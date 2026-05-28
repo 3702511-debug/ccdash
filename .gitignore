@@ -1,0 +1,26 @@
+# Personal credentials & runtime — НИКОГДА не коммитить
+auth.json
+vapid.json
+push-subs.json
+
+# Logs
+*.log
+out.log
+err.log
+tunnel.log
+tunnel.err.log
+
+# Deps (восстанавливаются через bun install)
+node_modules/
+
+# Whisper модели (большие, скачиваются скриптом)
+whisper-models/
+*.bin
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

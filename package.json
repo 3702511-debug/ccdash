@@ -1,0 +1,17 @@
+{
+  "name": "cc-dashboard",
+  "version": "0.1.0",
+  "description": "Local web dashboard for active Claude Code sessions",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
+}
