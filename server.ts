@@ -960,6 +960,25 @@ const HTML = `<!doctype html>
   .conn-banner b { display: block; font-size: 14px; margin-bottom: 2px; }
   .conn-banner .conn-detail { opacity: 0.85; font-size: 12px; }
   .conn-banner.warn { background: #8d5a00; border-bottom-color: #d4a500; }
+  .update-btn { background: #1f6feb !important; position: relative; }
+  .update-btn:hover { background: #2c7bef !important; }
+  .update-btn::after { content: ""; position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; background: #f0c674; border-radius: 50%; }
+  .update-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .update-modal-inner { background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 24px; max-width: 480px; width: 100%; max-height: 80vh; overflow-y: auto; }
+  .update-modal h2 { font-size: 18px; margin: 0 0 6px; color: #e6edf3; }
+  .update-versions { color: #8b949e; font-size: 13px; margin-bottom: 14px; }
+  .update-versions span { color: #58a6ff; font-weight: 500; }
+  .update-versions .upd-date { color: #6e7681; }
+  .update-notes-title { font-size: 13px; color: #8b949e; margin-bottom: 6px; }
+  .update-notes { margin: 0 0 18px; padding-left: 20px; color: #c9d1d9; font-size: 14px; line-height: 1.5; }
+  .update-notes li { margin-bottom: 4px; }
+  .update-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .update-actions button { padding: 9px 16px; border-radius: 8px; border: 0; font-size: 14px; cursor: pointer; }
+  .upd-cancel { background: #21262d; color: #c9d1d9; }
+  .upd-cancel:hover { background: #30363d; }
+  .upd-apply { background: #238636; color: #fff; }
+  .upd-apply:hover { background: #2ea043; }
+  .upd-apply:disabled { opacity: 0.6; cursor: not-allowed; }
   .refresh-btn.spinning svg { animation: spin 0.6s linear infinite; }
   /* Drawer (sessions list) — slides in from left on all platforms */
   #drawer { position: fixed; top: 0; left: 0; bottom: 0; width: min(85vw, 360px); background: #0d1117; border-right: 1px solid #30363d; transform: translateX(-100%); transition: transform 0.22s ease; z-index: 100; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top, 0); padding-bottom: env(safe-area-inset-bottom, 0); }
@@ -1140,6 +1159,21 @@ const HTML = `<!doctype html>
   <button id="push-btn" class="menu-btn" title="Включить пуш-уведомления" style="display:none">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
   </button>
+  <button id="update-btn" class="menu-btn update-btn" title="Доступно обновление" style="display:none">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9c-2.4 0-4.6-.94-6.2-2.45L3 21v-6h6"/><path d="M3 12a9 9 0 0 1 9-9c2.4 0 4.6.94 6.2 2.45L21 3v6h-6"/></svg>
+  </button>
+</div>
+<div id="update-modal" class="update-modal" style="display:none">
+  <div class="update-modal-inner">
+    <h2>Доступно обновление</h2>
+    <div class="update-versions">текущая <span id="upd-local">…</span> → новая <span id="upd-remote">…</span> <span id="upd-date" class="upd-date"></span></div>
+    <div class="update-notes-title">Что нового:</div>
+    <ul id="upd-notes" class="update-notes"></ul>
+    <div class="update-actions">
+      <button id="upd-cancel" class="upd-cancel">Позже</button>
+      <button id="upd-apply" class="upd-apply">Обновить сейчас</button>
+    </div>
+  </div>
 </div>
 <div class="meta" id="meta">подключение…</div>
 <div id="drawer">
@@ -2039,6 +2073,60 @@ async function checkHealth() {
 }
 setInterval(checkHealth, 10000);
 checkHealth();
+
+// === Update check ===
+const updateBtn = document.getElementById("update-btn");
+const updateModal = document.getElementById("update-modal");
+async function checkUpdate() {
+  try {
+    const res = await fetch("/api/update-info", { cache: "no-store" });
+    if (!res.ok) return;
+    const info = await res.json();
+    if (info.available) {
+      updateBtn.style.display = "";
+      updateBtn.dataset.info = JSON.stringify(info);
+    } else {
+      updateBtn.style.display = "none";
+    }
+  } catch {}
+}
+setInterval(checkUpdate, 5 * 60 * 1000); // каждые 5 мин
+checkUpdate();
+updateBtn.addEventListener("click", () => {
+  const info = JSON.parse(updateBtn.dataset.info || "{}");
+  document.getElementById("upd-local").textContent = info.local || "?";
+  document.getElementById("upd-remote").textContent = info.remote || "?";
+  document.getElementById("upd-date").textContent = info.date ? "(" + info.date + ")" : "";
+  const ul = document.getElementById("upd-notes");
+  ul.innerHTML = (info.notes && info.notes.length ? info.notes : ["Без описания"]).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
+  document.getElementById("upd-apply").disabled = !info.canApply;
+  document.getElementById("upd-apply").textContent = info.canApply ? "Обновить сейчас" : "Авто-обновление недоступно";
+  updateModal.style.display = "flex";
+});
+document.getElementById("upd-cancel").addEventListener("click", () => updateModal.style.display = "none");
+updateModal.addEventListener("click", (e) => { if (e.target === updateModal) updateModal.style.display = "none"; });
+document.getElementById("upd-apply").addEventListener("click", async () => {
+  const btn = document.getElementById("upd-apply");
+  btn.disabled = true;
+  btn.textContent = "Обновляю…";
+  try {
+    const res = await fetch("/api/update-apply", { method: "POST" });
+    const data = await res.json();
+    if (res.ok) {
+      btn.textContent = "Готово, перезагружаю…";
+      // Подождём пока сервер перезапустится и перезагрузим страницу
+      setTimeout(() => location.reload(), 8000);
+    } else {
+      alert("Ошибка: " + (data.error || res.status));
+      btn.disabled = false;
+      btn.textContent = "Обновить сейчас";
+    }
+  } catch (e) {
+    alert("Ошибка сети: " + e.message);
+    btn.disabled = false;
+    btn.textContent = "Обновить сейчас";
+  }
+});
 // Register service worker for PWA installability + push notifications.
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -2151,6 +2239,53 @@ setInterval(async () => {
     }
   } catch (e) { console.error("[push poller]", e); }
 }, 3000);
+
+// === Update mechanism ===
+// Локальный RELEASE.json (копируется через setup-local.ts) vs remote на GitHub.
+// /api/update-info — клиент опрашивает, видит ли он апдейт. /api/update-apply — запустить.
+type Release = { version: string; date?: string; notes?: string[] };
+let localRelease: Release | null = null;
+let remoteRelease: Release | null = null;
+const RELEASE_FILE = join(homedir(), ".cc-dashboard", "RELEASE.json");
+const REPO_PATH_FILE = join(homedir(), ".cc-dashboard", "repo-path.txt");
+try { localRelease = await Bun.file(RELEASE_FILE).json(); }
+catch { localRelease = { version: "0.0.0" }; }
+
+async function deriveRawReleaseUrl(): Promise<string | null> {
+  // Извлекает origin из git-репо и формирует raw.githubusercontent URL для RELEASE.json
+  try {
+    const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
+    const proc = Bun.spawnSync(["git", "-C", repoPath, "remote", "get-url", "origin"]);
+    const remote = proc.stdout.toString().trim();
+    // https://github.com/owner/repo.git → https://raw.githubusercontent.com/owner/repo/main/RELEASE.json
+    const m = remote.match(/github\.com[:\/]([^/]+)\/([^/.]+)/);
+    if (!m) return null;
+    return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/main/RELEASE.json`;
+  } catch { return null; }
+}
+
+let rawReleaseUrl: string | null = await deriveRawReleaseUrl();
+if (rawReleaseUrl) console.log(`[update] poll URL: ${rawReleaseUrl}`);
+
+async function pollRemoteRelease() {
+  if (!rawReleaseUrl) return;
+  try {
+    const res = await fetch(rawReleaseUrl, { cache: "no-store" });
+    if (!res.ok) return;
+    remoteRelease = await res.json();
+  } catch {}
+}
+pollRemoteRelease();
+setInterval(pollRemoteRelease, 10 * 60 * 1000);  // every 10 min
+
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
 
 // === Auth ===
 const AUTH_FILE = join(homedir(), ".cc-dashboard", "auth.json");
@@ -2359,6 +2494,28 @@ Bun.serve({
     }
     if (url.pathname === "/api/commands") {
       return Response.json(await discoverPluginCommands());
+    }
+    if (url.pathname === "/api/update-info") {
+      const local = localRelease?.version ?? "0.0.0";
+      const remote = remoteRelease?.version ?? local;
+      const available = compareVersions(local, remote) < 0;
+      return Response.json({
+        local, remote, available,
+        notes: available ? (remoteRelease?.notes ?? []) : [],
+        date: remoteRelease?.date,
+        canApply: !!rawReleaseUrl,  // если репо-путь известен — можно нажать кнопку
+      }, { headers: { "cache-control": "no-store" } });
+    }
+    if (url.pathname === "/api/update-apply" && req.method === "POST") {
+      try {
+        const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
+        // Detached: сервер сам перезагрузится через launchctl, ответ клиенту вернётся ДО рестарта.
+        const cmd = `cd ${JSON.stringify(repoPath)} && git pull --ff-only && bun run setup-local.ts > /tmp/cc-dash-update.log 2>&1`;
+        Bun.spawn(["bash", "-c", `(${cmd}) &`], { stdout: "ignore", stderr: "ignore" });
+        return Response.json({ ok: true, message: "Обновление запущено. Дашборд перезагрузится через несколько секунд." });
+      } catch (e: any) {
+        return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
+      }
     }
     if (url.pathname === "/api/push/vapid-public-key") {
       return Response.json({ key: vapidKeys?.publicKey ?? null });

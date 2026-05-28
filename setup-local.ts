@@ -43,12 +43,14 @@ ok("dependencies");
 mkdirSync(RUNTIME, { recursive: true });
 mkdirSync(join(RUNTIME, "icons"), { recursive: true });
 
-// Copy code + deps
-for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts"]) {
+// Copy code + deps + release info
+for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "RELEASE.json"]) {
   const src = join(SRC, f);
   if (existsSync(src)) cpSync(src, join(RUNTIME, f));
 }
 cpSync(join(SRC, "node_modules"), join(RUNTIME, "node_modules"), { recursive: true });
+// Запомним путь к git-репо — сервер использует его для git pull при авто-обновлении.
+await Bun.write(join(RUNTIME, "repo-path.txt"), SRC);
 ok(`copied to ${RUNTIME}`);
 
 // Icons (если есть в репо)
