@@ -2034,7 +2034,7 @@ async function checkHealth() {
       hideConn();
     }
   } catch (e) {
-    showConn("err", "Нет связи", "Не удаётся достучаться до eadashboard.duckdns.org. Проверь интернет/VPN на устройстве.");
+    showConn("err", "Нет связи", "Не удаётся достучаться до сервера дашборда. Проверь интернет/VPN на этом устройстве.");
   }
 }
 setInterval(checkHealth, 10000);
