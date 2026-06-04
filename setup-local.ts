@@ -88,6 +88,22 @@ if (!existsSync(whisperModel)) {
   log("  curl -L -o ~/.cc-dashboard/whisper-models/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin");
 }
 
+// 4.5. Claude Code: auto-permission mode. Без этого Claude Code на каждой bash-команде
+// показывает «Do you want to proceed?» — для пользователя дашборда это сильно мешает.
+// Создаём ТОЛЬКО если settings.json ещё нет (не трогаем существующие настройки).
+const claudeSettingsPath = join(HOME, ".claude", "settings.json");
+if (!existsSync(claudeSettingsPath)) {
+  log("Создаю ~/.claude/settings.json в auto-permission mode (без вопросов на каждую команду)…");
+  mkdirSync(join(HOME, ".claude"), { recursive: true });
+  await Bun.write(claudeSettingsPath, JSON.stringify({
+    permissions: { defaultMode: "auto" },
+    skipAutoPermissionPrompt: true,
+  }, null, 2));
+  ok("~/.claude/settings.json создан (auto mode)");
+} else {
+  log("(~/.claude/settings.json уже есть — не трогаю)");
+}
+
 // 5. LaunchAgent
 const plistPath = join(HOME, "Library", "LaunchAgents", "com.user.cc-dashboard.plist");
 const serverPath = join(RUNTIME, "server.ts");
