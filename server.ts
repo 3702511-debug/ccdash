@@ -1144,25 +1144,39 @@ let tuiContentsCache: { at: number; byTty: Map<string, string> } = { at: 0, byTt
 
 async function readAllTerminalContents(): Promise<Map<string, string>> {
   if (Date.now() - tuiContentsCache.at < TUI_SCRAPE_TTL_MS) return tuiContentsCache.byTty;
+  // ВАЖНО: берём `history of t` но обрезаем в AppleScript до последних 6000 символов.
+  // Без timeout-блоков AppleEvent ждал по умолчанию 60s и одна большая вкладка валила всю операцию
+  // (ошибка -1712). Сейчас на каждый tab даём 8s, на всю операцию 60s — если кто-то висит,
+  // остальные tabs всё равно обработаются.
   const script = `set sepStart to "|||TTYSTART|||"
 set sepEnd to "|||TTYEND|||"
 set acc to ""
+with timeout of 60 seconds
 tell application "Terminal"
   if it is running then
     repeat with w in windows
       try
         repeat with i from 1 to (count of tabs of w)
           try
-            set t to tab i of w
-            set ttyStr to tty of t
-            set cont to history of t
-            set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+            with timeout of 8 seconds
+              set t to tab i of w
+              set ttyStr to tty of t
+              set hist to history of t
+              set histLen to length of hist
+              if histLen > 6000 then
+                set cont to text (histLen - 5999) thru histLen of hist
+              else
+                set cont to hist
+              end if
+              set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+            end timeout
           end try
         end repeat
       end try
     end repeat
   end if
 end tell
+end timeout
 return acc`;
   const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
   const [out, err] = await Promise.all([
@@ -1607,7 +1621,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v27";
+const CACHE = "cc-dashboard-v30";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2017,6 +2031,12 @@ const HTML = `<!doctype html>
   .msg .body .link-copy:hover { background: #2ea043; color: white; border-color: #2ea043; }
   .msg .body .link-copy.copied { background: #238636; border-color: #238636; color: white; }
   .msg .body .link-copy svg { width: 14px; height: 14px; display: block; }
+  .msg .body .folder-open-btn { background: #21262d; border: 1px solid #444c56; color: #c9d1d9; border-radius: 4px; padding: 1px 5px; cursor: pointer; margin-left: 4px; vertical-align: middle; transition: background 0.15s; display: inline-flex; align-items: center; }
+  .msg .body .folder-open-btn:hover { background: #1f6feb; color: white; border-color: #1f6feb; }
+  .msg .body .folder-open-btn.opened { background: #2ea043; color: white; border-color: #2ea043; }
+  .msg .body .folder-open-btn svg { width: 13px; height: 13px; display: block; }
+  body.theme-light .msg .body .folder-open-btn { background: #eaeef2; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .msg .body .folder-open-btn:hover { background: #0969da; color: white; border-color: #0969da; }
   .msg .body h1, .msg .body h2, .msg .body h3 { font-size: 14px; font-weight: 600; color: #e6edf3; margin: 8px 0 4px; }
   .msg .body ul, .msg .body ol { margin: 4px 0 4px 20px; padding: 0; }
   .msg .body li { margin: 2px 0; }
@@ -2434,8 +2454,16 @@ function renderMd(text) {
     const fname = fullPath.split("/").pop();
     return '<a href="/api/file/' + encodeURIComponent(fname) + '" class="file-link">📎 ' + fname + '</a>';
   });
-  // 7. Restore inline code placeholders
-  text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => '<code class="inline-code">' + escapeHtml(inlineCodes[+i]) + '</code>');
+  // 7. Restore inline code placeholders. Если содержимое выглядит как путь под $HOME (~/... или /Users/...)
+  //    или /tmp/cc-dashboard/... — добавляем рядом кнопку «открыть в Finder».
+  const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => {
+    const code = inlineCodes[+i];
+    const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/cc-dashboard\\/)[^\\s'"]+$/.test(code);
+    const codeHtml = '<code class="inline-code">' + escapeHtml(code) + '</code>';
+    if (!isPath) return codeHtml;
+    return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+  });
   // 8. Restore markdown link placeholders
   text = text.replace(/\\x00ML(\\d+)\\x00/g, (_, i) => {
     const ml = mdLinks[+i];
@@ -3546,6 +3574,27 @@ function openPanel(sid) {
       } catch (err) { alert("Ошибка: " + err.message); }
       return;
     }
+    const folderBtn = e.target.closest(".folder-open-btn");
+    if (folderBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const p = decodeURIComponent(folderBtn.dataset.path);
+      const origHTML = folderBtn.innerHTML;
+      folderBtn.classList.add("opening");
+      try {
+        const r = await revealPath(p);
+        if (r?.error) {
+          folderBtn.innerHTML = '!';
+          folderBtn.title = r.error;
+          setTimeout(() => { folderBtn.innerHTML = origHTML; folderBtn.title = "Открыть в Finder"; }, 2000);
+        } else {
+          folderBtn.classList.add("opened");
+          setTimeout(() => folderBtn.classList.remove("opened"), 1300);
+        }
+      } catch (err) { console.error("open-path failed:", err); }
+      folderBtn.classList.remove("opening");
+      return;
+    }
     const inlineCode = e.target.closest("code.inline-code");
     if (inlineCode) {
       try {
@@ -3934,6 +3983,15 @@ async function focusWindow(sid) {
     err.textContent = "Окно не найдено (закрыто?)";
   } else {
     err.textContent = "";
+  }
+}
+
+async function revealPath(path) {
+  try {
+    const res = await fetch("/api/open-path", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+    return await res.json().catch(() => ({}));
+  } catch (e) {
+    return { error: e.message || String(e) };
   }
 }
 
@@ -4631,41 +4689,44 @@ Bun.serve({
       });
     }
 
+    if (url.pathname === "/api/open-path" && req.method === "POST") {
+      const body = await req.json().catch(() => ({})) as { path?: string };
+      let p = String(body.path ?? "").trim();
+      if (!p) return Response.json({ error: "no path" }, { status: 400 });
+      // Срезать line-суффикс (:NNN) — это для редактора, Finder его не понимает
+      p = p.replace(/:\d+(:\d+)?$/, "");
+      // Tilde-expand
+      if (p.startsWith("~")) p = p.replace(/^~/, homedir());
+      // Безопасность: разрешаем только пути под $HOME или /tmp/cc-dashboard/
+      const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/cc-dashboard/");
+      if (!allowed) return Response.json({ error: "path outside allowed scope" }, { status: 403 });
+      const pathEsc = p.replace(/"/g, '\\"');
+      // reveal POSIX file работает и для папок (подсвечивает в Finder), и для файлов (показывает в родительской)
+      const script = `tell application "Finder"
+        reveal POSIX file "${pathEsc}"
+        activate
+      end tell
+      return "ok"`;
+      const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const [, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      if (err.trim()) return Response.json({ error: err.trim() }, { status: 500 });
+      return Response.json({ ok: true });
+    }
+
     const interruptMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/interrupt$/);
     if (interruptMatch && req.method === "POST") {
       const sid = interruptMatch[1];
       const meta = sessionMeta.get(sid);
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
-      const script = `tell application "System Events"
-        set prevApp to name of first process whose frontmost is true
-      end tell
-      tell application "Terminal"
-        repeat with w in windows
-          try
-          repeat with t in tabs of w
-            try
-              if (tty of t) is "/dev/${meta.tty}" then
-                set selected of t to true
-                set frontmost of w to true
-                activate
-                delay 0.12
-                tell application "System Events" to key code 53
-                return "ok"
-              end if
-            end try
-          end repeat
-          end try
-        end repeat
-      end tell
-      return "not found"`;
-      const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
-      const [out, err] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-      ]);
-      await proc.exited;
-      console.log(`[interrupt ${meta.tty}] out="${out.trim()}" err="${err.trim()}"`);
-      if (err.trim()) return Response.json({ error: err.trim() }, { status: 500 });
+      // Используем sendRawKey('escape') — он шлёт Esc через CGEventPostToPid без system-wide activate.
+      // Раньше тут был AppleScript с `activate`, который выкидывал Terminal в фронт.
+      const { ok, error } = await sendRawKey(meta.tty, "escape");
+      console.log(`[interrupt ${meta.tty}] sendRawKey escape: ok=${ok} err=${error ?? ""}`);
+      if (!ok) return Response.json({ error: error ?? "send failed" }, { status: 500 });
       return Response.json({ ok: true });
     }
 
