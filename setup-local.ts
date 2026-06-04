@@ -10,7 +10,7 @@
 //   5. Загружает LaunchAgent
 // Чего НЕ делает (отдельно):
 //   - setup-auth.ts → создание логина/пароля (требует TTY для пароля)
-//   - VPS + Caddy + autossh туннель → см. DEPLOY.md шаг 3
+//   - VPS + Caddy + autossh туннель → см. RUNBOOK.md часть A+Б
 //   - PWA-установка на iPhone
 
 import { homedir } from "node:os";
@@ -126,7 +126,46 @@ const ld = Bun.spawnSync(["launchctl", "load", plistPath]);
 if (ld.exitCode === 0) ok(`LaunchAgent: ${plistPath}`);
 else die(`launchctl load упал: ${ld.stderr?.toString()}`);
 
-// 6. Smoke test
+// 6. Создать главную сессию «CC Dash» если её ещё нет
+const mainSessionPath = join(RUNTIME, "main-session.json");
+if (!existsSync(mainSessionPath)) {
+  log("Создаю главную сессию «CC Dash» в Terminal…");
+  const cwdEsc = SRC.replace(/"/g, '\\"');
+  const script = `tell application "System Events"
+  set prevApp to name of first process whose frontmost is true
+end tell
+tell application "Terminal"
+  activate
+  set newTab to do script "cd \\"${cwdEsc}\\" && claude"
+  delay 8
+  do script "/rename CC Dash" in newTab
+  delay 0.2
+  do script "" in newTab
+  delay 2
+end tell
+tell application "System Events"
+  try
+    set visible of process "Terminal" to false
+  end try
+end tell
+try
+  tell application prevApp to activate
+end try
+return "ok"`;
+  const proc = Bun.spawnSync(["osascript", "-e", script]);
+  if (proc.exitCode === 0) {
+    ok("главная сессия запущена, через 5-10 сек подхватится дашбордом");
+    log("  Чтобы пометить её как главную: после появления в дашборде запиши её sid в ~/.cc-dashboard/main-session.json");
+    log("  Можно сделать через UI (TODO) или вручную:");
+    log("    1. Открой http://localhost:8787/api/sessions");
+    log("    2. Найди объект с title=\"CC Dash\", скопируй sessionId");
+    log("    3. echo '{\"sid\":\"<тот-sid>\",\"name\":\"CC Dash\"}' > ~/.cc-dashboard/main-session.json");
+  } else {
+    log(`  AppleScript упал (${proc.stderr?.toString()?.slice(0, 200)}). Создай главную сессию вручную через UI.`);
+  }
+}
+
+// 7. Smoke test
 await new Promise(r => setTimeout(r, 1000));
 try {
   const res = await fetch("http://localhost:8787/api/health");
@@ -149,4 +188,4 @@ console.log();
 console.log("Дальше:");
 console.log("  1. Создай учётку: bun run ~/.cc-dashboard/setup-auth.ts");
 console.log("  2. Открой http://localhost:8787 и залогинься");
-console.log("  3. (опционально) Удалённый доступ с iPhone — см. DEPLOY.md шаг 3");
+console.log("  3. (опционально) Удалённый доступ с iPhone — см. RUNBOOK.md часть A+Б");

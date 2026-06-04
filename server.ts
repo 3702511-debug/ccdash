@@ -71,6 +71,16 @@ interface Session {
   status: Status;
   lastActivity: string;
   lastActivityRel: string;
+  busySince?: string;
+  inputTokens?: number;
+  limitHit?: boolean;
+  limitResetAt?: string;
+  isMain?: boolean;
+  hasOpenQuestion?: boolean;
+  openQuestion?: any;  // see OpenQuestion type below — declared later, so use 'any' here to avoid forward-ref
+  // kid-dash интеграция: для сессий kid-dash (cwd содержит ~/.kid-dash/ или ~/Documents/клод/kid-dash/)
+  // показываем баннер «ребёнок на уроке» и блокируем композер, пока child_active.
+  kidDash?: { isChildChat: boolean; isBlocked: boolean; currentSubject: string | null; expectedEnd: string | null };
 }
 
 interface SessionMeta {
@@ -117,10 +127,6 @@ async function pidInfo(pid: number): Promise<{ cwd: string | null; tty: string |
     ppidComm = (await sh("ps", ["-o", "comm=", "-p", ppid])).trim();
   }
   return { cwd, tty, ppidComm };
-}
-
-function encodeProjectName(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9.]/g, "-");
 }
 
 function relTime(iso: string): string {
@@ -306,6 +312,14 @@ interface StatusInfo {
   lastActivity: string;
   sessionId: string;
   recordCwd: string | null;
+  // Опционально: для активных статусов — когда стартанули и сколько токенов
+  busySince?: string;
+  inputTokens?: number;
+  // Лимит Anthropic API хитнут — claude в терминале спит до ручного вмешательства
+  limitHit?: boolean;
+  limitResetAt?: string;
+  // Открытый AskUserQuestion — модель ждёт ответ-выбор от пользователя; UI показывает кнопки
+  openQuestionId?: string;
 }
 
 async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
@@ -335,7 +349,23 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
 
   let status: Status = "unknown";
   if (lastMessage?.type === "user") {
-    status = ageSec > 600 ? "idle" : "thinking";
+    const c = lastMessage.message?.content;
+    const items = Array.isArray(c) ? c : [];
+    const textBody = typeof c === "string" ? c : items.filter((x: any) => x?.type === "text").map((x: any) => x?.text ?? "").join("");
+    const hasText = textBody.trim().length > 0;
+    const hasToolResult = items.some((x: any) => x?.type === "tool_result");
+    if (textBody.trimStart().startsWith("/")) {
+      // Slash-команды (/rename, /clear, …) — обрабатываются локально клодом
+      status = "waiting";
+    } else if (!hasText && hasToolResult) {
+      // tool_result feedback клоду. Если запись свежая — claude в процессе обработки.
+      // Раньше порог был 30 сек, но клод реально может анализировать большой stdout 1-2 мин без эмиссии в jsonl
+      // (особенно если стримит ответ в конце). Поднимаем до 3 мин — если за это время не появилось ничего нового,
+      // тогда уже считаем что сессия закончила/застряла → "waiting".
+      status = ageSec > 180 ? "waiting" : "thinking";
+    } else {
+      status = ageSec > 600 ? "idle" : "thinking";
+    }
   } else if (lastMessage?.type === "assistant") {
     const content = lastMessage.message?.content;
     const items = Array.isArray(content) ? content : [];
@@ -347,7 +377,73 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
     }
   }
 
-  return { status, lastActivity: ts, sessionId, recordCwd };
+  // Доп. метрики для активных статусов: время с момента последнего user-сообщения + токены последнего assistant
+  let busySince: string | undefined;
+  let inputTokens: number | undefined;
+  if (status === "thinking" || status === "tool" || status === "waiting") {
+    for (let i = records.length - 1; i >= 0; i--) {
+      if (records[i].type === "user" && records[i].timestamp) {
+        busySince = records[i].timestamp;
+        break;
+      }
+    }
+    // Последний assistant-record содержит message.usage.input_tokens / cache_*
+    for (let i = records.length - 1; i >= 0; i--) {
+      const u = records[i]?.message?.usage;
+      if (u && typeof u.input_tokens === "number") {
+        inputTokens = (u.input_tokens || 0)
+          + (u.cache_read_input_tokens || 0)
+          + (u.cache_creation_input_tokens || 0);
+        break;
+      }
+    }
+  }
+
+  // Детект «лимита Anthropic» в последнем assistant-сообщении
+  let limitHit = false;
+  let limitResetAt: string | undefined;
+  if (lastMessage?.type === "assistant") {
+    const c = lastMessage.message?.content;
+    const text = typeof c === "string" ? c : (Array.isArray(c) ? c.map((x: any) => x?.text ?? "").join(" ") : "");
+    // Авто-сообщения claude code обычно стоят в начале и сами по себе короткие.
+    // Чтобы не цеплять случайные упоминания в нормальном тексте — проверяем что текст ИМЕННО НАЧИНАЕТСЯ с лимит-фразы.
+    const head = text.trimStart().slice(0, 200);
+    // Паттерн 1: персональный лимит — «You've hit your … limit · resets 3:50pm (TZ)»
+    const personalLimit = head.match(/^You(?:'ve)?\s+hit\s+your[\s\w-]{0,40}limit[^a-z]*resets\s+(\d{1,2}):(\d{2})(am|pm)?/i);
+    if (personalLimit) {
+      limitHit = true;
+      limitResetAt = `${personalLimit[1]}:${personalLimit[2]}${personalLimit[3] ? personalLimit[3].toLowerCase() : ""}`;
+    }
+    // Паттерн 2: серверный лимит — «API Error: Server is temporarily limiting requests …»
+    else if (/^API\s*Error:\s*Server\s+is\s+temporarily\s+limiting\s+requests/i.test(head)) {
+      limitHit = true;
+    }
+  }
+
+  // Детект открытого AskUserQuestion — последний tool_use с name=AskUserQuestion, не имеющий matching tool_result
+  let openQuestionId: string | undefined;
+  const askedIds = new Set<string>();
+  const answeredIds = new Set<string>();
+  for (const r of records) {
+    if (r.type === "assistant" && Array.isArray(r.message?.content)) {
+      for (const item of r.message.content) {
+        if (item?.type === "tool_use" && item?.name === "AskUserQuestion" && typeof item.id === "string") {
+          askedIds.add(item.id);
+        }
+      }
+    } else if (r.type === "user" && Array.isArray(r.message?.content)) {
+      for (const item of r.message.content) {
+        if (item?.type === "tool_result" && typeof item.tool_use_id === "string") {
+          answeredIds.add(item.tool_use_id);
+        }
+      }
+    }
+  }
+  for (const id of askedIds) {
+    if (!answeredIds.has(id)) openQuestionId = id;  // last unanswered wins
+  }
+
+  return { status, lastActivity: ts, sessionId, recordCwd, busySince, inputTokens, limitHit, limitResetAt, openQuestionId };
 }
 
 interface PidInfo {
@@ -481,6 +577,35 @@ function bindPidByTitle(
 const sessionStickyCache = new Map<string, { session: Session; lastSeenAt: number }>();
 const SESSION_STICKY_MS = 30_000;
 
+// Главная сессия (управляющая дашбордом) — закреплена сверху, не удаляется.
+const MAIN_SESSION_FILE = join(homedir(), ".cc-dashboard", "main-session.json");
+let mainSessionSid: string | null = null;
+try {
+  const data = await Bun.file(MAIN_SESSION_FILE).json();
+  if (data?.sid) mainSessionSid = String(data.sid);
+} catch {}
+
+// «Отстойник» — закрытые сессии, скрытые пользователем. Map<sid, {cwd, title}>.
+const HIDDEN_SIDS_FILE = join(homedir(), ".cc-dashboard", "hidden-sids.json");
+type HiddenInfo = { cwd?: string; title?: string };
+let hiddenSids = new Map<string, HiddenInfo>();
+try {
+  const data = await Bun.file(HIDDEN_SIDS_FILE).json();
+  if (Array.isArray(data)) {
+    // legacy format — array of strings
+    for (const sid of data) hiddenSids.set(sid, {});
+  } else if (data && typeof data === "object") {
+    for (const [sid, info] of Object.entries(data)) {
+      hiddenSids.set(sid, (info && typeof info === "object") ? info as HiddenInfo : {});
+    }
+  }
+} catch {}
+async function saveHiddenSids() {
+  const obj: Record<string, HiddenInfo> = {};
+  for (const [k, v] of hiddenSids) obj[k] = v;
+  await Bun.write(HIDDEN_SIDS_FILE, JSON.stringify(obj, null, 2));
+}
+
 // Scan installed Claude Code plugins for custom slash commands.
 // Plugin commands are .md files with YAML frontmatter (description: ...).
 let cachedPluginCommands: Array<{ name: string; desc: string }> | null = null;
@@ -530,6 +655,35 @@ async function discoverPluginCommands(): Promise<Array<{ name: string; desc: str
   return result;
 }
 
+// === kid-dash интеграция ===
+// Опрашиваем kid-dash сервер на 127.0.0.1:8788/api/state. Кэшируем 5 сек.
+// Если kid-dash недоступен (нет процесса) — child_active молча считаем false.
+const KID_DASH_STATE_TTL_MS = 5000;
+let kidDashStateCache: { at: number; value: any | null } = { at: 0, value: null };
+async function fetchKidDashState(): Promise<{ child_active: boolean; current_subject: string | null; expected_end: string | null; last_message_ts: string | null } | null> {
+  if (Date.now() - kidDashStateCache.at < KID_DASH_STATE_TTL_MS) return kidDashStateCache.value;
+  try {
+    const r = await fetch("http://127.0.0.1:8788/api/state", { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) { kidDashStateCache = { at: Date.now(), value: null }; return null; }
+    const v = await r.json();
+    kidDashStateCache = { at: Date.now(), value: v };
+    return v;
+  } catch {
+    kidDashStateCache = { at: Date.now(), value: null };
+    return null;
+  }
+}
+const KID_DASH_CWD = join(homedir(), "Documents", "клод", "kid-dash");
+const KID_DASH_RUNTIME = join(homedir(), ".kid-dash");
+// Override-таймаут: мама подтвердила «точно прервать урок» → разблокировка на 60 сек
+const KID_DASH_OVERRIDE_DURATION_MS = 60 * 1000;
+let kidDashOverrideUntil: number | null = null;
+function isKidChatSession(s: { cwd: string }): boolean {
+  // Только по CWD ~/.kid-dash/ — title-match убран чтобы не путать с маминой dev-сессией
+  // «Kid Dash (mom)» которая живёт в ~/Documents/клод/kid-dash/
+  return !!(s.cwd && (s.cwd === KID_DASH_RUNTIME || s.cwd.startsWith(KID_DASH_RUNTIME + "/")));
+}
+
 async function snapshot(): Promise<Session[]> {
   const [freshJsonls, pidInfos, tabTitles, selfId] = await Promise.all([
     findAllFreshJsonls(),
@@ -537,6 +691,25 @@ async function snapshot(): Promise<Session[]> {
     getTabTitles(),
     getSelfSessionId(),
   ]);
+  // Также включаем jsonl каждого ЖИВОГО claude-процесса даже если файл не «свежий» (за пределами 24ч).
+  // Иначе долго бездействующая, но запущенная сессия показывается как pid-XXXXX без истории.
+  const knownPaths = new Set(freshJsonls.map(j => j.path));
+  for (const p of pidInfos) {
+    if (!p.sessionId) continue;
+    try {
+      const dirs = await readdir(PROJECTS_DIR);
+      for (const d of dirs) {
+        const candidate = join(PROJECTS_DIR, d, p.sessionId + ".jsonl");
+        if (knownPaths.has(candidate)) continue;
+        try {
+          const s = await stat(candidate);
+          freshJsonls.push({ path: candidate, mtime: s.mtimeMs });
+          knownPaths.add(candidate);
+          break;
+        } catch {}
+      }
+    } catch {}
+  }
   freshJsonls.sort((a, b) => b.mtime - a.mtime);
 
   const sessions: Session[] = [];
@@ -578,6 +751,12 @@ async function snapshot(): Promise<Session[]> {
         status: st.status,
         lastActivity: st.lastActivity,
         lastActivityRel: relTime(st.lastActivity),
+        busySince: st.busySince,
+        inputTokens: st.inputTokens,
+        limitHit: st.limitHit,
+        limitResetAt: st.limitResetAt,
+        isMain: mainSessionSid !== null && sessionId === mainSessionSid,
+        hasOpenQuestion: !!st.openQuestionId,
       });
 
       sessionMeta.set(sessionId, {
@@ -628,13 +807,78 @@ async function snapshot(): Promise<Session[]> {
     sessions.push(entry.session);
   }
 
+  // TUI live AskUserQuestion: для каждой сессии с tty читаем visible-contents Terminal-вкладки
+  // и парсим открытый модал. Это вылавливает вопросы, которые claude ещё не флашнул в jsonl.
+  try {
+    const all = await readAllTerminalContents();
+    for (const s of sessions) {
+      if (!s.tty) continue;
+      if (s.hasOpenQuestion) continue;  // уже есть jsonl-based, не перезаписываем
+      const text = all.get(s.tty);
+      if (!text) continue;
+      const q = parseTuiModal(text);
+      if (q) {
+        s.hasOpenQuestion = true;
+        s.openQuestion = q;
+      }
+    }
+  } catch (e) {
+    console.error("[tui-scrape]", e);
+  }
+
+  // kid-dash интеграция: помечаем Ребёнок-чат-сессию + блокировка по child_active
+  try {
+    const kdState = await fetchKidDashState();
+    const overrideUntil = kidDashOverrideUntil;  // см. ниже — мама может временно разблокировать на минуту
+    const overrideActive = overrideUntil && Date.now() < overrideUntil;
+    for (const s of sessions) {
+      if (isKidChatSession(s)) {
+        const blocked = !overrideActive && !!(kdState?.child_active);
+        s.kidDash = {
+          isChildChat: true,
+          isBlocked: blocked,
+          currentSubject: kdState?.current_subject ?? null,
+          expectedEnd: kdState?.expected_end ?? null,
+        };
+      }
+    }
+  } catch (e) {
+    console.error("[kid-dash sync]", e);
+  }
+
+  // Отфильтровать скрытые пользователем сессии (плюс по пути обновим cwd/title в hiddenSids)
+  if (hiddenSids.size > 0) {
+    for (const s of sessions) {
+      if (hiddenSids.has(s.sessionId)) {
+        hiddenSids.set(s.sessionId, { cwd: s.cwd, title: s.title || undefined });
+      }
+    }
+    return sessions.filter(s => !hiddenSids.has(s.sessionId));
+  }
   return sessions;
 }
 
+interface QuestionOption { label: string; description?: string; isFreeText?: boolean; tuiNum?: number }
+interface OpenQuestion {
+  toolUseId: string;
+  question: string;
+  header?: string;
+  multiSelect: boolean;
+  options: QuestionOption[];
+  answered: boolean;
+  answeredWith?: string;
+  // Multi-tab modal: claude задал несколько вопросов сразу + одна кнопка Submit (header вида
+  // «← ☐ Tab1 ☐ Tab2 ✔ Submit →»). Dashboard показывает по одному вопросу за раз с кнопкой Далее.
+  isMultiTab?: boolean;
+  // Внутри multi-tab — финальный экран подтверждения («Review your answers / Submit answers / Cancel»).
+  // Dashboard рендерит кнопку «Отправить ответы».
+  isSubmitReview?: boolean;
+}
 interface Message {
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "question";
   text: string;
   ts: string;
+  question?: OpenQuestion;
 }
 
 function compactToolUse(item: any): string {
@@ -680,13 +924,15 @@ function compactToolResult(item: any): string {
 }
 
 async function readMessages(jsonlPath: string, limitBytes = 256 * 1024): Promise<Message[]> {
-  // Adaptive: если в окне нет user/assistant сообщений (jsonl мог забиться api_error/system),
-  // расширяем окно — до 16МБ или размера файла.
+  // Adaptive: стартуем с limitBytes (или с полного размера файла, если он меньше), при недостатке user/assistant
+  // расширяем окно до 16МБ. Без этого маленькие jsonl'ы (< 256КБ) пропускали первое чтение из-за условия.
   const file = Bun.file(jsonlPath);
   const totalSize = file.size;
-  let win = limitBytes;
+  let win = Math.min(limitBytes, Math.max(totalSize, 4096));
   let messages: Message[] = [];
-  while (messages.length < 5 && win <= 16 * 1024 * 1024 && win <= totalSize * 2) {
+  let firstPass = true;
+  while (firstPass || (messages.length < 5 && win < 16 * 1024 * 1024)) {
+    firstPass = false;
     const text = await readTail(jsonlPath, win);
     const lines = text.split("\n").filter(l => l.trim().startsWith("{"));
     messages = [];
@@ -712,11 +958,61 @@ async function readMessages(jsonlPath: string, limitBytes = 256 * 1024): Promise
           for (const item of content) {
             if (item?.type === "text" && typeof item.text === "string" && item.text.trim().length) {
               messages.push({ role: "assistant", text: item.text, ts });
+            } else if (item?.type === "tool_use" && item?.name === "AskUserQuestion") {
+              // Render AskUserQuestion as a structured "question" message — frontend shows clickable options
+              const q = item?.input?.questions?.[0];
+              if (q && typeof q.question === "string" && Array.isArray(q.options)) {
+                messages.push({
+                  role: "question",
+                  text: q.question,
+                  ts,
+                  question: {
+                    toolUseId: item.id,
+                    question: q.question,
+                    header: q.header,
+                    multiSelect: !!q.multiSelect,
+                    options: q.options.map((o: any) => ({ label: String(o.label ?? ""), description: o.description })),
+                    answered: false,
+                  },
+                });
+              }
             } else if (item?.type === "tool_use") {
               messages.push({ role: "tool", text: compactToolUse(item), ts });
             }
           }
         }
+      }
+    }
+    // Pass 2: mark questions as answered if a matching tool_result is present in the same window
+    // (Re-scan the source lines to find tool_results whose tool_use_id matches a question.)
+    const answers = new Map<string, string>(); // toolUseId → answer label
+    for (const line of lines) {
+      let rec: any;
+      try { rec = JSON.parse(line); } catch { continue; }
+      if (rec.type !== "user") continue;
+      const c = rec.message?.content;
+      if (!Array.isArray(c)) continue;
+      for (const item of c) {
+        if (item?.type === "tool_result" && typeof item.tool_use_id === "string") {
+          // tool_result content may be string with answer info; also rec.toolUseResult.answers
+          let ans = "";
+          const txt = typeof item.content === "string" ? item.content
+                    : Array.isArray(item.content) ? item.content.map((x: any) => x?.text ?? "").join("") : "";
+          const m = txt.match(/"([^"]+)"="([^"]+)"/);
+          if (m) ans = m[2];
+          if (!ans && rec.toolUseResult?.answers) {
+            const vals = Object.values(rec.toolUseResult.answers);
+            if (vals.length) ans = String(vals[0]);
+          }
+          if (ans) answers.set(item.tool_use_id, ans);
+          else answers.set(item.tool_use_id, "(answered)");
+        }
+      }
+    }
+    for (const m of messages) {
+      if (m.role === "question" && m.question) {
+        const a = answers.get(m.question.toolUseId);
+        if (a) { m.question.answered = true; m.question.answeredWith = a === "(answered)" ? undefined : a; }
       }
     }
     if (win >= totalSize) break;
@@ -768,7 +1064,14 @@ const APPLESCRIPT_BODY = `on run argv
   try
     tell application "Terminal"
       if it is running then
+        -- Развернуть свёрнутые окна — AppleScript не видит tabs минимизированных окон.
         repeat with w in windows
+          try
+            if miniaturized of w then set miniaturized of w to false
+          end try
+        end repeat
+        repeat with w in windows
+          try
           repeat with t in tabs of w
             try
               if (tty of t) is targetTty then
@@ -790,6 +1093,7 @@ const APPLESCRIPT_BODY = `on run argv
               end if
             end try
           end repeat
+          end try
         end repeat
       end if
     end tell
@@ -802,10 +1106,15 @@ const RESTORE_SCRIPT = `on run argv
   set cwdArg to item 1 of argv
   set sidArg to item 2 of argv
   set cmd to "cd " & quoted form of cwdArg & " && claude --resume " & sidArg
+  -- Без activate — пользователь остаётся в дашборде/браузере, Terminal не вылезает.
   tell application "Terminal"
-    activate
     do script cmd
   end tell
+  -- Скрыть Terminal сразу после запуска, чтобы окно не оставалось перед глазами.
+  delay 0.5
+  try
+    tell application "System Events" to set visible of process "Terminal" to false
+  end try
   return "ok"
 end run`;
 
@@ -823,6 +1132,437 @@ async function restoreSession(sessionId: string, cwd: string): Promise<{ ok: boo
   console.log(`[restore sid=${sessionId.slice(0, 8)} cwd=${cwd}] out="${out.trim()}" stderr="${stderr}"`);
   if (stderr) return { ok: false, error: stderr };
   return { ok: true };
+}
+
+// Отправка реальных нажатий клавиш в TUI-модал (AskUserQuestion и т.п.) — paste не работает,
+// модал ждёт стрелки/Enter. Через System Events key code (layout-independent: 125=down, 36=return).
+// === TUI screen-scrape: читать visible-contents Terminal-вкладок для детекта живого AskUserQuestion-модала ===
+// Claude Code НЕ пишет AskUserQuestion в jsonl, пока пользователь не ответит. Чтобы показать модал в дашборде
+// до ответа, надо парсить visible-text из Terminal.app.
+const TUI_SCRAPE_TTL_MS = 4000;
+let tuiContentsCache: { at: number; byTty: Map<string, string> } = { at: 0, byTty: new Map() };
+
+async function readAllTerminalContents(): Promise<Map<string, string>> {
+  if (Date.now() - tuiContentsCache.at < TUI_SCRAPE_TTL_MS) return tuiContentsCache.byTty;
+  const script = `set sepStart to "|||TTYSTART|||"
+set sepEnd to "|||TTYEND|||"
+set acc to ""
+tell application "Terminal"
+  if it is running then
+    repeat with w in windows
+      try
+        repeat with i from 1 to (count of tabs of w)
+          try
+            set t to tab i of w
+            set ttyStr to tty of t
+            set cont to history of t
+            set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+          end try
+        end repeat
+      end try
+    end repeat
+  end if
+end tell
+return acc`;
+  const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const [out, err] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  await proc.exited;
+  if (err.trim()) console.error("[tui-scrape] stderr:", err.trim().slice(0, 200));
+  const byTty = new Map<string, string>();
+  const blocks = out.split("|||TTYSTART|||").slice(1);
+  for (const block of blocks) {
+    const endIdx = block.indexOf("|||TTYEND|||");
+    if (endIdx < 0) continue;
+    const body = block.slice(0, endIdx);
+    const sepIdx = body.indexOf("|||CONTENT|||");
+    if (sepIdx < 0) continue;
+    const ttyPath = body.slice(0, sepIdx).trim();
+    const text = body.slice(sepIdx + "|||CONTENT|||".length);
+    const ttyShort = ttyPath.replace(/^\/dev\//, "");
+    byTty.set(ttyShort, text);
+  }
+  tuiContentsCache = { at: Date.now(), byTty };
+  return byTty;
+}
+
+// Парсит из visible-text Claude Code TUI модал AskUserQuestion.
+// Шаблон:
+//   <header (опц.)>
+//   <question text>
+//   1. <label1>
+//      <desc1?>
+//   2. <label2>
+//   ...
+//   N. Chat about this    ← это всегда последний пункт, escape hatch, в options не включаем
+//   Enter to select | ↑/↓ to navigate | Esc to cancel
+function parseTuiModal(text: string): OpenQuestion | null {
+  if (!text) return null;
+  // Допустимые маркеры модала:
+  //   - стандартный: «Enter to select · ↑/↓ to navigate · Esc to cancel»
+  //   - Submit Review (без нижней нав-строки): «Ready to submit your answers?» + «Submit answers / Cancel»
+  const hasStandardMarker = /Enter to select|to navigate|Esc to cancel/i.test(text);
+  const hasSubmitReview = /Ready to submit your answers/i.test(text) && /Submit answers/i.test(text);
+  if (!hasStandardMarker && !hasSubmitReview) return null;
+  const rawLines = text.split(/\r?\n/);
+  let markerIdx = -1;
+  for (let i = rawLines.length - 1; i >= 0; i--) {
+    if (/Enter to select|to navigate/i.test(rawLines[i])) { markerIdx = i; break; }
+  }
+  // Submit Review screen — нав-маркера нет, используем последнюю строку с опцией «2. Cancel» как anchor
+  if (markerIdx < 0 && hasSubmitReview) {
+    for (let i = rawLines.length - 1; i >= 0; i--) {
+      if (/^\s*2\.\s+Cancel\s*$/i.test(rawLines[i])) { markerIdx = i + 1; break; }
+    }
+  }
+  if (markerIdx < 0) return null;
+
+  const optionRe = /^[›❯>]?\s*(\d+)\.\s+(.+?)\s*$/;
+  const isSeparator = (l: string) => /^[─━═║│┃╮╭╯╰┌┐└┘╲╱]+$/.test(l);
+
+  // Pass 1: найти все строки опций над маркером (в обратном порядке)
+  const optionLineIndices: number[] = [];
+  let firstOptLine = -1;
+  for (let i = markerIdx - 1; i >= 0 && i > markerIdx - 80; i--) {
+    const trimmed = rawLines[i].trim();
+    if (!trimmed) continue;
+    if (isSeparator(trimmed)) continue;
+    if (optionRe.test(trimmed)) {
+      optionLineIndices.unshift(i);
+      firstOptLine = i;
+      continue;
+    }
+    if (optionLineIndices.length > 0) {
+      // Не опция и не разделитель — описание или конец блока
+      const rawLine = rawLines[i];
+      const leading = rawLine.length - rawLine.replace(/^\s+/, "").length;
+      const firstCh = trimmed.charAt(0);
+      // ВАЖНО: /[а-я]/i без флага /u в JS НЕ case-folds Кириллицу, поэтому явно перечисляем оба регистра
+      const looksDesc = leading >= 4 || /[a-zA-Zа-яА-ЯёЁ]/.test(firstCh);
+      if (looksDesc) continue;
+      break;
+    }
+  }
+  if (optionLineIndices.length < 1) return null;
+
+  // Pass 2: для каждой опции собрать label + description (отступленные строки до следующей опции)
+  const opts: { num: number; label: string; description?: string }[] = [];
+  for (let k = 0; k < optionLineIndices.length; k++) {
+    const optIdx = optionLineIndices[k];
+    const nextOptIdx = (k + 1 < optionLineIndices.length) ? optionLineIndices[k + 1] : markerIdx;
+    const labelMatch = optionRe.exec(rawLines[optIdx].trim());
+    if (!labelMatch) continue;
+    const descLines: string[] = [];
+    for (let j = optIdx + 1; j < nextOptIdx; j++) {
+      const raw = rawLines[j];
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      if (isSeparator(trimmed)) continue;
+      descLines.push(trimmed);
+    }
+    // Чистим чекбокс-префикс «[ ]» / «[✔]» / «[✓]» и лидирующий ❯ (выбор-маркер)
+    const cleanedLabel = labelMatch[2]
+      .replace(/^[›❯>]\s*/, "")
+      .replace(/^\[[\s✔☑✓☐x✗]\]\s*/u, "")
+      .trim();
+    opts.push({
+      num: parseInt(labelMatch[1], 10),
+      label: cleanedLabel,
+      description: descLines.join(" ").trim() || undefined,
+    });
+  }
+
+  // «Chat about this» — TUI escape hatch (выход из модала без ответа), всегда отбрасываем.
+  // «Type something» — это free-text option, оставляем но помечаем isFreeText=true, чтобы фронт показал input.
+  const filtered = opts
+    .filter(o => !/^Chat about this$/i.test(o.label))
+    .map(o => /^Type something\.?$/i.test(o.label) ? { ...o, label: "Свой вариант…", isFreeText: true } : o);
+  if (filtered.length < 1) return null;
+
+  // Поднимаемся выше firstOptLine — ищем сам вопрос (приоритет строкам, заканчивающимся на ?),
+  // потом header. Пропускаем сильно отступленные строки (это описания опций при испорченном дисплее).
+  let question = "";
+  let questionFallback = "";
+  let questionLineIdx = -1;
+  for (let i = firstOptLine - 1; i >= 0 && i > firstOptLine - 25; i--) {
+    const rawLine = rawLines[i];
+    const cleaned = rawLine.replace(/^[\s│┃╮╭]+|[\s│┃╯╰]+$/g, "").trim();
+    if (!cleaned) {
+      if (question || questionFallback) {
+        if (rawLines[i-1] && rawLines[i-1].trim()) continue;  // одна пустая ОК
+        break;
+      }
+      continue;
+    }
+    if (isSeparator(cleaned)) continue;
+    // Пропускаем сильно отступленные строки — это «описание» опций, могло «выехать» в зону вопроса при кривом дисплее
+    const leading = rawLine.length - rawLine.replace(/^\s+/, "").length;
+    if (leading >= 4) continue;
+    if (cleaned.endsWith("?") && !question) {
+      question = cleaned;
+      questionLineIdx = i;
+      break;  // вопрос найден, дальше идём искать header
+    }
+    if (!questionFallback) {
+      questionFallback = cleaned;
+      questionLineIdx = i;
+    }
+  }
+  if (!question) question = questionFallback;
+  if (!question) return null;
+  // Header — выше вопроса, обычно короткая строка с чекбоксом ☐
+  let header: string | undefined;
+  let isMultiTab = false;
+  for (let i = questionLineIdx - 1; i >= 0 && i > questionLineIdx - 10; i--) {
+    const cleaned = rawLines[i].replace(/^[\s│┃╮╭]+|[\s│┃╯╰]+$/g, "").trim();
+    if (!cleaned) continue;
+    if (isSeparator(cleaned)) continue;
+    // Multi-tab detection: header вида «← ☐ Tab1 ☐ Tab2 ✔ Submit →»
+    // Признаки: ←/→ стрелки навигации ИЛИ ≥2 чекбоксов в одной строке, ИЛИ Submit в строке
+    const hasNavArrows = /[←→]/.test(cleaned);
+    const checkboxCount = (cleaned.match(/[☐☑✓✗▢▣]/g) || []).length;
+    const hasSubmit = /\bSubmit\b/i.test(cleaned);
+    if (hasNavArrows || checkboxCount >= 2 || hasSubmit) {
+      isMultiTab = true;
+      // Берём весь header как есть (для отображения в UI)
+      header = cleaned;
+    } else {
+      const dehead = cleaned.replace(/^[☐☑✓✗▢▣◯◉●○]\s*/, "").trim();
+      if (dehead && dehead.length <= 60 && !dehead.endsWith("?")) {
+        header = dehead;
+      }
+    }
+    break;
+  }
+  // Стабильный хэш: нормализуем пробелы + добавляем сигнатуру первых опций (это устойчивее чем чистый question)
+  const normalize = (s: string) => s.trim().replace(/\s+/g, ' ').toLowerCase();
+  const sig = normalize(question) + "|" + filtered.slice(0, 3).map(o => normalize(o.label)).join("|");
+  let h = 0;
+  for (let i = 0; i < sig.length; i++) h = ((h << 5) - h + sig.charCodeAt(i)) | 0;
+  const toolUseId = "tui-" + Math.abs(h).toString(36);
+  // Submit-review экран: «Review your answers» с опциями «Submit answers / Cancel»
+  const isSubmitReview = isMultiTab && filtered.some(o => /^(Submit answers|Cancel)$/i.test(o.label));
+  return {
+    toolUseId,
+    question,
+    header,
+    multiSelect: false,
+    options: filtered.map(o => ({ label: o.label, description: o.description, isFreeText: (o as any).isFreeText, tuiNum: o.num })),
+    answered: false,
+    isMultiTab,
+    isSubmitReview,
+  };
+}
+
+async function getTuiQuestion(tty: string | null): Promise<OpenQuestion | null> {
+  if (!tty) return null;
+  const all = await readAllTerminalContents();
+  const text = all.get(tty);
+  if (!text) return null;
+  return parseTuiModal(text);
+}
+
+// === macOS CGEvent: шлём keyboard events напрямую в процесс Terminal через CGEventPostToPid.
+// Это позволяет инжектить клавиши БЕЗ переключения system-wide focus — Terminal не вылезает.
+// Требует Accessibility-permission для процесса Bun (System Settings > Privacy & Security > Accessibility).
+let cgSymbols: any = null;
+let cfSymbols: any = null;
+let cgLoadAttempted = false;
+function loadCG(): boolean {
+  if (cgLoadAttempted) return !!cgSymbols;
+  cgLoadAttempted = true;
+  try {
+    const { dlopen, FFIType } = require("bun:ffi");
+    cgSymbols = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", {
+      CGEventCreateKeyboardEvent: { args: [FFIType.ptr, FFIType.u16, FFIType.bool], returns: FFIType.ptr },
+      CGEventPostToPid: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.void },
+      CGEventKeyboardSetUnicodeString: { args: [FFIType.ptr, FFIType.u64, FFIType.ptr], returns: FFIType.void },
+    }).symbols;
+    cfSymbols = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", {
+      CFRelease: { args: [FFIType.ptr], returns: FFIType.void },
+    }).symbols;
+    return true;
+  } catch (e) {
+    console.error("[CG] load failed:", e);
+    return false;
+  }
+}
+
+function cgSendKey(pid: number, keyCode: number) {
+  const down = cgSymbols.CGEventCreateKeyboardEvent(null, keyCode, true);
+  cgSymbols.CGEventPostToPid(pid, down);
+  cfSymbols.CFRelease(down);
+  const up = cgSymbols.CGEventCreateKeyboardEvent(null, keyCode, false);
+  cgSymbols.CGEventPostToPid(pid, up);
+  cfSymbols.CFRelease(up);
+}
+
+function cgSendText(pid: number, text: string) {
+  const { ptr } = require("bun:ffi");
+  for (const char of text) {
+    const codes: number[] = [];
+    for (let i = 0; i < char.length; i++) codes.push(char.charCodeAt(i));
+    const utf16 = new Uint16Array(codes);
+    const buf = Buffer.from(utf16.buffer, utf16.byteOffset, utf16.byteLength);
+    const down = cgSymbols.CGEventCreateKeyboardEvent(null, 0, true);
+    cgSymbols.CGEventKeyboardSetUnicodeString(down, codes.length, ptr(buf));
+    cgSymbols.CGEventPostToPid(pid, down);
+    cfSymbols.CFRelease(down);
+    const up = cgSymbols.CGEventCreateKeyboardEvent(null, 0, false);
+    cgSymbols.CGEventKeyboardSetUnicodeString(up, codes.length, ptr(buf));
+    cgSymbols.CGEventPostToPid(pid, up);
+    cfSymbols.CFRelease(up);
+  }
+}
+
+let terminalPidCache: { pid: number; at: number } | null = null;
+async function getTerminalPid(): Promise<number | null> {
+  if (terminalPidCache && Date.now() - terminalPidCache.at < 60000) return terminalPidCache.pid;
+  const proc = Bun.spawnSync(["pgrep", "-x", "Terminal"]);
+  const out = proc.stdout.toString().trim();
+  const pid = parseInt(out.split("\n")[0], 10);
+  if (Number.isInteger(pid) && pid > 0) {
+    terminalPidCache = { pid, at: Date.now() };
+    return pid;
+  }
+  return null;
+}
+
+// Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
+async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  if (!text) return { ok: false, error: "empty text" };
+  const termPid = await getTerminalPid();
+  if (!termPid) return { ok: false, error: "Terminal not found" };
+  const selectScript = `on run argv
+    set targetTty to "/dev/" & (item 1 of argv)
+    tell application "Terminal"
+      repeat with w in windows
+        try
+          repeat with t in tabs of w
+            try
+              if (tty of t) is targetTty then
+                set selected of t to true
+                set frontmost of w to true
+                set index of w to 1
+                return "ok"
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+    return "tty not found"
+  end run`;
+  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
+  if (sel.stdout.toString().trim() !== "ok") return { ok: false, error: "tab not found" };
+  if (!loadCG()) return { ok: false, error: "CG FFI failed" };
+  await new Promise(r => setTimeout(r, 80));
+  cgSendText(termPid, text);
+  console.log(`[type-text ${tty}] len=${text.length} CG-direct OK pid=${termPid}`);
+  return { ok: true };
+}
+
+// Универсальная отправка raw-клавиш в TUI-вкладку через CGEventPostToPid.
+// Используется для multi-tab навигации (left/right arrows), Submit (enter на нужной вкладке), Esc (отмена модала).
+async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "enter" | "escape"): Promise<{ ok: boolean; error?: string }> {
+  const keyMap: Record<string, number> = {
+    left: 123, right: 124, down: 125, up: 126, enter: 36, escape: 53,
+  };
+  const keyCode = keyMap[key];
+  if (keyCode === undefined) return { ok: false, error: "invalid key" };
+
+  const termPid = await getTerminalPid();
+  if (!termPid) return { ok: false, error: "Terminal not found" };
+
+  // Set tab selected + bring its window to TERMINAL'S front (не системный фронт — Safari остаётся фронт),
+  // чтобы CGEvent шёл именно в этот таб, а не в чужой.
+  const selectScript = `on run argv
+    set targetTty to "/dev/" & (item 1 of argv)
+    tell application "Terminal"
+      repeat with w in windows
+        try
+          repeat with t in tabs of w
+            try
+              if (tty of t) is targetTty then
+                set selected of t to true
+                set frontmost of w to true
+                set index of w to 1
+                return "ok"
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+    return "tty not found"
+  end run`;
+  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
+  if (sel.stdout.toString().trim() !== "ok") return { ok: false, error: "tab not found" };
+
+  if (!loadCG()) return { ok: false, error: "CG FFI failed" };
+  // Маленькая задержка чтобы Terminal успел переключить front-tab внутри своего стека
+  await new Promise(r => setTimeout(r, 80));
+  cgSendKey(termPid, keyCode);
+  console.log(`[send-raw-key ${tty}] key=${key} (code=${keyCode}) CG-direct OK pid=${termPid}`);
+  return { ok: true };
+}
+
+async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: string): Promise<{ ok: boolean; error?: string }> {
+  if (optionIndex < 1 || optionIndex > 9) return { ok: false, error: "optionIndex out of range 1-9" };
+  const downs = optionIndex - 1;
+  const termPid = await getTerminalPid();
+  if (!termPid) return { ok: false, error: "Terminal process not found" };
+  // Шаг 1: AppleScript — БЕЗ `activate` Terminal'а, только выбираем нужную вкладку внутри Terminal.
+  // Это не переключает system focus.
+  const selectScript = `on run argv
+    set targetTty to "/dev/" & (item 1 of argv)
+    tell application "Terminal"
+      repeat with w in windows
+        try
+          repeat with t in tabs of w
+            try
+              if (tty of t) is targetTty then
+                set selected of t to true
+                set frontmost of w to true
+                set index of w to 1
+                return "ok"
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+    return "tty not found"
+  end run`;
+  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
+  const selOut = sel.stdout.toString().trim();
+  if (selOut !== "ok") return { ok: false, error: "tab " + tty + " not found in Terminal" };
+  // Маленькая задержка чтобы Terminal успел переключить front-tab
+  await new Promise(r => setTimeout(r, 80));
+  // Шаг 2: грузим CG-FFI
+  if (!loadCG()) return { ok: false, error: "CGEvent FFI failed to load" };
+  // Шаг 3: посылаем клавиши через CGEventPostToPid → Terminal-процесс (без focus)
+  try {
+    for (let i = 0; i < downs; i++) {
+      cgSendKey(termPid, 125);  // Down arrow
+      await new Promise(r => setTimeout(r, 60));
+    }
+    await new Promise(r => setTimeout(r, 150));
+    if (!freeText || freeText.length === 0) {
+      cgSendKey(termPid, 36);  // Enter
+    } else {
+      cgSendText(termPid, freeText);
+      await new Promise(r => setTimeout(r, 200));
+      cgSendKey(termPid, 36);  // Enter to submit
+    }
+    console.log(`[answer-question ${tty} idx=${optionIndex} freeText=${freeText ? "yes(" + freeText.length + ")" : "no"}] CG-direct OK pid=${termPid}`);
+    return { ok: true };
+  } catch (e: any) {
+    console.error("[answer-question] CG error:", e?.message || e);
+    return { ok: false, error: "CG inject failed: " + (e?.message || String(e)) };
+  }
 }
 
 async function controlTerminal(tty: string, action: "focus" | "send", msg = ""): Promise<{ result: string; stderr: string }> {
@@ -867,12 +1607,16 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v1";
+const CACHE = "cc-dashboard-v27";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
 });
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('activate', e => e.waitUntil((async () => {
+  const keys = await caches.keys();
+  await Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)));
+  await self.clients.claim();
+})()));
 self.addEventListener('fetch', e => {
   // Network-first для главной HTML страницы. Если сервер недоступен — отдаём кэш с offline-баннером.
   const url = new URL(e.request.url);
@@ -936,14 +1680,16 @@ const HTML = `<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { font: 14px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 16px; min-height: 100vh; display: flex; flex-direction: column; }
+  body { font: 14px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 16px; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
   /* Chrome fullscreen on macOS slides a toolbar over the top ~60px when cursor hits the top edge.
      Detection via JS: body.chrome-fs is set when window covers the whole screen.
      В фуллскрине прижимаем body к 100vh с overflow:hidden, чтобы выезжающий тулбар Chrome
      не показывал «дырку» под собой и не было лишнего скроллбара. Скролл живёт внутри .feed. */
   body.chrome-fs { padding-top: 64px; height: 100vh; max-height: 100vh; overflow: hidden; }
   .topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; padding: 4px 0; }
-  h1 { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: clamp(26px, 4.5vw, 42px); font-weight: 700; margin: 0; flex: 1; min-width: 0; color: #f0f6fc; text-align: center; letter-spacing: 0.04em; line-height: 1.05; text-shadow: 0 0 14px rgba(255,255,255,0.1), 0 2px 6px rgba(0,0,0,0.5); position: relative; }
+  h1 { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: clamp(26px, 4.5vw, 42px); font-weight: 700; margin: 0; flex: 1; min-width: 0; color: #f0f6fc; text-align: center; letter-spacing: 0.04em; line-height: 1.05; text-shadow: 0 0 14px rgba(255,255,255,0.1), 0 2px 6px rgba(0,0,0,0.5); }
+  h1 .logo-text { position: relative; cursor: pointer; user-select: none; display: inline-block; transition: text-shadow 0.15s; }
+  h1 .logo-text:hover { text-shadow: 0 0 20px rgba(255,255,255,0.18), 0 2px 6px rgba(0,0,0,0.5); }
   h1 .blood { position: absolute; left: 0; right: 0; top: 0; color: #a30000; pointer-events: none; text-shadow: 0 0 10px rgba(180,0,0,0.55), 0 2px 6px rgba(60,0,0,0.7); clip-path: inset(0 0 100% 0); animation: bloodDrip 90s linear infinite; animation-delay: -80s; will-change: clip-path, opacity; }
   @keyframes bloodDrip {
     0%, 94% { clip-path: inset(0 0 100% 0); opacity: 0.92; }
@@ -956,10 +1702,22 @@ const HTML = `<!doctype html>
   .menu-btn:hover { background: #30363d; }
   .menu-btn svg { width: 18px; height: 18px; display: block; }
   .topbar-spacer { display: block; width: 40px; height: 36px; flex-shrink: 0; }
-  .conn-banner { background: #b3260f; color: #fff; padding: 10px 16px; font-size: 13px; text-align: center; line-height: 1.35; border-bottom: 1px solid #d73a49; }
-  .conn-banner b { display: block; font-size: 14px; margin-bottom: 2px; }
-  .conn-banner .conn-detail { opacity: 0.85; font-size: 12px; }
-  .conn-banner.warn { background: #8d5a00; border-bottom-color: #d4a500; }
+  .conn-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 250; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .conn-modal-inner { background: #0d1117; border: 1.5px solid #f85149; border-radius: 16px; padding: 36px 32px 28px; max-width: 460px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; box-shadow: 0 16px 48px rgba(248,81,73,0.18), 0 0 60px rgba(248,81,73,0.12); }
+  .conn-modal.warn .conn-modal-inner { border-color: #d4a500; box-shadow: 0 16px 48px rgba(212,165,0,0.18), 0 0 60px rgba(212,165,0,0.12); }
+  .conn-icon { width: 56px; height: 56px; display: flex; align-items: center; justify-content: center; color: #f85149; }
+  .conn-modal.warn .conn-icon { color: #d4a500; }
+  .conn-icon svg { width: 100%; height: 100%; }
+  .conn-title { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: clamp(28px, 6vw, 38px); font-weight: 700; margin: 0; color: #f0f6fc; letter-spacing: 0.03em; line-height: 1.1; text-shadow: 0 0 14px rgba(255,255,255,0.08), 0 2px 6px rgba(0,0,0,0.5); }
+  .conn-detail { color: #8b949e; font-size: 14px; line-height: 1.5; margin: 0; }
+  .conn-retry { margin-top: 10px; background: #21262d; border: 0; color: #fff; padding: 10px 24px; border-radius: 22px; font-family: inherit; font-size: 14px; cursor: pointer; transition: background 0.15s, transform 0.15s; }
+  .conn-retry:hover { background: #30363d; }
+  .conn-retry:active { transform: scale(0.97); }
+  body.theme-light .conn-modal-inner { background: #ffffff; }
+  body.theme-light .conn-title { color: #0d1117; text-shadow: 0 0 8px rgba(0,0,0,0.05); }
+  body.theme-light .conn-detail { color: #57606a; }
+  body.theme-light .conn-retry { background: #eaeef2; color: #1f2328; }
+  body.theme-light .conn-retry:hover { background: #d0d7de; }
   .update-btn { background: #1f6feb !important; position: relative; }
   .update-btn:hover { background: #2c7bef !important; }
   .update-btn::after { content: ""; position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; background: #f0c674; border-radius: 50%; }
@@ -979,13 +1737,111 @@ const HTML = `<!doctype html>
   .upd-apply { background: #238636; color: #fff; }
   .upd-apply:hover { background: #2ea043; }
   .upd-apply:disabled { opacity: 0.6; cursor: not-allowed; }
+  /* New session modal — стиль логин-формы */
+  .ns-modal-inner { background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 28px 26px 22px; max-width: 420px; width: 100%; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 16px 48px rgba(0,0,0,0.5); }
+  .ns-title { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: clamp(32px, 6vw, 42px); font-weight: 700; margin: 0 0 8px; text-align: center; color: #f0f6fc; letter-spacing: 0.04em; text-shadow: 0 0 12px rgba(255,255,255,0.1), 0 2px 6px rgba(0,0,0,0.5); }
+  .ns-input { background: #0d1117; border: 1px solid #30363d; color: #e6edf3; border-radius: 22px; padding: 12px 20px; font-size: 15px; font-family: inherit; width: 100%; box-sizing: border-box; }
+  .ns-input:focus { outline: 0; border-color: #58a6ff; }
+  .ns-input::placeholder { color: #6e7681; }
+  .ns-input-with-action { position: relative; display: flex; align-items: center; }
+  .ns-input-with-action .ns-input { padding-right: 48px; }
+  .ns-folder-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: transparent; border: 0; color: #8b949e; cursor: pointer; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+  .ns-folder-btn:hover { background: #21262d; color: #c9d1d9; }
+  .ns-folder-btn svg { width: 18px; height: 18px; }
+  .ns-folder-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: #0d1117; border: 1px solid #30363d; border-radius: 12px; max-height: 220px; overflow-y: auto; z-index: 20; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .ns-folder-item { padding: 10px 16px; cursor: pointer; font-size: 13px; color: #c9d1d9; font-family: ui-monospace, "SF Mono", monospace; border-bottom: 1px solid #21262d; }
+  .ns-folder-item:last-child { border-bottom: 0; }
+  .ns-folder-item:hover { background: #21262d; }
+  .ns-toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 4px; cursor: pointer; color: #c9d1d9; font-size: 14px; }
+  .ns-toggle-row:hover { color: #fff; }
+  .ns-error { color: #f85149; font-size: 13px; min-height: 18px; text-align: center; }
+  .ns-resume-hint { color: #58a6ff; font-size: 12px; line-height: 1.45; padding: 8px 12px; background: rgba(88,166,255,0.08); border: 1px solid rgba(88,166,255,0.3); border-radius: 8px; text-align: left; }
+  .ns-resume-hint.warn { color: #f0c674; background: rgba(240,198,116,0.08); border-color: rgba(240,198,116,0.3); }
+  .ns-input.locked, .toggle.locked { opacity: 0.55; pointer-events: none; }
+  .ns-actions { display: flex; gap: 10px; }
+  .ns-btn { flex: 1; padding: 12px 16px; border-radius: 22px; border: 0; font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; transition: background 0.15s, transform 0.15s; }
+  .ns-btn:active { transform: scale(0.98); }
+  .ns-btn-secondary { background: #21262d; color: #c9d1d9; }
+  .ns-btn-secondary:hover { background: #30363d; }
+  .ns-btn-primary { background: #238636; color: #fff; }
+  .ns-btn-primary:hover { background: #2ea043; }
+  .ns-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  /* Light theme overrides */
+  body.theme-light .ns-modal-inner { background: #ffffff; border-color: #d0d7de; }
+  body.theme-light .ns-title { color: #0d1117; text-shadow: 0 0 8px rgba(0,0,0,0.05); }
+  body.theme-light .ns-input { background: #f6f8fa; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .ns-input::placeholder { color: #6e7681; }
+  body.theme-light .ns-folder-list { background: #ffffff; border-color: #d0d7de; }
+  body.theme-light .ns-folder-item { color: #1f2328; border-bottom-color: #eaeef2; }
+  body.theme-light .ns-folder-item:hover { background: #f6f8fa; }
+  body.theme-light .ns-toggle-row { color: #1f2328; }
+  body.theme-light .ns-btn-secondary { background: #eaeef2; color: #1f2328; }
+  body.theme-light .ns-btn-secondary:hover { background: #d0d7de; }
+  body.theme-light .ns-btn-primary { background: #1f883d; }
+  body.theme-light .ns-btn-primary:hover { background: #2c9c4d; }
   .refresh-btn.spinning svg { animation: spin 0.6s linear infinite; }
   /* Drawer (sessions list) — slides in from left on all platforms */
-  #drawer { position: fixed; top: 0; left: 0; bottom: 0; width: min(85vw, 360px); background: #0d1117; border-right: 1px solid #30363d; transform: translateX(-100%); transition: transform 0.22s ease; z-index: 100; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top, 0); padding-bottom: env(safe-area-inset-bottom, 0); }
+  #drawer { position: fixed; top: 0; left: 0; bottom: 0; width: min(85vw, 360px); background: #0d1117; border-right: 1px solid #30363d; transform: translateX(-100%); transition: transform 0.22s ease; z-index: 100; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top, 0); padding-bottom: env(safe-area-inset-bottom, 0); overflow-y: auto; overscroll-behavior: contain; }
   #drawer.open { transform: translateX(0); }
-  .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #30363d; }
-  .drawer-title { font-size: 14px; font-weight: 500; color: #e6edf3; }
-  .drawer-close { background: transparent; border: 0; color: #8b949e; font-size: 24px; cursor: pointer; line-height: 1; padding: 4px 10px; }
+  .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #30363d; position: sticky; top: 0; background: #0d1117; z-index: 1; }
+  body.theme-light .drawer-head { background: #ffffff; }
+  .drawer-title { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: 28px; font-weight: 700; color: #f0f6fc; letter-spacing: 0.03em; line-height: 1; text-shadow: 0 0 10px rgba(255,255,255,0.08); }
+  .drawer-section { border-bottom: 1px solid #21262d; }
+  .drawer-section:last-child { border-bottom: 0; }
+  .drawer-section-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; cursor: pointer; user-select: none; color: #e6edf3; font-size: 14px; font-weight: 500; }
+  .drawer-section-head:hover { background: #161b22; }
+  .drawer-section-head .drawer-chevron { width: 16px; height: 16px; transition: transform 0.2s; color: #8b949e; }
+  .drawer-section.open > .drawer-section-head .drawer-chevron { transform: rotate(180deg); }
+  .drawer-section-body { display: none; overflow: hidden; }
+  .drawer-section.open > .drawer-section-body { display: block; }
+  .drawer-section .grid { padding: 4px 12px 12px; }
+  .new-session-btn { display: flex; align-items: center; justify-content: center; width: calc(100% - 24px); margin: 8px 12px 4px; padding: 12px; background: transparent; border: 1.5px solid #ffffff; color: #ffffff; border-radius: 8px; cursor: pointer; font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: 20px; font-weight: 700; letter-spacing: 0.04em; text-shadow: 0 0 10px rgba(255,255,255,0.15); line-height: 1.2; transition: background 0.15s, transform 0.15s; }
+  .new-session-btn:hover { background: rgba(255,255,255,0.05); transform: scale(1.02); }
+  body.theme-light .new-session-btn { border-color: #0d1117; color: #0d1117; text-shadow: 0 0 6px rgba(0,0,0,0.06); }
+  body.theme-light .new-session-btn:hover { background: rgba(0,0,0,0.04); }
+  .drawer-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 10px 28px; cursor: pointer; color: #c9d1d9; font-size: 14px; }
+  .drawer-item:hover { background: #161b22; }
+  .drawer-item .drawer-item-state { color: #6e7681; font-size: 12px; }
+  .drawer-item.active .drawer-item-state { color: #3fb950; }
+  .toggle { position: relative; display: inline-block; width: 46px; height: 26px; background: #30363d; border-radius: 13px; transition: background 0.2s; flex-shrink: 0; pointer-events: none; }
+  .toggle .toggle-thumb { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; background: #f0f6fc; border-radius: 50%; transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  .toggle.on { background: #238636; }
+  .toggle.on .toggle-thumb { transform: translateX(20px); }
+  /* Theme toggle — sun on left (light), moon on right (dark) */
+  .theme-toggle .toggle-thumb { display: flex; align-items: center; justify-content: center; }
+  .theme-toggle .theme-icon { width: 13px; height: 13px; color: #8b949e; }
+  .theme-toggle .theme-icon-moon { display: none; }
+  .theme-toggle.on .theme-icon-sun { display: none; }
+  .theme-toggle.on .theme-icon-moon { display: block; }
+  .theme-toggle.on { background: #1f3a8a; }
+  /* Раскрывающийся пункт настроек с под-выбором */
+  .drawer-sub-head { display: flex; align-items: center; justify-content: space-between; }
+  .drawer-sub-state { display: inline-flex; align-items: center; gap: 6px; color: #8b949e; font-size: 13px; }
+  .drawer-chevron-sm { width: 14px; height: 14px; transition: transform 0.2s; }
+  .drawer-sub.open .drawer-chevron-sm { transform: rotate(180deg); }
+  .drawer-sub-body { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
+  .drawer-sub.open .drawer-sub-body { max-height: 80px; }
+  /* 2-position segmented switch */
+  .theme-switch { position: relative; display: flex; margin: 4px 28px 12px; background: #21262d; border-radius: 999px; padding: 3px; }
+  .theme-switch-thumb { position: absolute; top: 3px; left: 3px; width: calc(50% - 3px); height: calc(100% - 6px); background: #ffffff; border-radius: 999px; transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
+  .theme-switch[data-active="light"] .theme-switch-thumb { transform: translateX(calc(100% + 0px)); }
+  .theme-switch-opt { flex: 1; background: transparent; border: 0; padding: 8px 12px; color: #c9d1d9; font-size: 13px; cursor: pointer; border-radius: 999px; z-index: 1; transition: color 0.2s; font-family: inherit; }
+  .theme-switch[data-active="dark"] .theme-switch-opt[data-theme="dark"],
+  .theme-switch[data-active="light"] .theme-switch-opt[data-theme="light"] { color: #0d1117; font-weight: 500; }
+  .drawer-section-count { color: #6e7681; font-size: 12px; font-weight: 400; margin-left: 4px; }
+  .hidden-list { padding: 4px 14px 12px 14px; }
+  .hidden-list-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; font-size: 12px; color: #8b949e; border-bottom: 1px solid #21262d; }
+  .hidden-list-item:last-child { border-bottom: 0; }
+  .hidden-list-item .sid { font-family: ui-monospace, monospace; }
+  .hidden-list-item button { background: #21262d; border: 0; color: #58a6ff; font-size: 11px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  .hidden-list-item button:hover { background: #30363d; }
+  .hidden-list-empty { padding: 12px 0; text-align: center; color: #6e7681; font-size: 12px; }
+  .drawer-sub.open > .drawer-sub-body { max-height: 240px; }
+  .drawer-dot { display: inline-block; width: 8px; height: 8px; background: #f85149; border-radius: 50%; margin-left: 8px; vertical-align: middle; }
+  .green-dot { display: inline-block; width: 8px; height: 8px; background: #3fb950; border-radius: 50%; margin-left: 6px; vertical-align: middle; box-shadow: 0 0 6px rgba(63,185,80,0.5); }
+  .menu-btn { position: relative; }
+  .menu-dot { position: absolute; top: 5px; right: 5px; width: 8px; height: 8px; background: #f85149; border-radius: 50%; }
+  .drawer-close { background: transparent; border: 0; color: #f0f6fc; font-family: 'UnifrakturCook', 'Pirata One', serif; font-weight: 700; font-size: 24px; cursor: pointer; line-height: 1; padding: 0; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; text-shadow: 0 0 8px rgba(255,255,255,0.1); }
   .drawer-close:hover { color: white; }
   .drawer-backdrop { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 99; opacity: 0; pointer-events: none; transition: opacity 0.22s; }
   .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
@@ -1017,6 +1873,13 @@ const HTML = `<!doctype html>
   .card.self::after { content: 'это твой чат'; display: block; font-size: 10px; color: #a371f7; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
   .card.dead { opacity: 0.55; }
   .resume-btn { display: inline-block; margin-top: 6px; background: #1f6feb; border: 0; color: white; padding: 4px 10px; border-radius: 5px; font-size: 11px; cursor: pointer; font-weight: 500; }
+  .card { position: relative; }
+  .hide-btn { position: absolute; top: 4px; right: 6px; background: transparent; border: 0; color: #8b949e; padding: 0; width: 22px; height: 22px; line-height: 1; cursor: pointer; font-family: 'UnifrakturCook', 'Pirata One', serif; font-weight: 700; font-size: 20px; display: inline-flex; align-items: center; justify-content: center; transition: color 0.15s, transform 0.15s; }
+  .main-pin { position: absolute; top: 6px; right: 8px; color: #58a6ff; pointer-events: none; display: inline-flex; }
+  .main-pin svg { width: 16px; height: 16px; display: block; }
+  .hide-btn:hover { color: #f85149; transform: scale(1.15); }
+  body.theme-light .hide-btn { color: #57606a; }
+  body.theme-light .hide-btn:hover { color: #cf222e; }
   .resume-btn:hover { background: #388bfd; }
   .resume-btn:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
 
@@ -1026,22 +1889,50 @@ const HTML = `<!doctype html>
   .welcome { display: none; flex: 1; flex-direction: column; padding: 32px 24px; overflow-y: auto; }
   .welcome.show { display: flex; }
   .welcome-inner { width: 100%; max-width: 1200px; margin: 0 auto; }
-  .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; }
+  .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; align-items: start; }
   .welcome-grid .card { padding: 16px; }
+  .new-session-card { display: flex; align-items: center; justify-content: center; background: transparent !important; border: 1.5px solid #ffffff !important; transition: background 0.15s, transform 0.15s; }
+  .new-session-card span { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: 0.04em; text-shadow: 0 0 10px rgba(255,255,255,0.15); line-height: 1.2; }
+  .new-session-card:hover { background: rgba(255,255,255,0.05) !important; transform: scale(1.02); }
+  body.theme-light .new-session-card { border-color: #0d1117 !important; }
+  body.theme-light .new-session-card span { color: #0d1117; text-shadow: 0 0 6px rgba(0,0,0,0.06); }
+  body.theme-light .new-session-card:hover { background: rgba(0,0,0,0.04) !important; }
   .welcome-empty { color: #6e7681; text-align: center; padding: 60px 20px; font-size: 16px; }
   .panel { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; min-width: 460px; flex: 1 1 0; display: flex; flex-direction: column; max-height: calc(100vh - 60px); }
-  .panel-header { padding: 12px 16px; display: flex; align-items: center; gap: 8px; }
+  .panel-header { padding: 12px 16px; display: flex; align-items: center; gap: 8px; cursor: grab; }
+  .panel-header:active { cursor: grabbing; }
+  .panel-header button, .panel-header .title-block { cursor: pointer; }
+  .panel.dragging { opacity: 0.5; }
+  .panel.drag-over-left { box-shadow: -3px 0 0 0 #58a6ff inset, -3px 0 0 0 #58a6ff; }
+  .panel.drag-over-right { box-shadow: 3px 0 0 0 #58a6ff inset, 3px 0 0 0 #58a6ff; }
   .panel-header .title-block { flex: 1; min-width: 0; cursor: pointer; user-select: none; }
   .panel-header .title-main { font-size: 14px; font-weight: 500; color: #e6edf3; margin-bottom: 2px; word-break: break-word; }
   .panel-header .cwd-line { font-size: 11px; color: #8b949e; word-break: break-all; }
   .panel-header button { background: #21262d; border: 0; color: #c9d1d9; padding: 0; border-radius: 50%; width: 36px; height: 36px; min-width: 36px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .panel-header button:hover { background: #30363d; color: white; }
+  /* Status-line в стиле claude code: эмблема ✻ + текст «думает…», между feed и composer */
+  .status-line { display: flex; align-items: center; gap: 8px; padding: 6px 16px 8px; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; color: #c9d1d9; }
+  .status-line .claude-mark { color: #f0c674; font-size: 14px; line-height: 1; animation: claude-pulse 1.4s ease-in-out infinite; }
+  .status-line.tool .claude-mark { color: #58a6ff; }
+  .status-line.waiting .claude-mark { color: #3fb950; animation: none; }
+  .status-line.limit .claude-mark { color: #f85149; animation: none; font-size: 16px; }
+  .status-line .wake-btn { margin-left: auto; background: #1f6feb; border: 0; color: #fff; font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-family: inherit; }
+  .status-line .wake-btn:hover { background: #388bfd; }
+  .status-line .wake-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .status-line .status-text { color: #8b949e; }
+  @keyframes claude-pulse { 0%,100% { opacity: 1; transform: rotate(0deg); } 50% { opacity: 0.4; transform: rotate(180deg); } }
+  body.theme-light .status-line { color: #1f2328; }
+  body.theme-light .status-line .status-text { color: #57606a; }
   .panel-header button svg { width: 16px; height: 16px; display: block; }
   .panel-header .interrupt-btn { width: auto; min-width: auto; padding: 0 14px; font-size: 13px; font-weight: 500; color: white; background: #d73a49; border-radius: 18px; height: 36px; letter-spacing: 0.02em; }
   .panel-header .interrupt-btn:hover { background: #cb2431; }
   .panel-header .close-btn:hover { background: #d73a49; color: white; }
   .warn { background: #321c1c; color: #f0c674; padding: 8px 14px; font-size: 12px; border-bottom: 1px solid #30363d; }
   .warn.self { background: #1f1633; color: #a371f7; }
+  .warn.kid-locked { background: rgba(210,153,34,0.12); color: #d29922; border-bottom-color: rgba(210,153,34,0.35); }
+  .warn.kid-locked .kid-override-btn { margin-left: 12px; padding: 4px 12px; background: rgba(248,81,73,0.15); border: 1px solid rgba(248,81,73,0.4); color: #f85149; border-radius: 4px; font: inherit; cursor: pointer; font-size: 12px; }
+  .warn.kid-locked .kid-override-btn:hover { background: rgba(248,81,73,0.25); }
+  .warn.kid-locked .kid-override-btn:disabled { opacity: 0.6; cursor: default; }
   .feed { flex: 1; overflow-y: auto; padding: 14px 16px; }
   .feed > * { max-width: 900px; margin-left: auto; margin-right: auto; }
   .msg { margin-bottom: 12px; }
@@ -1051,6 +1942,62 @@ const HTML = `<!doctype html>
   .msg.tool .who { color: #8b949e; }
   .msg .body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
   .msg.tool .body { color: #8b949e; font-size: 12px; }
+  .msg.question .who { color: #d29922; }
+  .q-card { background: rgba(187,128,9,0.08); border: 1px solid rgba(210,153,34,0.45); border-radius: 8px; padding: 12px 14px; }
+  .msg.question.answered .q-card { background: rgba(63,185,80,0.05); border-color: rgba(63,185,80,0.35); }
+  .q-header { font-size: 11px; color: #d29922; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-weight: 600; }
+  .msg.question.answered .q-header { color: #3fb950; }
+  .q-question { font-size: 14px; color: #e6edf3; font-weight: 500; margin-bottom: 10px; }
+  .q-opts { display: flex; flex-direction: column; gap: 6px; }
+  .q-opt { display: block; width: 100%; text-align: left; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; color: #c9d1d9; font: inherit; cursor: default; transition: all 0.15s; position: relative; }
+  button.q-opt.active { cursor: pointer; }
+  button.q-opt.active:hover { background: #1f2937; border-color: #d29922; transform: translateY(-1px); }
+  .q-num { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; text-align: center; background: #30363d; border-radius: 50%; color: #d29922; font-size: 11px; font-weight: 700; margin-right: 8px; vertical-align: middle; }
+  button.q-opt.active:hover .q-num { background: #d29922; color: #0d1117; }
+  .q-label { font-weight: 500; }
+  .q-desc { font-size: 12px; color: #8b949e; margin-top: 4px; padding-left: 26px; line-height: 1.4; }
+  .q-status { margin-top: 10px; font-size: 12px; color: #d29922; }
+  .msg.question.answered .q-status { color: #3fb950; }
+  .q-status.multitab { background: rgba(210,153,34,0.08); border: 1px solid rgba(210,153,34,0.35); border-radius: 6px; padding: 8px 12px; color: #d29922; }
+  .q-rawkey { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; }
+  .q-rawkey:hover { background: #2d333b; border-color: #58a6ff; }
+  .q-rawkey.q-esc { color: #f85149; border-color: rgba(248,81,73,0.4); margin-left: auto; }
+  .q-rawkey.q-esc:hover { background: rgba(248,81,73,0.15); border-color: #f85149; }
+  .q-next-tab, .q-final-submit { background: #238636; border: 0; color: #fff; padding: 8px 18px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500; font-size: 13px; }
+  .q-next-tab:hover, .q-final-submit:hover { background: #2ea043; }
+  .q-next-tab:disabled { opacity: 0.5; cursor: not-allowed; }
+  .q-opt.picked { background: rgba(63,185,80,0.08); border-color: rgba(63,185,80,0.45); }
+  .q-check { display: inline-block; width: 16px; color: #3fb950; margin-right: 6px; font-weight: 700; }
+  /* двушаговая логика: подсветка выбранной опции + кнопки подтвердить/отмена */
+  button.q-opt.selected { background: rgba(63,185,80,0.15); border-color: #3fb950; box-shadow: 0 0 0 1px rgba(63,185,80,0.35); }
+  button.q-opt.selected .q-num { background: #3fb950; color: #0d1117; }
+  /* Кнопки всегда видимы и всегда полностью отрисованы.
+     Если нет выбора — клик игнорируется на JS-уровне; чтобы не было визуальной игры
+     с opacity при ре-рендерах, не применяем никаких dim-стилей. */
+  .q-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .q-confirm { background: #238636; border: 0; color: #fff; padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500; }
+  .q-confirm:hover { background: #2ea043; }
+  .q-confirm:disabled { opacity: 0.6; cursor: not-allowed; }
+  .q-cancel { background: transparent; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; }
+  .q-cancel:hover { border-color: #f85149; color: #f85149; }
+  /* free-text-answered: пользовательский текст в плашке, без input */
+  .q-opt.free-text-answered .q-label { white-space: pre-wrap; word-break: break-word; font-style: normal; color: #c9d1d9; }
+  /* Все плашки опций имеют одинаковую минимальную высоту — даже если текст ответа короткий,
+     плашка не должна быть тоньше остальных. Если текста больше — плашка вырастет. */
+  .q-opt { min-height: 56px; box-sizing: border-box; }
+  /* free-text option (открытый): внутри кнопки текстовый input */
+  button.q-opt.free-text { padding-bottom: 8px; }
+  button.q-opt.free-text .q-label { font-style: italic; color: #8b949e; }
+  button.q-opt.free-text.selected .q-label { color: #c9d1d9; }
+  .q-free-input { display: block; width: calc(100% - 26px); margin: 8px 0 0 26px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 6px 10px; color: #c9d1d9; font: inherit; font-style: normal; box-sizing: border-box; }
+  .q-free-input:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 2px rgba(88,166,255,0.2); }
+  button.q-opt.free-text.selected .q-free-input { border-color: #3fb950; }
+  button.q-opt.free-text.selected .q-free-input:focus { border-color: #58a6ff; }
+  /* Бейдж «?» на карточке сессии */
+  .card.has-question { box-shadow: 0 0 0 2px rgba(210,153,34,0.55); border-left-color: #d29922 !important; }
+  .card .q-badge { display: none; }
+  .card.has-question .q-badge { display: inline-block; margin-left: 6px; color: #d29922; font-weight: 700; animation: q-pulse 1.6s ease-in-out infinite; font-size: 14px; }
+  @keyframes q-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   .msg .body pre.code-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; overflow-x: auto; font: 12px/1.45 ui-monospace, "SF Mono", monospace; color: #c9d1d9; margin: 6px 0; white-space: pre; }
   .msg .body code.inline-code { background: rgba(110,118,129,0.15); border-radius: 3px; padding: 1px 5px; font: 12px ui-monospace, monospace; color: #79c0ff; cursor: pointer; transition: background 0.15s; }
   .msg .body code.inline-code:hover { background: rgba(110,118,129,0.35); }
@@ -1091,15 +2038,22 @@ const HTML = `<!doctype html>
   .attach-btn, .mic-btn { background: #21262d; border: 0; color: #c9d1d9; padding: 0; border-radius: 50%; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; min-width: 40px; flex-shrink: 0; }
   .attach-btn:hover, .mic-btn:hover { background: #30363d; color: white; }
   .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
-  .mic-btn.recording { background: #d73a49; animation: pulse 1s ease-in-out infinite; }
+  .mic-btn { transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
+  .mic-btn.recording { background: #d73a49; transform: scale(1.8); box-shadow: 0 0 22px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.35); animation: mic-glow 1.4s ease-in-out infinite; z-index: 5; }
+  .mic-btn .rec-arrow { display: none; width: 18px; height: 18px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.3)); }
+  .mic-btn.recording .mic-icon { display: none; }
+  .mic-btn.recording .rec-arrow { display: block; }
   .mic-btn.transcribing { background: #1f6feb; }
-  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.55 } }
+  @keyframes mic-glow {
+    0%, 100% { box-shadow: 0 0 22px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.35); }
+    50% { box-shadow: 0 0 32px rgba(215,58,73,0.95), 0 0 64px rgba(215,58,73,0.55); }
+  }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
   .mic-btn.transcribing svg { animation: spin 1s linear infinite; }
   .composer textarea { flex: 1; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 22px; padding: 10px 16px; font: 13px/1.4 -apple-system, sans-serif; resize: none; height: 40px; min-height: 40px; max-height: 50vh; overflow-y: auto; box-sizing: border-box; }
   .composer textarea:focus { outline: none; border-color: #58a6ff; }
-  .composer .send-btn { background: #238636; border: 0; color: white; padding: 0; border-radius: 50%; cursor: pointer; width: 40px; height: 40px; min-width: 40px; display: inline-flex; align-items: center; justify-content: center; }
-  .composer .send-btn:hover { background: #2ea043; }
+  .composer .send-btn { background: #58a6ff; border: 0; color: white; padding: 0; border-radius: 50%; cursor: pointer; width: 40px; height: 40px; min-width: 40px; display: inline-flex; align-items: center; justify-content: center; }
+  .composer .send-btn:hover { background: #79b8ff; }
   .composer .send-btn:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
   .composer .send-btn svg { width: 16px; height: 16px; display: block; transform: translateX(-1px); }
 
@@ -1119,7 +2073,7 @@ const HTML = `<!doctype html>
     .badge { font-size: 9px; }
 
     /* Active panel takes full viewport on mobile */
-    body { min-height: 100dvh; }
+    body { min-height: 100dvh; height: auto; max-height: none; overflow: visible; }
     #panels { flex-direction: column; gap: 0; min-height: auto; padding: 0; overflow: visible; flex: 1; }
     #panels:empty { padding: 20px; }
     #panels:empty::before { font-size: 12px; padding: 0; text-align: center; }
@@ -1147,21 +2101,133 @@ const HTML = `<!doctype html>
     #panels { flex-direction: column; overflow-x: hidden; overflow-y: auto; min-height: auto; }
     .panel { min-width: 0; width: 100%; max-height: calc(100vh - 80px); flex: 0 0 auto; }
   }
+
+  /* === Light theme === */
+  body.theme-light { color-scheme: light; background: #f6f8fa; color: #1f2328; }
+  body.theme-light h1, body.theme-light .drawer-title, body.theme-light .welcome-btn { color: #0d1117; text-shadow: 0 0 8px rgba(0,0,0,0.05); }
+  body.theme-light h1 .blood { color: #b30000; text-shadow: 0 0 10px rgba(180,0,0,0.4), 0 2px 4px rgba(60,0,0,0.3); }
+  body.theme-light .menu-btn { background: #eaeef2; color: #1f2328; }
+  body.theme-light .menu-btn:hover { background: #d0d7de; }
+  body.theme-light .meta { color: #57606a; }
+  body.theme-light #drawer { background: #ffffff; border-right-color: #d0d7de; }
+  body.theme-light .drawer-head { border-bottom-color: #d0d7de; }
+  body.theme-light .drawer-section { border-bottom-color: #eaeef2; }
+  body.theme-light .drawer-section-head { color: #1f2328; }
+  body.theme-light .drawer-section-head:hover { background: #f6f8fa; }
+  body.theme-light .drawer-section-head .drawer-chevron { color: #57606a; }
+  body.theme-light .drawer-item { color: #1f2328; }
+  body.theme-light .drawer-item:hover { background: #f6f8fa; }
+  body.theme-light .drawer-close { color: #1f2328; }
+  body.theme-light .card { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .card:hover { background: #f6f8fa; }
+  body.theme-light .card.open { background: #ddf4ff; border-color: #0969da; }
+  body.theme-light .card .title { color: #0d1117; }
+  body.theme-light .card .cwd { color: #57606a; }
+  body.theme-light .badge { background: #eaeef2; color: #57606a; }
+  body.theme-light .panel { background: #ffffff; border-color: #d0d7de; }
+  body.theme-light .panel-header .title-main { color: #0d1117; }
+  body.theme-light .panel-header .cwd-line { color: #57606a; }
+  body.theme-light .panel-header button { background: #eaeef2; color: #57606a; }
+  body.theme-light .panel-header button:hover { background: #d0d7de; color: #1f2328; }
+  body.theme-light .msg .who { color: #57606a; }
+  body.theme-light .msg.user .who { color: #0550ae; }
+  body.theme-light .msg.tool .who { color: #57606a; }
+  body.theme-light .msg .body { color: #1f2328; }
+  body.theme-light .msg .body b { color: #0d1117; }
+  body.theme-light .msg.tool .body { color: #57606a; }
+  body.theme-light .msg.tool .body code.inline-code { color: #6639ba; }
+  body.theme-light .msg .body code.inline-code { background: rgba(175,184,193,0.2); color: #0550ae; }
+  body.theme-light .msg .body pre.code-block { background: #f6f8fa; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .msg .body a { color: #0969da; }
+  body.theme-light .composer-wrap { background: #ffffff; }
+  body.theme-light .composer textarea { background: #f6f8fa; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .composer textarea:focus { border-color: #0969da; }
+  body.theme-light .attach-btn, body.theme-light .mic-btn { background: #eaeef2; color: #57606a; }
+  body.theme-light .attach-btn:hover, body.theme-light .mic-btn:hover { background: #d0d7de; }
+  body.theme-light .send-btn { background: #0969da; }
+  body.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light input::placeholder { color: #6e7681; }
+  body.theme-light .login-box button { background: #eaeef2; color: #1f2328; }
+  body.theme-light .login-box button:hover { background: #d0d7de; }
+  body.theme-light .cmd-menu { background: #ffffff; border-color: #d0d7de; }
+  body.theme-light .cmd-item:hover, body.theme-light .cmd-item.active { background: #f6f8fa; }
+  body.theme-light .cmd-name { color: #0969da; }
+  body.theme-light .cmd-desc { color: #57606a; }
+  body.theme-light .toggle { background: #d0d7de; }
+  body.theme-light .toggle.on { background: #1f883d; }
+  body.theme-light .update-modal-inner { background: #ffffff; border-color: #d0d7de; }
+  body.theme-light .update-modal h2 { color: #0d1117; }
+  body.theme-light .update-versions, body.theme-light .update-notes-title { color: #57606a; }
+  body.theme-light .update-notes { color: #1f2328; }
+  body.theme-light .upd-cancel { background: #eaeef2; color: #1f2328; }
+  body.theme-light .empty { color: #57606a; }
+  body.theme-light .welcome-empty { color: #57606a; }
 </style>
 </head>
 <body>
-<div id="conn-banner" class="conn-banner" style="display:none"></div>
+<div id="conn-modal" class="conn-modal" style="display:none">
+  <div class="conn-modal-inner">
+    <div class="conn-icon" id="conn-icon"></div>
+    <h2 class="conn-title" id="conn-title">Нет связи</h2>
+    <p class="conn-detail" id="conn-detail"></p>
+    <button class="conn-retry" id="conn-retry">Повторить</button>
+  </div>
+</div>
 <div class="topbar">
-  <button id="menu-btn" class="menu-btn" title="Сессии">
+  <button id="menu-btn" class="menu-btn" title="Меню">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    <span class="menu-dot" id="menu-dot" style="display:none"></span>
   </button>
-  <h1>CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></h1>
-  <button id="push-btn" class="menu-btn" title="Включить пуш-уведомления" style="display:none">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-  </button>
-  <button id="update-btn" class="menu-btn update-btn" title="Доступно обновление" style="display:none">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9c-2.4 0-4.6-.94-6.2-2.45L3 21v-6h6"/><path d="M3 12a9 9 0 0 1 9-9c2.4 0 4.6.94 6.2 2.45L21 3v6h-6"/></svg>
-  </button>
+  <h1><span id="logo-home" class="logo-text" title="На главный экран">CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></span></h1>
+  <div class="topbar-spacer"></div>
+  <button id="push-btn" style="display:none"></button>
+  <button id="update-btn" style="display:none"></button>
+</div>
+<div id="rename-modal" class="update-modal" style="display:none">
+  <div class="ns-modal-inner">
+    <h2 class="ns-title">Переименовать</h2>
+    <input id="rn-name" type="text" class="ns-input" placeholder="Новое название сессии" autocomplete="off" autocapitalize="off" autocorrect="off" />
+    <div id="rn-error" class="ns-error"></div>
+    <div class="ns-actions">
+      <button class="ns-btn ns-btn-secondary" id="rn-cancel">Отмена</button>
+      <button class="ns-btn ns-btn-primary" id="rn-apply">Переименовать</button>
+    </div>
+  </div>
+</div>
+<div id="close-session-modal" class="update-modal" style="display:none">
+  <div class="ns-modal-inner">
+    <h2 class="ns-title">Закрыть сессию?</h2>
+    <p id="cs-text" style="color:#8b949e; font-size:13px; text-align:center; margin:0;">Что сделать с этой сессией?</p>
+    <div id="cs-error" class="ns-error"></div>
+    <div class="ns-actions" style="flex-direction:column; gap:8px;">
+      <button class="ns-btn ns-btn-secondary" id="cs-hide">Перенести в закрытые</button>
+      <button class="ns-btn" id="cs-delete" style="background:#d73a49;color:#fff">Удалить совсем</button>
+      <button class="ns-btn ns-btn-secondary" id="cs-cancel">Отмена</button>
+    </div>
+  </div>
+</div>
+<div id="new-session-modal" class="update-modal" style="display:none">
+  <div class="ns-modal-inner">
+    <h2 class="ns-title">New Session</h2>
+    <div class="ns-input-with-action">
+      <input id="ns-cwd" type="text" class="ns-input" placeholder="Рабочая папка (по умолчанию ~/)" autocomplete="off" autocapitalize="off" autocorrect="off" />
+      <button id="ns-folder-btn" class="ns-folder-btn" title="Выбрать из недавних">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <div id="ns-folder-list" class="ns-folder-list" style="display:none"></div>
+    </div>
+    <div id="ns-resume-hint" class="ns-resume-hint" style="display:none"></div>
+    <input id="ns-name" type="text" class="ns-input" placeholder="Название сессии" autocomplete="off" autocapitalize="off" autocorrect="off" />
+    <div class="ns-toggle-row" id="ns-rc-row">
+      <span>Remote Control</span>
+      <span class="toggle" id="ns-rc-toggle"><span class="toggle-thumb"></span></span>
+    </div>
+    <div id="ns-error" class="ns-error"></div>
+    <div class="ns-actions">
+      <button class="ns-btn ns-btn-secondary" id="ns-cancel">Отмена</button>
+      <button class="ns-btn ns-btn-primary" id="ns-apply">Создать</button>
+    </div>
+  </div>
 </div>
 <div id="update-modal" class="update-modal" style="display:none">
   <div class="update-modal-inner">
@@ -1178,10 +2244,53 @@ const HTML = `<!doctype html>
 <div class="meta" id="meta">подключение…</div>
 <div id="drawer">
   <div class="drawer-head">
-    <div class="drawer-title">Сессии</div>
-    <button id="drawer-close" class="drawer-close">×</button>
+    <div class="drawer-title">Menu</div>
+    <button id="drawer-close" class="drawer-close">X</button>
   </div>
-  <div class="grid" id="grid"></div>
+  <div class="drawer-section" data-section="sessions">
+    <div class="drawer-section-head">
+      <span>Активные сессии</span>
+      <svg class="drawer-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="drawer-section-body">
+      <button class="new-session-btn" id="new-session-btn">New Session</button>
+      <div class="grid" id="grid"></div>
+    </div>
+  </div>
+  <div class="drawer-section" data-section="hidden">
+    <div class="drawer-section-head">
+      <span>Закрытые сессии</span>
+      <svg class="drawer-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="drawer-section-body">
+      <div id="hidden-list" class="hidden-list"></div>
+    </div>
+  </div>
+  <div class="drawer-section" data-section="settings">
+    <div class="drawer-section-head">
+      <span>Настройки<span class="drawer-dot" id="settings-dot" style="display:none"></span></span>
+      <svg class="drawer-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="drawer-section-body">
+      <div class="drawer-item" id="settings-notifications">
+        <span>Уведомления</span>
+        <span class="toggle" id="notif-toggle"><span class="toggle-thumb"></span></span>
+      </div>
+      <div class="drawer-item" id="settings-theme">
+        <span>Тема</span>
+        <span class="toggle theme-toggle" id="theme-toggle">
+          <span class="toggle-thumb">
+            <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.5" y1="4.5" x2="6.6" y2="6.6"/><line x1="17.4" y1="17.4" x2="19.5" y2="19.5"/><line x1="4.5" y1="19.5" x2="6.6" y2="17.4"/><line x1="17.4" y1="6.6" x2="19.5" y2="4.5"/></svg>
+            <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+          </span>
+        </span>
+      </div>
+      <div class="drawer-item" id="settings-updates">
+        <span>Обновления<span class="drawer-dot" id="updates-dot" style="display:none"></span></span>
+        <span class="drawer-item-state" id="updates-state">…</span>
+      </div>
+    </div>
+  </div>
 </div>
 <div id="drawer-backdrop" class="drawer-backdrop"></div>
 <div id="welcome" class="welcome">
@@ -1243,6 +2352,47 @@ fetch("/api/commands")
   .catch(() => {});
 let sessionsCache = [];
 const panels = new Map(); // sid → { el, pollInterval }
+const questionSelections = new Map(); // sid → { toolUseId, idx } — выбор пользователем варианта ДО подтверждения
+const questionFreeTexts = new Map(); // sid → { toolUseId, value } — введённый текст в free-text input, переживает re-render
+
+function applyQuestionSelection(p, sid) {
+  const sel = questionSelections.get(sid);
+  const freeTxt = questionFreeTexts.get(sid);
+  const cards = p.el.querySelectorAll(".q-card[data-tool-use-id]");
+  // Запомним был ли фокус на free-text input ДО возможного перерендера (чтобы вернуть после)
+  const activeIsFreeInput = document.activeElement?.classList?.contains("q-free-input");
+  for (const card of cards) {
+    const buttons = card.querySelectorAll("button.q-opt");
+    buttons.forEach(b => b.classList.remove("selected"));
+    let selectedBtn = null;
+    if (sel && card.dataset.toolUseId === sel.toolUseId) {
+      selectedBtn = card.querySelector('button.q-opt[data-idx="' + sel.idx + '"]');
+      if (selectedBtn) selectedBtn.classList.add("selected");
+    }
+    if (freeTxt && card.dataset.toolUseId === freeTxt.toolUseId) {
+      const input = card.querySelector("button.q-opt.free-text .q-free-input");
+      if (input && input.value !== freeTxt.value) {
+        input.value = freeTxt.value;
+      }
+    }
+    if (selectedBtn && activeIsFreeInput) {
+      const input = selectedBtn.querySelector(".q-free-input");
+      if (input && document.activeElement !== input) {
+        input.focus();
+        try {
+          const len = input.value.length;
+          input.setSelectionRange(len, len);
+        } catch {}
+      }
+    }
+    // Multi-tab: активируем «Далее» когда есть выбор в этой карточке
+    const nextBtn = card.querySelector(".q-next-tab");
+    if (nextBtn) {
+      const cardHasSelection = sel && card.dataset.toolUseId === sel.toolUseId;
+      nextBtn.disabled = !cardHasSelection;
+    }
+  }
+}
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1320,13 +2470,15 @@ function findSession(sid) { return sessionsCache.find(s => s.sessionId === sid);
 function buildCardsHTML(sessions) {
   return sessions.map(s => {
     const isDead = s.pid < 0 && !s.sessionId.startsWith('pid-') && !s.isSelf;
-    const badge = s.tty ? '<span class="badge">'+s.tty+'</span>' : (isDead ? '<span class="badge">закрыто</span>' : (s.isDesktop ? '<span class="badge">desktop</span>' : ''));
-    const pidLabel = s.pid > 0 ? 'pid ' + s.pid : '';
+    const badge = isDead ? '<span class="badge">закрыто</span>' : (s.isDesktop ? '<span class="badge">desktop</span>' : '');
+    const pidLabel = '';
     const head = s.title
-      ? \`<div class="title">\${escapeHtml(s.title)}</div>\${badge ? \`<div class="cwd">\${badge}</div>\` : ''}\`
-      : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${badge}</div>\`;
-    const classes = [s.status, s.isSelf ? 'self' : '', panels.has(s.sessionId) ? 'open' : '', isDead ? 'dead' : ''].filter(Boolean).join(' ');
-    const resumeBtn = isDead ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}">▶ Resume</button>\` : '';
+      ? \`<div class="title">\${escapeHtml(s.title)}\${s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : ''}</div>\${badge ? \`<div class="cwd">\${badge}</div>\` : ''}\`
+      : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : ''}\${badge}</div>\`;
+    const classes = [s.status, s.isSelf ? 'self' : '', panels.has(s.sessionId) ? 'open' : '', isDead ? 'dead' : '', s.hasOpenQuestion ? 'has-question' : ''].filter(Boolean).join(' ');
+    const qBadge = s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : '';
+    const resumeBtn = isDead && !s.isMain ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}">▶ Resume</button>\` : '';
+    const hideBtn = s.isMain ? \`<span class="main-pin" title="Главная сессия дашборда — нельзя удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><line x1="12" y1="22" x2="12" y2="8"/><path d="M5 12H2a10 10 0 0 0 20 0h-3"/></svg></span>\` : \`<button class="hide-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-dead="\${isDead ? '1' : '0'}" title="Закрыть/удалить">X</button>\`;
     return \`
       <div class="card \${classes}" data-sid="\${s.sessionId}">
         \${head}
@@ -1334,7 +2486,7 @@ function buildCardsHTML(sessions) {
           <span class="status \${s.status}">\${STATUS_LABELS[s.status] ?? s.status}</span>
           <span>\${s.lastActivityRel === '—' ? '' : s.lastActivityRel + ' назад'}\${pidLabel ? ' · ' + pidLabel : ''}</span>
         </div>
-        \${resumeBtn}
+        \${resumeBtn}\${hideBtn}
       </div>
     \`;
   }).join("");
@@ -1344,7 +2496,14 @@ function wireCards(container) {
   for (const el of container.querySelectorAll(".card")) {
     el.addEventListener("click", (e) => {
       if (e.target.classList.contains("resume-btn")) return;
+      if (e.target.classList.contains("hide-btn")) return;
       onCardClick(el.dataset.sid);
+    });
+  }
+  for (const btn of container.querySelectorAll(".hide-btn")) {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      openCloseSessionModal(btn.dataset.sid, btn.dataset.cwd, btn.dataset.dead === "1");
     });
   }
   for (const btn of container.querySelectorAll(".resume-btn")) {
@@ -1379,27 +2538,42 @@ function render(sessions) {
   sessionsCache = sessions;
   document.getElementById("meta").textContent =
     sessions.length + " сессий • обновлено " + new Date().toLocaleTimeString();
+  const statusOrder = { thinking: 0, tool: 1, waiting: 2, idle: 3, unknown: 4 };
   sessions.sort((a, b) => {
-    if (a.tty && !b.tty) return -1;
-    if (!a.tty && b.tty) return 1;
-    if (a.tty && b.tty) return a.tty.localeCompare(b.tty);
+    // Main session всегда первая
+    if (a.isMain && !b.isMain) return -1;
+    if (!a.isMain && b.isMain) return 1;
+    const aDead = a.pid < 0 && !a.sessionId.startsWith('pid-') && !a.isSelf;
+    const bDead = b.pid < 0 && !b.sessionId.startsWith('pid-') && !b.isSelf;
+    if (aDead && !bDead) return 1;
+    if (!aDead && bDead) return -1;
+    const sa = statusOrder[a.status] ?? 5;
+    const sb = statusOrder[b.status] ?? 5;
+    if (sa !== sb) return sa - sb;
+    // В пределах одного статуса — по времени последней активности (свежие выше)
+    const ta = a.lastActivity ? new Date(a.lastActivity).getTime() : 0;
+    const tb = b.lastActivity ? new Date(b.lastActivity).getTime() : 0;
+    if (ta !== tb) return tb - ta;
     return a.sessionId.localeCompare(b.sessionId);
   });
   const grid = document.getElementById("grid");
   const welcomeGrid = document.getElementById("welcome-grid");
   const welcomeEmpty = document.getElementById("welcome-empty");
+  const newCardHTML = '<div class="card new-session-card" id="welcome-new-session"><span>New Session</span></div>';
   if (sessions.length === 0) {
     grid.innerHTML = '<div class="empty">Нет запущенных claude-процессов</div>';
-    welcomeGrid.innerHTML = '';
-    welcomeEmpty.style.display = 'block';
+    welcomeGrid.innerHTML = newCardHTML;
+    welcomeEmpty.style.display = 'none';
   } else {
     const html = buildCardsHTML(sessions);
     grid.innerHTML = html;
-    welcomeGrid.innerHTML = html;
+    welcomeGrid.innerHTML = newCardHTML + html;
     welcomeEmpty.style.display = 'none';
     wireCards(grid);
     wireCards(welcomeGrid);
   }
+  const wnsCard = document.getElementById("welcome-new-session");
+  if (wnsCard) wnsCard.addEventListener("click", () => document.getElementById("new-session-btn").click());
   // Refresh open panel headers (status may have changed)
   for (const sid of panels.keys()) updatePanelHeader(sid);
 }
@@ -1413,6 +2587,9 @@ function openDrawer() {
 function closeDrawer() {
   document.getElementById("drawer").classList.remove("open");
   document.getElementById("drawer-backdrop").classList.remove("open");
+  // Сворачиваем все секции drawer'а, чтобы при следующем открытии всё было собрано.
+  document.querySelectorAll(".drawer-section.open").forEach(s => s.classList.remove("open"));
+  document.querySelectorAll(".drawer-sub.open").forEach(s => s.classList.remove("open"));
 }
 function updateWelcome() {
   const welcome = document.getElementById("welcome");
@@ -1435,9 +2612,341 @@ function onCardClick(sid) {
   openPanel(sid);
 }
 
+// Клик по логотипу — закрыть всё и полностью перезагрузить страницу (заодно сброс состояния).
+document.getElementById("logo-home").addEventListener("click", () => {
+  location.href = "/";
+});
+
 document.getElementById("menu-btn").addEventListener("click", openDrawer);
 document.getElementById("drawer-close").addEventListener("click", closeDrawer);
 document.getElementById("drawer-backdrop").addEventListener("click", closeDrawer);
+
+// Accordion: тап по заголовку секции → toggle открытия
+document.querySelectorAll(".drawer-section-head").forEach(head => {
+  head.addEventListener("click", () => head.parentElement.classList.toggle("open"));
+});
+
+// Пункты «Настройки» → проксируем на старые обработчики push-btn / update-btn
+document.getElementById("settings-notifications").addEventListener("click", () => {
+  document.getElementById("push-btn").click();
+});
+document.getElementById("settings-updates").addEventListener("click", () => {
+  document.getElementById("update-btn").click();
+});
+
+// Скрытые сессии
+async function refreshHiddenList() {
+  try {
+    const res = await fetch("/api/hidden-sessions");
+    const list = await res.json();
+    const cnt = document.getElementById("hidden-count");
+    if (cnt) cnt.textContent = list.length;
+    const container = document.getElementById("hidden-list");
+    if (list.length === 0) {
+      container.innerHTML = '<div class="hidden-list-empty">Пусто</div>';
+    } else {
+      container.innerHTML = list.map(item => {
+        const label = item.title ? escapeHtml(item.title) : (item.cwd ? escapeHtml(item.cwd.split("/").pop()) : item.sid.slice(0,12) + '…');
+        return '<div class="hidden-list-item">' +
+          '<span class="sid">' + label + '</span>' +
+          '<button data-sid="' + item.sid + '" data-cwd="' + escapeHtml(item.cwd || "") + '">Восстановить</button>' +
+          '</div>';
+      }).join("");
+      container.querySelectorAll("button").forEach(b => {
+        b.addEventListener("click", async () => {
+          b.disabled = true; b.textContent = "Запускаю…";
+          try {
+            const res = await fetch("/api/session/" + b.dataset.sid + "/unhide", {
+              method: "POST", headers: {"content-type":"application/json"},
+              body: JSON.stringify({ restore: !!b.dataset.cwd }),
+            });
+            if (!res.ok) {
+              const d = await res.json().catch(() => ({}));
+              alert("Ошибка: " + (d.error || res.status));
+              b.disabled = false; b.textContent = "Восстановить";
+              return;
+            }
+            refreshHiddenList();
+          } catch (e) { alert("Сеть: " + e.message); b.disabled = false; b.textContent = "Восстановить"; }
+        });
+      });
+    }
+  } catch {}
+}
+// Загружаем список при каждом раскрытии секции «Закрытые сессии»
+document.querySelector('.drawer-section[data-section="hidden"] .drawer-section-head').addEventListener("click", refreshHiddenList);
+// Также периодически обновляем счётчик
+setInterval(refreshHiddenList, 30000);
+refreshHiddenList();
+
+// Тема: тумблер с иконкой солнца (слева, светлая) / луны (справа, тёмная).
+// localStorage("theme") = "light" | "dark" (по умолчанию dark).
+function applyTheme(theme) {
+  document.body.classList.toggle("theme-light", theme === "light");
+  const tg = document.getElementById("theme-toggle");
+  if (tg) tg.classList.toggle("on", theme === "dark");
+}
+const savedTheme = localStorage.getItem("theme") || "dark";
+applyTheme(savedTheme);
+document.getElementById("settings-theme").addEventListener("click", () => {
+  const cur = localStorage.getItem("theme") || "dark";
+  const next = cur === "dark" ? "light" : "dark";
+  localStorage.setItem("theme", next);
+  applyTheme(next);
+});
+// === Rename session modal (клик по названию чата) ===
+const rnModal = document.getElementById("rename-modal");
+const rnName = document.getElementById("rn-name");
+const rnError = document.getElementById("rn-error");
+const rnApply = document.getElementById("rn-apply");
+let rnCurrentSid = "";
+function openRenameModal(sid) {
+  const s = findSession(sid);
+  if (!s) return;
+  rnCurrentSid = sid;
+  rnName.value = s.title || "";
+  rnError.textContent = "";
+  rnApply.disabled = false;
+  rnApply.textContent = "Переименовать";
+  rnModal.style.display = "flex";
+  setTimeout(() => { rnName.focus(); rnName.select(); }, 50);
+}
+document.getElementById("rn-cancel").addEventListener("click", () => rnModal.style.display = "none");
+rnModal.addEventListener("click", (e) => { if (e.target === rnModal) rnModal.style.display = "none"; });
+rnName.addEventListener("keydown", (e) => { if (e.key === "Enter") rnApply.click(); });
+rnApply.addEventListener("click", async () => {
+  const newName = rnName.value.trim();
+  if (!newName) { rnError.textContent = "Введите название"; return; }
+  rnApply.disabled = true;
+  rnApply.textContent = "Применяю…";
+  rnError.textContent = "";
+  try {
+    const res = await fetch("/api/session/" + rnCurrentSid + "/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "/rename " + newName }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.terminal === "none") {
+      rnError.textContent = data.error || "Не удалось отправить";
+      rnApply.disabled = false;
+      rnApply.textContent = "Переименовать";
+    } else {
+      rnApply.textContent = "✓ Готово";
+      setTimeout(() => { rnModal.style.display = "none"; }, 500);
+    }
+  } catch (e) {
+    rnError.textContent = "Сеть: " + e.message;
+    rnApply.disabled = false;
+    rnApply.textContent = "Переименовать";
+  }
+});
+
+// === Close session modal (× на карточке) ===
+const csModal = document.getElementById("close-session-modal");
+const csText = document.getElementById("cs-text");
+const csHide = document.getElementById("cs-hide");
+const csDelete = document.getElementById("cs-delete");
+const csError = document.getElementById("cs-error");
+let csCurrent = { sid: "", cwd: "", isDead: false };
+function openCloseSessionModal(sid, cwd, isDead) {
+  csCurrent = { sid, cwd, isDead };
+  csError.textContent = "";
+  csHide.disabled = false; csDelete.disabled = false;
+  csHide.textContent = "Перенести в закрытые";
+  csDelete.textContent = "Удалить совсем";
+  if (isDead) {
+    csText.textContent = "Сессия уже закрыта. Удалить её совсем или просто скрыть из списка?";
+    csHide.textContent = "Скрыть из списка";
+  } else {
+    csText.textContent = "Терминал закроется. «В закрытые» — можно будет восстановить. «Удалить» — необратимо (jsonl удалится).";
+  }
+  csModal.style.display = "flex";
+}
+csHide.addEventListener("click", async () => {
+  csHide.disabled = true; csDelete.disabled = true;
+  csHide.textContent = "Закрываю…";
+  try {
+    const res = await fetch("/api/session/" + csCurrent.sid + "/close", {
+      method: "POST", headers: {"content-type":"application/json"},
+      body: JSON.stringify({ mode: "hide" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Ошибка");
+    csModal.style.display = "none";
+  } catch (e) { csError.textContent = e.message; csHide.disabled = false; csDelete.disabled = false; csHide.textContent = "Перенести в закрытые"; }
+});
+csDelete.addEventListener("click", async () => {
+  if (!confirm("Точно удалить безвозвратно? jsonl с историей будет удалён.")) return;
+  csHide.disabled = true; csDelete.disabled = true;
+  csDelete.textContent = "Удаляю…";
+  try {
+    const res = await fetch("/api/session/" + csCurrent.sid + "/close", {
+      method: "POST", headers: {"content-type":"application/json"},
+      body: JSON.stringify({ mode: "delete" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Ошибка");
+    csModal.style.display = "none";
+  } catch (e) { csError.textContent = e.message; csHide.disabled = false; csDelete.disabled = false; csDelete.textContent = "Удалить совсем"; }
+});
+document.getElementById("cs-cancel").addEventListener("click", () => csModal.style.display = "none");
+csModal.addEventListener("click", (e) => { if (e.target === csModal) csModal.style.display = "none"; });
+
+// === New session modal ===
+const newSessionBtn = document.getElementById("new-session-btn");
+const nsModal = document.getElementById("new-session-modal");
+const nsName = document.getElementById("ns-name");
+const nsCwd = document.getElementById("ns-cwd");
+const nsRcToggle = document.getElementById("ns-rc-toggle");
+const nsError = document.getElementById("ns-error");
+const nsApply = document.getElementById("ns-apply");
+const nsResumeHint = document.getElementById("ns-resume-hint");
+const nsRcRow = document.getElementById("ns-rc-row");
+let nsResumeState = null; // null = новая | {sid, title, hasLivePid}
+function nsReset() {
+  nsName.value = "";
+  nsCwd.value = "";
+  nsRcToggle.classList.remove("on");
+  nsError.textContent = "";
+  nsApply.disabled = false;
+  nsApply.textContent = "Создать";
+  nsResumeHint.style.display = "none";
+  nsName.classList.remove("locked");
+  nsName.readOnly = false;
+  nsRcToggle.classList.remove("locked");
+  nsRcRow.style.pointerEvents = "";
+  nsResumeState = null;
+}
+async function nsCheckExisting() {
+  const cwd = nsCwd.value.trim();
+  if (!cwd) {
+    nsResumeHint.style.display = "none";
+    nsName.classList.remove("locked"); nsName.readOnly = false;
+    nsRcToggle.classList.remove("locked"); nsRcRow.style.pointerEvents = "";
+    nsApply.textContent = "Создать";
+    nsResumeState = null;
+    return;
+  }
+  try {
+    const res = await fetch("/api/check-existing?cwd=" + encodeURIComponent(cwd));
+    const info = await res.json();
+    if (!info.exists) {
+      nsResumeHint.style.display = "none";
+      nsName.classList.remove("locked"); nsName.readOnly = false;
+      nsRcToggle.classList.remove("locked"); nsRcRow.style.pointerEvents = "";
+      nsApply.textContent = "Создать";
+      nsResumeState = null;
+      return;
+    }
+    nsResumeState = info;
+    if (info.hasLivePid) {
+      // Уже открыта в Terminal
+      nsResumeHint.className = "ns-resume-hint warn";
+      nsResumeHint.textContent = "⚠ В этой папке уже запущена терминальная сессия (sid " + info.sid.slice(0,8) + "). Открой её карточку — дублировать нельзя.";
+      nsResumeHint.style.display = "block";
+      nsApply.disabled = true;
+      nsApply.textContent = "Создать";
+    } else {
+      nsResumeHint.className = "ns-resume-hint";
+      const titleText = info.title || ("сессия " + info.sid.slice(0, 8));
+      nsResumeHint.textContent = "↩ Будет восстановлена существующая сессия «" + titleText + "». Имя сохранится, Remote Control включится автоматически.";
+      nsResumeHint.style.display = "block";
+      nsName.value = titleText;
+      nsName.classList.add("locked"); nsName.readOnly = true;
+      nsRcToggle.classList.add("on");
+      nsRcToggle.classList.add("locked"); nsRcRow.style.pointerEvents = "none";
+      nsApply.textContent = "Восстановить";
+      nsApply.disabled = false;
+    }
+  } catch {}
+}
+let nsCheckTimer = null;
+nsCwd.addEventListener("input", () => {
+  clearTimeout(nsCheckTimer);
+  nsCheckTimer = setTimeout(nsCheckExisting, 400);
+});
+newSessionBtn.addEventListener("click", () => {
+  nsReset();
+  nsModal.style.display = "flex";
+  // Сначала фокус на папку — она определяет дальнейший флоу
+  setTimeout(() => nsCwd.focus(), 50);
+});
+document.getElementById("ns-cancel").addEventListener("click", () => nsModal.style.display = "none");
+nsModal.addEventListener("click", (e) => { if (e.target === nsModal) nsModal.style.display = "none"; });
+document.getElementById("ns-rc-row").addEventListener("click", () => nsRcToggle.classList.toggle("on"));
+
+// Folder picker: при клике показываем выпадающий список из cwd живых сессий + стандартные.
+const nsFolderList = document.getElementById("ns-folder-list");
+function buildFolderList() {
+  const fromSessions = (sessionsCache || []).map(s => s.cwd).filter(Boolean);
+  const std = ["~/", "~/Documents", "~/Documents/клод", "~/Documents/2ATM"];
+  const all = [...new Set([...std, ...fromSessions])];
+  nsFolderList.innerHTML = all.map(p => '<div class="ns-folder-item" data-path="' + escapeHtml(p) + '">' + escapeHtml(p) + '</div>').join("");
+  nsFolderList.querySelectorAll(".ns-folder-item").forEach(el => {
+    el.addEventListener("click", () => {
+      nsCwd.value = el.dataset.path;
+      nsFolderList.style.display = "none";
+    });
+  });
+}
+document.getElementById("ns-folder-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (nsFolderList.style.display === "none") {
+    buildFolderList();
+    nsFolderList.style.display = "block";
+  } else {
+    nsFolderList.style.display = "none";
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!nsFolderList.contains(e.target) && e.target.id !== "ns-folder-btn") {
+    nsFolderList.style.display = "none";
+  }
+});
+nsApply.addEventListener("click", async () => {
+  const name = nsName.value.trim();
+  if (!name) { nsError.textContent = "Введите название"; return; }
+  nsApply.disabled = true;
+  nsApply.textContent = "Создаю…";
+  nsError.textContent = "";
+  try {
+    const res = await fetch("/api/session/new", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name,
+        cwd: nsCwd.value.trim(),
+        remoteControl: nsRcToggle.classList.contains("on"),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      nsError.textContent = data.error || "Ошибка";
+      nsApply.disabled = false;
+      nsApply.textContent = "Создать";
+    } else {
+      nsApply.textContent = "✓ Готово";
+      setTimeout(() => { nsModal.style.display = "none"; }, 600);
+      // Ждём пока новая сессия появится в snapshot (по совпадению title), затем открываем её панель
+      let tries = 0;
+      const findInterval = setInterval(() => {
+        tries++;
+        if (tries > 25) { clearInterval(findInterval); return; }
+        const found = (sessionsCache || []).find(s => s.title === name);
+        if (found) {
+          clearInterval(findInterval);
+          onCardClick(found.sessionId);
+        }
+      }, 800);
+    }
+  } catch (e) {
+    nsError.textContent = "Сетевая ошибка: " + e.message;
+    nsApply.disabled = false;
+    nsApply.textContent = "Создать";
+  }
+});
+
 
 // Chrome F11/Cmd+Ctrl+F fullscreen detection: when toolbar auto-slides over the page,
 // add body.chrome-fs class so CSS bumps top padding and our topbar stays visible underneath.
@@ -1449,6 +2958,7 @@ function updateChromeFsClass() {
 }
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
+
 
 
 // Idle-timeout: 30 мин без активности → logout. При полном закрытии браузера/PWA cookie стирается сама
@@ -1504,12 +3014,78 @@ function updatePanelHeader(sid) {
     warnEl.textContent = "Это Claude Desktop сессия — отправка из дашборда недоступна (нет tty). Открой окно вручную.";
     warnEl.classList.remove("self");
     warnEl.style.display = "";
+  } else if (s.kidDash && s.kidDash.isBlocked) {
+    // Ребёнок-чат сессия + child_active = блокируем композер с баннером + Override-кнопка
+    warnEl.classList.remove("self");
+    warnEl.classList.add("kid-locked");
+    const subj = s.kidDash.currentSubject ? \` (\${s.kidDash.currentSubject})\` : "";
+    const until = s.kidDash.expectedEnd ? new Date(s.kidDash.expectedEnd).toLocaleTimeString().slice(0,5) : "";
+    const untilTxt = until ? \`, до \${until}\` : "";
+    warnEl.innerHTML = \`🔒 Ребёнок сейчас на уроке\${subj}\${untilTxt} — композер заблокирован. <button class="kid-override-btn">Override</button>\`;
+    warnEl.style.display = "";
+    const overrideBtn = warnEl.querySelector(".kid-override-btn");
+    if (overrideBtn) {
+      overrideBtn.addEventListener("click", async () => {
+        if (!confirm("Точно прервать урок ребёнка? Композер разблокируется на 60 секунд.")) return;
+        try {
+          const r = await fetch("/api/kid-dash/override", { method: "POST" });
+          if (r.ok) {
+            overrideBtn.textContent = "✓ разблокировано";
+            overrideBtn.disabled = true;
+          } else {
+            alert("Не удалось разблокировать: " + r.status);
+          }
+        } catch (e) { alert("Сеть: " + e); }
+      });
+    }
   } else {
+    warnEl.classList.remove("kid-locked");
     warnEl.style.display = "none";
   }
-  const blocked = s.isDesktop || s.isSelf;
+  const blocked = s.isDesktop || s.isSelf || (s.kidDash && s.kidDash.isBlocked);
   p.el.querySelector("textarea").disabled = blocked;
   p.el.querySelector(".send-btn").disabled = blocked;
+  // Status-line между feed и composer (стиль claude code: ✻ Думает… (1m 26s · ↑ 3.7k tokens))
+  const statusLine = p.el.querySelector(".status-line");
+  if (statusLine) {
+    const labels = { thinking: "Думает…", tool: "Запускает инструмент…", waiting: "Готов к ответу" };
+    if (s.limitHit && s.tty) {
+      // Лимит исчерпан — особый статус + кнопка разбудить
+      statusLine.className = "status-line limit";
+      statusLine.innerHTML = '<span class="claude-mark">⚠</span><span class="status-text">Лимит исчерпан' + (s.limitResetAt ? \` (сброс \${s.limitResetAt})\` : "") + '</span><button class="wake-btn" data-sid="' + sid + '">Разбудить</button>';
+      statusLine.querySelector(".wake-btn").addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true; btn.textContent = "…";
+        try {
+          const r = await fetch("/api/session/" + sid + "/wake", { method: "POST" });
+          if (!r.ok) { const d = await r.json().catch(()=>({})); alert("Ошибка: " + (d.error || r.status)); }
+          else btn.textContent = "✓";
+        } catch (e2) { alert("Сеть: " + e2.message); }
+        setTimeout(() => { btn.disabled = false; btn.textContent = "Разбудить"; }, 3000);
+      });
+      statusLine.style.display = "flex";
+    } else if (!s.tty || s.status === "idle" || s.status === "unknown") {
+      statusLine.style.display = "none";
+    } else {
+      statusLine.className = "status-line " + s.status;
+      let extras = [];
+      if (s.busySince && (s.status === "thinking" || s.status === "tool")) {
+        const ageSec = Math.floor((Date.now() - new Date(s.busySince).getTime()) / 1000);
+        if (ageSec > 0) {
+          const m = Math.floor(ageSec / 60);
+          const sec = ageSec % 60;
+          extras.push(m > 0 ? \`\${m}m \${sec}s\` : \`\${sec}s\`);
+        }
+      }
+      if (s.inputTokens && s.inputTokens > 0) {
+        const t = s.inputTokens >= 1000 ? (s.inputTokens / 1000).toFixed(1) + "k" : s.inputTokens.toString();
+        extras.push(\`~\${t} ctx\`);
+      }
+      const suffix = extras.length ? \` (\${extras.join(" · ")})\` : "";
+      statusLine.innerHTML = '<span class="claude-mark">✻</span><span class="status-text">' + escapeHtml((labels[s.status] || s.status) + suffix) + '</span>';
+      statusLine.style.display = "flex";
+    }
+  }
 }
 
 async function refreshFeedPanel(sid) {
@@ -1524,17 +3100,88 @@ async function refreshFeedPanel(sid) {
     const sel = window.getSelection();
     if (sel && sel.toString().length > 0 && p.el.contains(sel.anchorNode)) return;
     // Skip если контент не изменился (избегаем лишних перерисовок)
-    const html = msgs.map(m => \`
+    const html = msgs.map(m => {
+      if (m.role === "question" && m.question) {
+        const q = m.question;
+        // Если ответ — свободный текст (не совпадает ни с одним label-варианта), то это и есть free-text-ответ.
+        // В таком случае подсветим free-text-опцию и покажем В НЕЙ сам текст пользователя как label.
+        const isFreeTextAnswer = q.answered && q.answeredWith && !q.options.some(opt => opt.label === q.answeredWith);
+        const optsHtml = q.options.map((o, i) => {
+          const label = (o.label || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+          const desc = (o.description || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+          if (q.answered) {
+            // Для free-text-ответа — особый рендер у isFreeText-опции
+            if (isFreeTextAnswer && o.isFreeText) {
+              const userText = (q.answeredWith || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+              const tuiNum = o.tuiNum || (i + 1);
+              return \`<div class="q-opt picked free-text-answered"><span class=q-check>●</span><span class=q-num>\${tuiNum}</span><span class=q-label>\${userText}</span></div>\`;
+            }
+            const isPicked = q.answeredWith && q.answeredWith === o.label;
+            const tuiNum = o.tuiNum || (i + 1);
+            return \`<div class="q-opt \${isPicked?"picked":""}"><span class=q-check>\${isPicked?"●":""}</span><span class=q-num>\${tuiNum}</span><span class=q-label>\${label}</span>\${desc?\`<div class=q-desc>\${desc}</div>\`:""}</div>\`;
+          }
+          const isFree = !!o.isFreeText;
+          const labelHtml = isFree ? "Свой вариант" : label;
+          const freeInputHtml = isFree
+            ? \`<input type="text" class="q-free-input" placeholder="Введите свой ответ…" \${q.answered?"disabled":""} />\`
+            : "";
+          const tuiNum = o.tuiNum || (i + 1);
+          // Опции кликабельные и в single-tab, и в multi-tab — выбор применяется к текущей вкладке.
+          return \`<button class="q-opt active \${isFree?"free-text":""}" data-idx="\${tuiNum}" \${isFree?"data-free-text=\\"1\\"":""}><span class=q-num>\${tuiNum}</span><span class=q-label>\${labelHtml}</span>\${desc?\`<div class=q-desc>\${desc}</div>\`:""}\${freeInputHtml}</button>\`;
+        }).join("");
+        const headerHtml = q.header ? \`<div class=q-header>\${q.header.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</div>\` : "";
+        // Если ответ — free-text, но в options нет isFreeText-опции (старые jsonl-вопросы без TUI-обогащения),
+        // дорисуем синтетическую «Свой вариант» в конец, с пользовательским текстом
+        const hasFreeTextOpt = q.options.some(o => o.isFreeText);
+        const extraFreeTextHtml = (q.answered && isFreeTextAnswer && !hasFreeTextOpt)
+          ? \`<div class="q-opt picked free-text-answered"><span class=q-check>●</span><span class=q-num>5</span><span class=q-label>\${(q.answeredWith||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</span></div>\`
+          : "";
+        const isMultiTab = !!q.isMultiTab;
+        const isSubmitReview = !!q.isSubmitReview;
+        const statusHtml = q.answered
+          ? \`<div class=q-status>✓ отвечено</div>\`
+          : isMultiTab
+            ? (isSubmitReview
+                ? \`<div class="q-status multitab">Финальный шаг — отправить все ответы или отменить.</div>\`
+                : \`<div class="q-status multitab">Выбери ответ, потом нажми «Далее». В этом опросе несколько вопросов — после Далее покажется следующий.</div>\`)
+            : \`<div class=q-status>⚠ ждёт твой выбор</div>\`;
+        // Single-tab — Отправить/Отмена. Multi-tab — Далее (или Отправить ответы на финальном экране).
+        const actionsHtml = q.answered
+          ? ""
+          : isMultiTab
+            ? (isSubmitReview
+                ? \`<div class="q-actions"><button class="q-final-submit" type="button">✓ Отправить ответы</button><button class="q-rawkey q-esc" data-key="escape" type="button">Отмена</button></div>\`
+                : \`<div class="q-actions"><button class="q-next-tab" type="button" disabled>Далее</button><button class="q-rawkey q-esc" data-key="escape" type="button">Esc</button></div>\`)
+            : \`<div class="q-actions"><button class="q-confirm" type="button">Отправить</button><button class="q-cancel" type="button">Отмена</button></div>\`;
+        return \`<div class="msg question \${q.answered?"answered":"open"}" data-tool-use-id="\${q.toolUseId}"><div class="who">вопрос</div><div class="q-card" data-tool-use-id="\${q.toolUseId}">\${headerHtml}<div class=q-question>\${renderMd(q.question)}</div><div class=q-opts>\${optsHtml}\${extraFreeTextHtml}</div>\${actionsHtml}\${statusHtml}</div></div>\`;
+      }
+      return \`
       <div class="msg \${m.role}">
         <div class="who">\${m.role}</div>
         <div class="body">\${renderMd(m.text)}</div>
       </div>
-    \`).join("");
+    \`;
+    }).join("");
     if (p.lastFeedHtml === html) return;
     p.lastFeedHtml = html;
     const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
     feed.innerHTML = html;
+    applyQuestionSelection(p, sid);
     if (nearBottom) feed.scrollTop = feed.scrollHeight;
+  } catch {}
+}
+
+// Полл TUI-зеркала для multi-tab control карточек: каждую секунду обновляет содержимое <pre.q-tui-mirror>
+async function refreshTuiMirror(sid) {
+  const p = panels.get(sid);
+  if (!p) return;
+  const mirrorEl = p.el.querySelector(".q-tui-mirror");
+  if (!mirrorEl) return;  // Нет multi-tab контрола в этой панели — пропускаем
+  try {
+    const r = await fetch("/api/session/" + sid + "/tui-mirror", { cache: "no-store" });
+    if (!r.ok) return;
+    const { content } = await r.json();
+    if (mirrorEl.textContent !== content) mirrorEl.textContent = content;
   } catch {}
 }
 
@@ -1553,9 +3200,6 @@ function openPanel(sid) {
       <button class="focus-btn" title="Поднять окно терминала">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
       </button>
-      <button class="refresh-btn" title="Обновить">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      </button>
       <button class="interrupt-btn" title="Прервать текущий процесс claude (Esc)">Stop</button>
       <button class="close-btn" title="Закрыть панель">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></svg>
@@ -1563,6 +3207,7 @@ function openPanel(sid) {
     </div>
     <div class="warn" style="display:none"></div>
     <div class="feed"><div class="msg"><div class="who">…</div><div class="body">загружаю</div></div></div>
+    <div class="status-line" style="display:none"><span class="claude-mark">✻</span><span class="status-text"></span></div>
     <div class="composer-wrap">
       <div class="send-error"></div>
       <div class="send-hint" style="display:none"></div>
@@ -1574,7 +3219,8 @@ function openPanel(sid) {
         </button>
         <textarea placeholder="Сообщение" rows="1"></textarea>
         <button class="mic-btn" title="Записать голос → whisper расшифрует в текст">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          <svg class="rec-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="4"/><polyline points="5 11 12 4 19 11"/></svg>
         </button>
         <button class="send-btn" style="display:none" title="Отправить">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -1585,8 +3231,279 @@ function openPanel(sid) {
   document.getElementById("panels").appendChild(el);
 
   // Click-to-copy for code blocks, inline code, and link-copy buttons
+  // Сохраняем введённый текст free-text input + автоматически выбираем этот вариант (если ещё не выбран)
+  el.querySelector(".feed").addEventListener("input", (e) => {
+    if (e.target.classList && e.target.classList.contains("q-free-input")) {
+      const card = e.target.closest(".q-card");
+      const btn = e.target.closest("button.q-opt");
+      const toolUseId = card?.dataset.toolUseId;
+      const idx = btn ? parseInt(btn.dataset.idx, 10) : 0;
+      if (toolUseId) {
+        questionFreeTexts.set(sid, { toolUseId, value: e.target.value });
+        // Auto-select: если пользователь печатает в этом инпуте — он явно хочет именно эту опцию
+        if (idx) {
+          const cur = questionSelections.get(sid);
+          if (!cur || cur.toolUseId !== toolUseId || cur.idx !== idx) {
+            questionSelections.set(sid, { toolUseId, idx });
+            const p = panels.get(sid);
+            if (p) applyQuestionSelection(p, sid);
+          }
+        }
+      }
+    }
+  });
+  // То же при focusin (на iPad/Mac tap → focus, иногда без click event)
+  el.querySelector(".feed").addEventListener("focusin", (e) => {
+    if (e.target.classList && e.target.classList.contains("q-free-input")) {
+      const card = e.target.closest(".q-card");
+      const btn = e.target.closest("button.q-opt");
+      const toolUseId = card?.dataset.toolUseId;
+      const idx = btn ? parseInt(btn.dataset.idx, 10) : 0;
+      if (idx && toolUseId) {
+        questionSelections.set(sid, { toolUseId, idx });
+        const p = panels.get(sid);
+        if (p) applyQuestionSelection(p, sid);
+      }
+    }
+  });
+  // Enter в input → submit как клик по «Отправить»
+  el.querySelector(".feed").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.classList && e.target.classList.contains("q-free-input")) {
+      e.preventDefault();
+      const confirmBtn = e.target.closest(".q-card")?.querySelector("button.q-confirm");
+      if (confirmBtn) confirmBtn.click();
+    }
+  });
   el.querySelector(".feed").addEventListener("click", async (e) => {
     const checkIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    // Клик по полю ввода свободного варианта — тут же выставляем выбор на этот вариант,
+    // чтобы при клике Отправить ответ ушёл (раньше user мог печатать без выбора → confirm no-op)
+    if (e.target.classList && e.target.classList.contains("q-free-input")) {
+      const btn = e.target.closest("button.q-opt");
+      const card = e.target.closest(".q-card");
+      if (btn && card) {
+        const idx = parseInt(btn.dataset.idx, 10);
+        const toolUseId = card.dataset.toolUseId;
+        if (idx && toolUseId) {
+          questionSelections.set(sid, { toolUseId, idx });
+          const p = panels.get(sid);
+          if (p) applyQuestionSelection(p, sid);
+        }
+      }
+      return;  // не делаем preventDefault — фокус нормально встанет в input
+    }
+    const qOpt = e.target.closest("button.q-opt.active");
+    if (qOpt) {
+      e.preventDefault();
+      const idx = parseInt(qOpt.dataset.idx, 10);
+      const card = qOpt.closest(".q-card");
+      const toolUseId = card?.dataset.toolUseId;
+      if (!idx || !toolUseId) return;
+      const cur = questionSelections.get(sid);
+      if (cur && cur.toolUseId === toolUseId && cur.idx === idx) {
+        questionSelections.delete(sid);
+      } else {
+        questionSelections.set(sid, { toolUseId, idx });
+      }
+      const p = panels.get(sid);
+      if (p) {
+        applyQuestionSelection(p, sid);
+        // Если выбрали free-text — фокус в input
+        if (qOpt.dataset.freeText) {
+          const input = qOpt.querySelector(".q-free-input");
+          if (input) setTimeout(() => input.focus(), 0);
+        }
+        // Multi-tab — активируем кнопку «Далее»
+        const nextBtn = card?.querySelector(".q-next-tab");
+        if (nextBtn) nextBtn.disabled = !questionSelections.get(sid);
+      }
+      return;
+    }
+    // Multi-tab «Далее» — отправляет выбранный ответ в текущую вкладку + переключается на следующую
+    const qNextTab = e.target.closest("button.q-next-tab");
+    if (qNextTab) {
+      e.preventDefault();
+      const sel = questionSelections.get(sid);
+      if (!sel) return;
+      qNextTab.disabled = true;
+      qNextTab.textContent = "Передаю ответ…";
+      const card = qNextTab.closest(".q-card");
+      let freeText;
+      if (card) {
+        const selectedBtn = card.querySelector('button.q-opt[data-idx="' + sel.idx + '"]');
+        if (selectedBtn && selectedBtn.dataset.freeText) {
+          const input = selectedBtn.querySelector(".q-free-input");
+          const val = (input && input.value || "").trim();
+          if (!val) { alert("Введи текст в Свой вариант перед переходом"); qNextTab.disabled = false; qNextTab.textContent = "Далее"; return; }
+          freeText = val;
+        }
+      }
+      try {
+        // 1) Зафиксировать ответ в текущей вкладке
+        const body = { optionIndex: sel.idx };
+        if (freeText) body.freeText = freeText;
+        const r1 = await fetch("/api/session/" + sid + "/answer-question", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r1.ok) {
+          const err = await r1.json().catch(() => ({}));
+          alert("Ответ не зафиксирован: " + (err.error || r1.status));
+          qNextTab.disabled = false; qNextTab.textContent = "Далее";
+          return;
+        }
+        // 2) Логика advance:
+        //    - Type something (Свой вариант): TUI сам переключается после Enter+текст+Enter → НЕ слать Right
+        //    - Обычная опция (1-4): Enter только переключает галку, надо досылать Right
+        if (!freeText) {
+          await new Promise(r => setTimeout(r, 400));
+          await fetch("/api/session/" + sid + "/send-raw-key", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ key: "right" }),
+          });
+        }
+        // 3) Сбрасываем локальный selection
+        questionSelections.delete(sid);
+        questionFreeTexts.delete(sid);
+        // 4) Следующий feed-refresh подтянет новую вкладку
+      } catch (err) {
+        alert("Сеть: " + err);
+        qNextTab.disabled = false; qNextTab.textContent = "Далее";
+      }
+      return;
+    }
+    // Multi-tab «Отправить ответы» (на Submit Review экране) — Enter подтверждает Submit answers
+    const qFinalSubmit = e.target.closest("button.q-final-submit");
+    if (qFinalSubmit) {
+      e.preventDefault();
+      qFinalSubmit.disabled = true;
+      qFinalSubmit.textContent = "Отправляю…";
+      try {
+        // Submit Review экран — option 1 = «Submit answers». Шлём idx=1
+        const r = await fetch("/api/session/" + sid + "/answer-question", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ optionIndex: 1 }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert("Не удалось отправить: " + (err.error || r.status));
+          qFinalSubmit.disabled = false; qFinalSubmit.textContent = "✓ Отправить ответы";
+        }
+      } catch (err) {
+        alert("Сеть: " + err);
+        qFinalSubmit.disabled = false; qFinalSubmit.textContent = "✓ Отправить ответы";
+      }
+      return;
+    }
+    const qConfirm = e.target.closest("button.q-confirm");
+    if (qConfirm) {
+      e.preventDefault();
+      const sel = questionSelections.get(sid);
+      if (!sel) return;
+      // Если выбран free-text вариант — забираем значение из input
+      const p = panels.get(sid);
+      let freeText;
+      if (p) {
+        const card = p.el.querySelector('.q-card[data-tool-use-id="' + sel.toolUseId + '"]');
+        const selectedBtn = card?.querySelector('button.q-opt[data-idx="' + sel.idx + '"]');
+        if (selectedBtn && selectedBtn.dataset.freeText) {
+          const input = selectedBtn.querySelector(".q-free-input");
+          const val = (input && input.value || "").trim();
+          if (!val) {
+            alert("Введи свой вариант в поле перед отправкой");
+            return;
+          }
+          freeText = val;
+        }
+      }
+      qConfirm.disabled = true;
+      qConfirm.textContent = "…";
+      try {
+        const body = { optionIndex: sel.idx };
+        if (freeText) body.freeText = freeText;
+        const res = await fetch("/api/session/" + sid + "/answer-question", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          alert("Не удалось ответить: " + (err.error || res.status));
+          qConfirm.disabled = false;
+          qConfirm.textContent = "Отправить";
+        } else {
+          questionSelections.delete(sid);
+          questionFreeTexts.delete(sid);
+        }
+      } catch (err) {
+        alert("Сеть: " + err);
+        qConfirm.disabled = false;
+        qConfirm.textContent = "Отправить";
+      }
+      return;
+    }
+    const qCancel = e.target.closest("button.q-cancel");
+    if (qCancel) {
+      e.preventDefault();
+      questionSelections.delete(sid);
+      questionFreeTexts.delete(sid);
+      const p = panels.get(sid);
+      if (p) applyQuestionSelection(p, sid);
+      return;
+    }
+    // Multi-tab: raw-key buttons (стрелки/Enter/Esc)
+    const qRawKey = e.target.closest("button.q-rawkey");
+    if (qRawKey) {
+      e.preventDefault();
+      const key = qRawKey.dataset.key;
+      if (!key) return;
+      qRawKey.disabled = true;
+      try {
+        const r = await fetch("/api/session/" + sid + "/send-raw-key", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ key }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert("Не удалось: " + (err.error || r.status));
+        }
+      } catch (err) {
+        alert("Сеть: " + err);
+      }
+      setTimeout(() => { qRawKey.disabled = false; }, 250);
+      return;
+    }
+    // Multi-tab: «Печать» — отправить текст из input в TUI
+    const qTextSend = e.target.closest("button.q-text-send");
+    if (qTextSend) {
+      e.preventDefault();
+      const card = qTextSend.closest(".q-card");
+      const input = card?.querySelector(".q-text-input");
+      const text = (input && input.value || "").trim();
+      if (!text) { input?.focus(); return; }
+      qTextSend.disabled = true;
+      try {
+        const r = await fetch("/api/session/" + sid + "/type-text", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert("Не удалось: " + (err.error || r.status));
+        } else {
+          input.value = "";
+        }
+      } catch (err) {
+        alert("Сеть: " + err);
+      }
+      setTimeout(() => { qTextSend.disabled = false; }, 250);
+      return;
+    }
     const copyBtn = e.target.closest(".copy-btn, .link-copy");
     if (copyBtn) {
       e.preventDefault();
@@ -1644,22 +3561,18 @@ function openPanel(sid) {
   const sendBtnEl = el.querySelector(".send-btn");
   const updateSendMic = () => {
     const hasText = el.querySelector("textarea").value.trim().length > 0;
-    micBtnEl.style.display = hasText ? "none" : "";
-    sendBtnEl.style.display = hasText ? "" : "none";
+    const p2 = panels.get(sid);
+    const hasAtts = p2 && p2.attachments && p2.attachments.length > 0;
+    const showSend = hasText || hasAtts;
+    micBtnEl.style.display = showSend ? "none" : "";
+    sendBtnEl.style.display = showSend ? "" : "none";
   };
   el.querySelector("textarea").addEventListener("input", updateSendMic);
 
   el.querySelector(".close-btn").addEventListener("click", () => closePanel(sid));
   el.querySelector(".focus-btn").addEventListener("click", () => focusWindow(sid));
   el.querySelector(".title-block").addEventListener("click", () => {
-    const s = findSession(sid);
-    if (!s || !s.title) return;  // only toggle when title is shown
-    const cwdEl = el.querySelector(".cwd-line");
-    cwdEl.style.display = cwdEl.style.display === "none" ? "" : "none";
-  });
-  el.querySelector(".refresh-btn").addEventListener("click", (ev) => {
-    ev.currentTarget.classList.add("spinning");
-    location.reload();
+    openRenameModal(sid);
   });
   el.querySelector(".interrupt-btn").addEventListener("click", async () => {
     const btn = el.querySelector(".interrupt-btn");
@@ -1775,6 +3688,7 @@ function openPanel(sid) {
     if (attachments.length === 0) {
       attachBar.style.display = "none";
       attachBar.innerHTML = "";
+      updateSendMic();
       return;
     }
     attachBar.style.display = "";
@@ -1787,6 +3701,7 @@ function openPanel(sid) {
         renderAttachments();
       });
     }
+    updateSendMic();
   }
 
   async function uploadFiles(files) {
@@ -1940,9 +3855,11 @@ function openPanel(sid) {
   });
 
   const interval = setInterval(() => refreshFeedPanel(sid), 1500);
-  panels.set(sid, { el, pollInterval: interval, attachments });
+  const mirrorInterval = setInterval(() => refreshTuiMirror(sid), 1000);
+  panels.set(sid, { el, pollInterval: interval, mirrorInterval, attachments });
   updateWelcome();
   updatePanelHeader(sid);
+  setupPanelDrag(el, sid);
   refreshFeedPanel(sid).then(() => {
     const feed = el.querySelector(".feed");
     feed.scrollTop = feed.scrollHeight;
@@ -1954,10 +3871,53 @@ function openPanel(sid) {
   if (card) card.classList.add("open");
 }
 
+// Drag-and-drop reordering панелей (только на десктопе — на мобильном панель одна за раз).
+function setupPanelDrag(panelEl, sid) {
+  if (window.matchMedia("(max-width: 768px)").matches) return;
+  const header = panelEl.querySelector(".panel-header");
+  header.setAttribute("draggable", "true");
+  header.addEventListener("dragstart", (e) => {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/x-panel-sid", sid);
+    panelEl.classList.add("dragging");
+  });
+  header.addEventListener("dragend", () => {
+    panelEl.classList.remove("dragging");
+    document.querySelectorAll(".panel.drag-over-left, .panel.drag-over-right").forEach(p =>
+      p.classList.remove("drag-over-left", "drag-over-right"));
+  });
+  panelEl.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer.types.includes("text/x-panel-sid")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const rect = panelEl.getBoundingClientRect();
+    const mid = rect.left + rect.width / 2;
+    panelEl.classList.toggle("drag-over-left", e.clientX < mid);
+    panelEl.classList.toggle("drag-over-right", e.clientX >= mid);
+  });
+  panelEl.addEventListener("dragleave", () => {
+    panelEl.classList.remove("drag-over-left", "drag-over-right");
+  });
+  panelEl.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const draggedSid = e.dataTransfer.getData("text/x-panel-sid");
+    panelEl.classList.remove("drag-over-left", "drag-over-right");
+    if (!draggedSid || draggedSid === sid) return;
+    const draggedEl = panels.get(draggedSid)?.el;
+    if (!draggedEl) return;
+    const rect = panelEl.getBoundingClientRect();
+    const mid = rect.left + rect.width / 2;
+    const container = document.getElementById("panels");
+    if (e.clientX < mid) container.insertBefore(draggedEl, panelEl);
+    else container.insertBefore(draggedEl, panelEl.nextSibling);
+  });
+}
+
 function closePanel(sid) {
   const p = panels.get(sid);
   if (!p) return;
   clearInterval(p.pollInterval);
+  if (p.mirrorInterval) clearInterval(p.mirrorInterval);
   p.el.remove();
   panels.delete(sid);
   const card = document.querySelector('.card[data-sid="' + sid + '"]');
@@ -2003,8 +3963,8 @@ async function sendInPanel(sid) {
     if (!res.ok || data.terminal === "none") {
       errEl.textContent = data.error || "Не удалось отправить";
     } else {
-      hintEl.textContent = "✓ Отправлено" + (atts.length ? " (" + atts.length + " файл(ов))" : "") + ".";
-      hintEl.style.display = "";
+      // Без всплывающей подсказки об отправке — статус виден через индикатор в шапке.
+      hintEl.style.display = "none";
       input.value = "";
       input.style.height = "";  // reset to base height
       const panel = panels.get(sid);
@@ -2042,33 +4002,73 @@ connect();
 // === Connection health monitor ===
 // Каждые 10 сек дёргает /api/health (без авторизации, дешёвый ping). По коду ответа определяет
 // конкретную причину и показывает баннер. Без этого, при разрыве Mac-VPS туннеля, дашборд просто молчит.
-const connBanner = document.getElementById("conn-banner");
+const connModal = document.getElementById("conn-modal");
+const connIcon = document.getElementById("conn-icon");
+const connTitle = document.getElementById("conn-title");
+const connDetail = document.getElementById("conn-detail");
+const connRetry = document.getElementById("conn-retry");
+const ICON_OFFLINE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>';
+const ICON_TUNNEL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/><path d="M12 10v4"/></svg>';
+const ICON_SERVER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>';
 let lastConnError = null;
-function showConn(level, title, detail) {
-  if (lastConnError === title) return;
-  lastConnError = title;
-  connBanner.className = "conn-banner" + (level === "warn" ? " warn" : "");
-  connBanner.innerHTML = "<b>" + title + "</b><span class='conn-detail'>" + detail + "</span>";
-  connBanner.style.display = "block";
+function showConn(level, title, detail, iconKey) {
+  const key = title + "|" + detail;
+  if (lastConnError === key) return;
+  lastConnError = key;
+  connModal.className = "conn-modal" + (level === "warn" ? " warn" : "");
+  connTitle.textContent = title;
+  connDetail.textContent = detail;
+  connIcon.innerHTML = iconKey === "tunnel" ? ICON_TUNNEL : iconKey === "server" ? ICON_SERVER : ICON_OFFLINE;
+  connModal.style.display = "flex";
 }
 function hideConn() {
   if (lastConnError === null) return;
   lastConnError = null;
-  connBanner.style.display = "none";
+  connModal.style.display = "none";
+}
+connRetry.addEventListener("click", () => {
+  connRetry.disabled = true;
+  connRetry.textContent = "Проверяю…";
+  checkHealth().finally(() => {
+    setTimeout(() => { connRetry.disabled = false; connRetry.textContent = "Повторить"; }, 800);
+  });
+});
+async function hasExternalNet() {
+  // Пробуем достучаться до Cloudflare 1.1.1.1 — если сеть на устройстве вообще есть, fetch ляжет в opaque success.
+  try {
+    await fetch("https://1.1.1.1/cdn-cgi/trace", { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(4000) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 async function checkHealth() {
   try {
-    const res = await fetch("/api/health", { cache: "no-store" });
+    const res = await fetch("/api/health", { cache: "no-store", signal: AbortSignal.timeout(8000) });
     if (res.ok) { hideConn(); return; }
     if (res.status === 502 || res.status === 503 || res.status === 504) {
-      showConn("err", "Mac недоступен", "Туннель до твоего Mac не отвечает. Возможно интернет на Mac упал или дашборд-сервер не запущен (status " + res.status + ").");
+      showConn("err",
+        "Туннель Mac→VPS упал",
+        "VPS на связи, но дашборд-сервер на твоём Mac не отвечает. Watchdog пытается восстановить, обычно 1-3 минуты.",
+        "tunnel");
     } else if (res.status >= 500) {
-      showConn("err", "Серверная ошибка дашборда", "Status " + res.status + ". Возможно сервер на Mac перезапускается.");
+      showConn("err", "Серверная ошибка дашборда", "Status " + res.status + ". Сервер перезапускается.", "server");
     } else {
       hideConn();
     }
   } catch (e) {
-    showConn("err", "Нет связи", "Не удаётся достучаться до сервера дашборда. Проверь интернет/VPN на этом устройстве.");
+    const netOk = await hasExternalNet();
+    if (netOk) {
+      showConn("err",
+        "Сервер дашборда недоступен",
+        "Интернет на устройстве работает, но VPS дашборда не отвечает. Скорее всего проблема у хостинг-провайдера VPS — подожди пару минут.",
+        "server");
+    } else {
+      showConn("err",
+        "Нет интернета на устройстве",
+        "Не достучаться ни до VPS, ни до Cloudflare. Проверь Wi-Fi/VPN.",
+        "offline");
+    }
   }
 }
 setInterval(checkHealth, 10000);
@@ -2082,12 +4082,19 @@ async function checkUpdate() {
     const res = await fetch("/api/update-info", { cache: "no-store" });
     if (!res.ok) return;
     const info = await res.json();
-    if (info.available) {
-      updateBtn.style.display = "";
-      updateBtn.dataset.info = JSON.stringify(info);
-    } else {
-      updateBtn.style.display = "none";
+    updateBtn.dataset.info = JSON.stringify(info);
+    const updState = document.getElementById("updates-state");
+    if (updState) {
+      const ver = info.local || "?";
+      updState.innerHTML = info.available
+        ? "v" + ver + ' <span class="green-dot" title="доступно обновление до v' + info.remote + '"></span>'
+        : "v" + ver;
     }
+    const dots = ["menu-dot", "settings-dot", "updates-dot"];
+    dots.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = info.available ? "inline-block" : "none";
+    });
   } catch {}
 }
 setInterval(checkUpdate, 5 * 60 * 1000); // каждые 5 мин
@@ -2098,9 +4105,25 @@ updateBtn.addEventListener("click", () => {
   document.getElementById("upd-remote").textContent = info.remote || "?";
   document.getElementById("upd-date").textContent = info.date ? "(" + info.date + ")" : "";
   const ul = document.getElementById("upd-notes");
-  ul.innerHTML = (info.notes && info.notes.length ? info.notes : ["Без описания"]).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
-  document.getElementById("upd-apply").disabled = !info.canApply;
-  document.getElementById("upd-apply").textContent = info.canApply ? "Обновить сейчас" : "Авто-обновление недоступно";
+  const applyBtn = document.getElementById("upd-apply");
+  const cancelBtn = document.getElementById("upd-cancel");
+  if (info.available) {
+    document.querySelector("#update-modal h2").textContent = "Доступно обновление";
+    document.querySelector("#update-modal .update-notes-title").textContent = "Что нового:";
+    document.querySelector("#update-modal .update-versions").style.display = "";
+    ul.innerHTML = (info.notes && info.notes.length ? info.notes : ["Без описания"]).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
+    applyBtn.style.display = "";
+    applyBtn.disabled = !info.canApply;
+    applyBtn.textContent = info.canApply ? "Обновить сейчас" : "Авто-обновление недоступно";
+    cancelBtn.textContent = "Позже";
+  } else {
+    document.querySelector("#update-modal h2").textContent = "Актуальная версия";
+    document.querySelector("#update-modal .update-notes-title").textContent = "У вас стоит последняя версия v" + (info.local || "?") + ". Обновляться не нужно.";
+    document.querySelector("#update-modal .update-versions").style.display = "none";
+    ul.innerHTML = "";
+    applyBtn.style.display = "none";
+    cancelBtn.textContent = "OK";
+  }
   updateModal.style.display = "flex";
 });
 document.getElementById("upd-cancel").addEventListener("click", () => updateModal.style.display = "none");
@@ -2143,17 +4166,17 @@ function urlBase64ToUint8Array(base64) {
   return out;
 }
 async function updatePushBtnState() {
+  const toggle = document.getElementById("notif-toggle");
+  const notifItem = document.getElementById("settings-notifications");
   if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
-    pushBtn.style.display = "none";
+    if (notifItem) notifItem.style.display = "none";
     return;
   }
   const reg = await navigator.serviceWorker.ready.catch(() => null);
-  if (!reg) { pushBtn.style.display = "none"; return; }
+  if (!reg) { if (notifItem) notifItem.style.display = "none"; return; }
   const sub = await reg.pushManager.getSubscription();
   const granted = Notification.permission === "granted" && !!sub;
-  pushBtn.style.display = "";
-  pushBtn.style.opacity = granted ? "0.5" : "1";
-  pushBtn.title = granted ? "Уведомления включены (клик — выключить)" : "Включить пуш-уведомления";
+  if (toggle) toggle.classList.toggle("on", granted);
 }
 pushBtn.addEventListener("click", async () => {
   try {
@@ -2213,18 +4236,28 @@ async function sendPushToAll(payload: { title: string; body: string; tag?: strin
     try {
       await webpush.sendNotification(sub as any, data);
     } catch (e: any) {
-      // 410 Gone = subscription expired/revoked
-      if (e?.statusCode === 410 || e?.statusCode === 404) dead.push(i);
-      else console.error("[push] send failed:", e?.statusCode, e?.body?.slice?.(0, 200));
+      // Очищаем подписку при ошибках, которые означают что она невалидна:
+      //   410 Gone — отписалась/устройство удалило
+      //   404 Not Found — endpoint больше не существует
+      //   403 BadJwtToken (Apple) — VAPID отвергнут конкретно для этой подписки (часто = просрочка)
+      //   403 + body содержит "BadJwtToken"
+      const body = String(e?.body || "");
+      const isBadJwt = e?.statusCode === 403 && /BadJwtToken|Forbidden/i.test(body);
+      if (e?.statusCode === 410 || e?.statusCode === 404 || isBadJwt) {
+        dead.push(i);
+      }
+      console.error("[push] send failed:", e?.statusCode, body.slice(0, 200));
     }
   }));
   if (dead.length) {
     pushSubscriptions = pushSubscriptions.filter((_, i) => !dead.includes(i));
     await savePushSubs();
+    console.log(`[push] cleaned up ${dead.length} dead subscription(s), remaining: ${pushSubscriptions.length}`);
   }
 }
 
 // Periodic poller: detect transition into "waiting" status, send push.
+const prevOpenQuestionBySid = new Map<string, boolean>();
 setInterval(async () => {
   try {
     const sessions = await snapshot();
@@ -2236,6 +4269,13 @@ setInterval(async () => {
         sendPushToAll({ title: `${title}: ждёт ответа`, body: "Claude закончил и ждёт от тебя ввода", tag: s.sessionId }).catch(() => {});
       }
       prevStatusBySid.set(s.sessionId, s.status);
+      // Push на появление НОВОГО открытого вопроса (AskUserQuestion)
+      const prevQ = prevOpenQuestionBySid.get(s.sessionId) ?? false;
+      if (!prevQ && s.hasOpenQuestion) {
+        const title = s.title || s.cwdLabel || "Claude";
+        sendPushToAll({ title: `❓ ${title} спрашивает`, body: "Открой панель — нужен твой выбор", tag: "q-" + s.sessionId }).catch(() => {});
+      }
+      prevOpenQuestionBySid.set(s.sessionId, !!s.hasOpenQuestion);
     }
   } catch (e) { console.error("[push poller]", e); }
 }, 3000);
@@ -2546,6 +4586,18 @@ Bun.serve({
     if (url.pathname === "/api/sessions") {
       return Response.json(await snapshot());
     }
+    // kid-dash override: мама подтвердила «точно прервать урок» → разблокировка на 60 сек
+    if (url.pathname === "/api/kid-dash/override" && req.method === "POST") {
+      kidDashOverrideUntil = Date.now() + KID_DASH_OVERRIDE_DURATION_MS;
+      // Сбросить кэш состояния чтобы изменения применились сразу
+      kidDashStateCache = { at: 0, value: null };
+      return Response.json({ ok: true, overrideUntil: kidDashOverrideUntil });
+    }
+    if (url.pathname === "/api/kid-dash/override" && req.method === "DELETE") {
+      kidDashOverrideUntil = null;
+      kidDashStateCache = { at: 0, value: null };
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/api/stream") {
       const stream = new ReadableStream({
         async start(controller) {
@@ -2584,20 +4636,25 @@ Bun.serve({
       const sid = interruptMatch[1];
       const meta = sessionMeta.get(sid);
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
-      const script = `tell application "Terminal"
+      const script = `tell application "System Events"
+        set prevApp to name of first process whose frontmost is true
+      end tell
+      tell application "Terminal"
         repeat with w in windows
+          try
           repeat with t in tabs of w
             try
               if (tty of t) is "/dev/${meta.tty}" then
                 set selected of t to true
                 set frontmost of w to true
                 activate
-                delay 0.15
+                delay 0.12
                 tell application "System Events" to key code 53
                 return "ok"
               end if
             end try
           end repeat
+          end try
         end repeat
       end tell
       return "not found"`;
@@ -2612,6 +4669,220 @@ Bun.serve({
       return Response.json({ ok: true });
     }
 
+    const hideMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/hide$/);
+    if (hideMatch && req.method === "POST") {
+      hiddenSids.set(hideMatch[1], {});
+      await saveHiddenSids();
+      return Response.json({ ok: true, total: hiddenSids.size });
+    }
+    const closeMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/close$/);
+    if (closeMatch && req.method === "POST") {
+      const body = await req.json().catch(() => ({})) as { mode?: string };
+      const mode = body.mode === "delete" ? "delete" : "hide";
+      const sid = closeMatch[1];
+      if (sid === mainSessionSid) {
+        return Response.json({ error: "Главную сессию дашборда нельзя закрыть" }, { status: 403 });
+      }
+      const meta = sessionMeta.get(sid);
+      const pid = meta?.pid;
+      const tty = meta?.tty;
+      const jsonlPath = meta?.jsonlPath;
+      // 1. Сначала убить claude pid — иначе Terminal покажет диалог «закрыть вкладку с запущенным процессом?» и tab останется
+      if (pid && pid > 0) {
+        try { process.kill(pid, "SIGTERM"); } catch {}
+        await new Promise(r => setTimeout(r, 300));
+        // Если не отвалился — SIGKILL
+        try { process.kill(pid, 0); /* check alive */ try { process.kill(pid, "SIGKILL"); } catch {} } catch {}
+      }
+      // 2. Закрыть Terminal-вкладку: сначала отправляем exit для shell, потом close (без диалога «процесс запущен»)
+      if (tty) {
+        const script = `tell application "Terminal"
+  repeat with w in windows
+    try
+      repeat with t in tabs of w
+        try
+          if (tty of t) is "/dev/${tty}" then
+            do script "exit" in t
+            delay 0.4
+            close t saving no
+            return "ok"
+          end if
+        end try
+      end repeat
+    end try
+  end repeat
+end tell`;
+        Bun.spawnSync(["osascript", "-e", script]);
+      }
+      const info = { cwd: meta?.cwd, title: meta?.title };
+      if (mode === "delete") {
+        if (jsonlPath) { try { await unlink(jsonlPath); } catch {} }
+        hiddenSids.set(sid, info);
+      } else {
+        hiddenSids.set(sid, info);
+      }
+      await saveHiddenSids();
+      return Response.json({ ok: true, mode });
+    }
+    const unhideMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/unhide$/);
+    if (unhideMatch && req.method === "POST") {
+      const sid = unhideMatch[1];
+      const body = await req.json().catch(() => ({})) as { restore?: boolean };
+      const info = hiddenSids.get(sid);
+      hiddenSids.delete(sid);
+      await saveHiddenSids();
+      // Если попросили restore — поднять терминальную сессию через claude --resume
+      if (body.restore && info?.cwd) {
+        const r = await restoreSession(sid, info.cwd);
+        if (!r.ok) return Response.json({ ok: false, error: r.error }, { status: 500 });
+      }
+      return Response.json({ ok: true, total: hiddenSids.size });
+    }
+    if (url.pathname === "/api/hidden-sessions") {
+      return Response.json([...hiddenSids].map(([sid, info]) => ({ sid, ...info })));
+    }
+    if (url.pathname === "/api/check-existing" && req.method === "GET") {
+      const cwdRaw = (url.searchParams.get("cwd") || "").trim();
+      if (!cwdRaw) return Response.json({ exists: false });
+      const cwd = cwdRaw.startsWith("~") ? cwdRaw.replace(/^~/, homedir()) : cwdRaw;
+      try {
+        const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+        const projectDir = join(PROJECTS_DIR, encoded);
+        const files = await readdir(projectDir).catch(() => [] as string[]);
+        const livePidSids = new Set((await gatherPidInfos()).map(p => p.sessionId).filter(Boolean));
+        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        let best: { sid: string; mtime: number; hasLivePid: boolean } | null = null;
+        for (const f of files) {
+          if (!f.endsWith(".jsonl")) continue;
+          const sid = f.replace(/\.jsonl$/, "");
+          try {
+            const filePath = join(projectDir, f);
+            const st = await stat(filePath);
+            if (st.mtimeMs < cutoff) continue;
+            const head = await readHead(filePath, 16 * 1024);
+            const lines = head.split("\n").filter(l => l.trim().startsWith("{"));
+            let hasRealUserMsg = false;
+            for (const line of lines) {
+              try {
+                const r = JSON.parse(line);
+                if (r.type !== "user") continue;
+                const c = r.message?.content;
+                const text = typeof c === "string" ? c : (Array.isArray(c) ? c.filter((x: any) => x?.type === "text").map((x: any) => x.text || "").join("") : "");
+                if (text.trim() && !text.startsWith("<command-") && !text.startsWith("<system-reminder")) { hasRealUserMsg = true; break; }
+              } catch {}
+            }
+            if (!hasRealUserMsg) continue;
+            const hasLivePid = livePidSids.has(sid);
+            if (!best || st.mtimeMs > best.mtime) best = { sid, mtime: st.mtimeMs, hasLivePid };
+          } catch {}
+        }
+        if (!best) return Response.json({ exists: false });
+        // Достанем title (если есть)
+        let title: string | null = null;
+        try {
+          const jsonlPath = join(projectDir, best.sid + ".jsonl");
+          title = await getTitleCached(best.sid, jsonlPath);
+        } catch {}
+        return Response.json({ exists: true, sid: best.sid, title, hasLivePid: best.hasLivePid });
+      } catch { return Response.json({ exists: false }); }
+    }
+    if (url.pathname === "/api/session/new" && req.method === "POST") {
+      const body = await req.json().catch(() => ({})) as { name?: string; cwd?: string; remoteControl?: boolean };
+      const name = String(body.name ?? "").trim();
+      const cwdRaw = String(body.cwd ?? "").trim() || "~";
+      let rc = !!body.remoteControl;
+      if (!name) return Response.json({ error: "Название обязательно" }, { status: 400 });
+      if (!/^[\p{L}\p{N} _.\-]+$/u.test(name)) return Response.json({ error: "Название содержит недопустимые символы" }, { status: 400 });
+      const cwd = cwdRaw.startsWith("~") ? cwdRaw.replace(/^~/, homedir()) : cwdRaw;
+      // Ищем существующий jsonl в этой папке БЕЗ живого Terminal-pid — берём для resume.
+      // Так подхватываем desktop-сессии (или прошлые терминальные, которые закрыли).
+      let resumeSid: string | null = null;
+      try {
+        const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+        const projectDir = join(PROJECTS_DIR, encoded);
+        const files = await readdir(projectDir).catch(() => [] as string[]);
+        const livePidSids = new Set((await gatherPidInfos()).map(p => p.sessionId).filter(Boolean));
+        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;  // не старее 30 дней
+        let best: { sid: string; mtime: number } | null = null;
+        for (const f of files) {
+          if (!f.endsWith(".jsonl")) continue;
+          const sid = f.replace(/\.jsonl$/, "");
+          if (livePidSids.has(sid)) continue;
+          try {
+            const filePath = join(projectDir, f);
+            const st = await stat(filePath);
+            if (st.mtimeMs < cutoff) continue;
+            // Проверка содержимого: пропускаем jsonl без реальных user-сообщений
+            const head = await readHead(filePath, 16 * 1024);
+            const lines = head.split("\n").filter(l => l.trim().startsWith("{"));
+            let hasRealUserMsg = false;
+            for (const line of lines) {
+              try {
+                const r = JSON.parse(line);
+                if (r.type !== "user") continue;
+                const c = r.message?.content;
+                const text = typeof c === "string" ? c : (Array.isArray(c) ? c.filter((x: any) => x?.type === "text").map((x: any) => x.text || "").join("") : "");
+                if (text.trim() && !text.startsWith("<command-") && !text.startsWith("<system-reminder")) {
+                  hasRealUserMsg = true;
+                  break;
+                }
+              } catch {}
+            }
+            if (!hasRealUserMsg) continue;
+            if (!best || st.mtimeMs > best.mtime) best = { sid, mtime: st.mtimeMs };
+          } catch {}
+        }
+        if (best) resumeSid = best.sid;
+      } catch {}
+      // Если resume — автоматически включаем /remote-control, чтобы terminal + Claude.app + dashboard
+      // могли работать в тандеме на одной сессии (как ты просил).
+      if (resumeSid) rc = true;
+      // Защита: если для resumeSid уже есть живой терминальный pid — отказ (нельзя дублировать)
+      if (resumeSid) {
+        const livePids = await gatherPidInfos();
+        if (livePids.some(p => p.sessionId === resumeSid)) {
+          return Response.json({ error: "Эта сессия уже открыта в Terminal — нельзя дублировать. Открой её карточку в дашборде." }, { status: 409 });
+        }
+      }
+      console.log(`[new-session] cwd=${cwd} resume=${resumeSid || "(new)"} rc=${rc}`);
+      // AppleScript: открыть Terminal, запустить claude (или claude --resume), /rename, /remote-control, скрыть.
+      const nameEsc = name.replace(/"/g, '\\"');
+      const cwdEsc = cwd.replace(/"/g, '\\"');
+      const claudeCmd = resumeSid ? `claude --resume ${resumeSid}` : "claude";
+      const rcBlock = rc
+        ? `do script "/remote-control" in newTab\n  delay 0.2\n  do script "" in newTab\n  delay 4`
+        : "";
+      const script = `tell application "System Events"
+  set prevApp to name of first process whose frontmost is true
+end tell
+-- Без activate — Terminal не вылезает в фронт. do script откроет новое окно/вкладку, но мы сразу его спрячем.
+tell application "Terminal"
+  set newTab to do script "cd \\"${cwdEsc}\\" && ${claudeCmd}"
+  delay 8
+  ${resumeSid ? "" : `do script "/rename ${nameEsc}" in newTab
+  delay 0.2
+  do script "" in newTab
+  delay 3`}
+  ${rcBlock}
+  delay 0.5
+end tell
+-- Спрятать Terminal (Cmd+H) и вернуть фронт тому приложению, в котором пользователь был (браузер).
+tell application "System Events"
+  try
+    set visible of process "Terminal" to false
+  end try
+end tell
+return "ok"`;
+      const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      console.log(`[new-session] name="${name}" rc=${rc} out="${out.trim()}" err="${err.trim()}"`);
+      if (err.trim() && proc.exitCode !== 0) return Response.json({ error: err.trim() }, { status: 500 });
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       const body = await req.json().catch(() => ({})) as { sessionId?: string; cwd?: string };
       const sid = String(body.sessionId ?? "").trim();
@@ -2729,13 +5000,95 @@ Bun.serve({
       }
     }
 
+    // DEBUG: показать сырой TUI-content + результат парсинга для одной tty
+    const debugTuiMatch = url.pathname.match(/^\/api\/debug\/tui\/([^/]+)$/);
+    if (debugTuiMatch) {
+      const tty = debugTuiMatch[1];
+      tuiContentsCache = { at: 0, byTty: new Map() };  // bust cache
+      // Запустим AppleScript заново и покажем сырой stdout+stderr
+      const debugScript = `set sepStart to "|||TTYSTART|||"
+set sepEnd to "|||TTYEND|||"
+set acc to ""
+set winCount to 0
+set errLog to ""
+tell application "Terminal"
+  set winCount to (count of windows)
+  repeat with w in windows
+    try
+      set tabCount to count of tabs of w
+      set errLog to errLog & "win-tabs=" & tabCount & ";"
+      repeat with t in tabs of w
+        try
+          set ttyStr to tty of t
+          set cont to ""
+          try
+            set cont to (contents of t) as text
+          on error eMsg
+            set errLog to errLog & "contents-err:" & eMsg & ";"
+          end try
+          set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+        on error eMsg
+          set errLog to errLog & "tab-err:" & eMsg & ";"
+        end try
+      end repeat
+    on error eMsg
+      set errLog to errLog & "win-err:" & eMsg & ";"
+    end try
+  end repeat
+end tell
+return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
+      const proc = Bun.spawn(["osascript", "-e", debugScript], { stdout: "pipe", stderr: "pipe" });
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      const all = await readAllTerminalContents();
+      const text = all.get(tty) ?? "";
+      const parsed = parseTuiModal(text);
+      return Response.json({
+        tty,
+        rawStdoutLen: out.length,
+        rawStdoutHead: out.slice(0, 500),
+        rawStdoutTail: out.slice(-500),
+        rawStderr: err,
+        contentLen: text.length,
+        allTtys: [...all.keys()],
+        contentTail: text.slice(-3000),
+        parsed,
+      });
+    }
+
     const messagesMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/messages$/);
     if (messagesMatch) {
       const sid = messagesMatch[1];
       const meta = sessionMeta.get(sid);
       if (!meta) return Response.json({ error: "session not found" }, { status: 404 });
-      if (!meta.jsonlPath) return Response.json([]);
-      const msgs = await readMessages(meta.jsonlPath);
+      const msgs = meta.jsonlPath ? await readMessages(meta.jsonlPath) : [];
+      // Если в Terminal-вкладке висит живой AskUserQuestion-модал, которого ещё нет в jsonl,
+      // дописываем его в конец фида как фейковую question-запись — чтобы фронт мог отрендерить.
+      const liveQ = await getTuiQuestion(meta.tty);
+      if (liveQ) {
+        // Найдём последний question-msg в фиде
+        let lastQIdx = -1;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if ((msgs[i] as any).role === "question") { lastQIdx = i; break; }
+        }
+        const lastQ = lastQIdx >= 0 ? (msgs[lastQIdx] as any) : null;
+        const sameLogical = lastQ && !lastQ.question?.answered && (
+          lastQ.question?.question === liveQ.question ||
+          lastQ.question?.question?.includes(liveQ.question) ||
+          liveQ.question?.includes(lastQ.question?.question || "")
+        );
+        if (sameLogical) {
+          // Заменяем jsonl-версию на TUI — там полные опции (включая «Свой вариант») и реальные описания.
+          // Но toolUseId оставляем из jsonl (он стабилен), чтобы DOM data-tool-use-id не дёргался между поллами.
+          const stableId = lastQ.question?.toolUseId || liveQ.toolUseId;
+          msgs[lastQIdx] = { role: "question" as const, text: liveQ.question, ts: lastQ.ts, question: { ...liveQ, toolUseId: stableId } };
+        } else {
+          msgs.push({ role: "question" as const, text: liveQ.question, ts: new Date().toISOString(), question: liveQ });
+        }
+      }
       return new Response(JSON.stringify(msgs), {
         headers: { "content-type": "application/json", "cache-control": "no-store, no-cache, must-revalidate" },
       });
@@ -2749,6 +5102,87 @@ Bun.serve({
       if (!meta.tty) return Response.json({ terminal: "none", error: "no tty (desktop session?)" });
       const { result, stderr } = await controlTerminal(meta.tty, "focus");
       return Response.json({ terminal: result, stderr });
+    }
+
+    const wakeMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/wake$/);
+    if (wakeMatch && req.method === "POST") {
+      const sid = wakeMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
+      if (!meta.jsonlPath) return Response.json({ error: "no jsonl" }, { status: 400 });
+      // Найти последнее user-сообщение в jsonl и переслать его — это retry, который реально дёрнет API.
+      let lastUserText = "";
+      try {
+        const tail = await readTail(meta.jsonlPath, 256 * 1024);
+        const lines = tail.split("\n").filter(l => l.trim().startsWith("{"));
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const r = JSON.parse(lines[i]);
+            if (r.type !== "user") continue;
+            const c = r.message?.content;
+            const t = typeof c === "string" ? c : (Array.isArray(c) ? c.filter((x: any) => x?.type === "text" && typeof x.text === "string").map((x: any) => x.text).join("\n") : "");
+            if (t && !t.startsWith("<command-") && !t.startsWith("<system-reminder")) { lastUserText = t; break; }
+          } catch {}
+        }
+      } catch {}
+      if (!lastUserText) {
+        // Fallback: пустой Enter
+        const { result } = await controlTerminal(meta.tty, "send", "");
+        return Response.json({ ok: true, terminal: result, fallback: "empty-enter" });
+      }
+      console.log(`[/wake sid=${sid}] resend last user text="${lastUserText.slice(0, 80)}"`);
+      const { result } = await controlTerminal(meta.tty, "send", lastUserText);
+      return Response.json({ ok: true, terminal: result, resent: lastUserText.slice(0, 120) });
+    }
+    // Multi-tab: отправить произвольный текст в указанный tty (для Type something / Свой вариант)
+    const typeTextMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/type-text$/);
+    if (typeTextMatch && req.method === "POST") {
+      const sid = typeTextMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
+      const body = await req.json().catch(() => ({})) as { text?: string };
+      if (typeof body.text !== "string" || !body.text) return Response.json({ error: "text required" }, { status: 400 });
+      const res = await sendTextToTui(meta.tty, body.text);
+      if (res.ok) return Response.json({ ok: true });
+      return Response.json({ error: res.error }, { status: 500 });
+    }
+    // Live mirror TUI содержимого — последние ~50 строк для multi-tab UI
+    const mirrorMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/tui-mirror$/);
+    if (mirrorMatch) {
+      const sid = mirrorMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
+      const all = await readAllTerminalContents();
+      const text = all.get(meta.tty) ?? "";
+      const lines = text.split("\n");
+      const tail = lines.slice(-50).join("\n");
+      return Response.json({ tty: meta.tty, content: tail });
+    }
+    // Multi-tab: отправить одну raw-клавишу (стрелки, Enter, Esc) в указанный tty
+    const rawKeyMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/send-raw-key$/);
+    if (rawKeyMatch && req.method === "POST") {
+      const sid = rawKeyMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
+      const body = await req.json().catch(() => ({})) as { key?: string };
+      if (!body.key || typeof body.key !== "string") return Response.json({ error: "key required" }, { status: 400 });
+      const res = await sendRawKey(meta.tty, body.key as any);
+      if (res.ok) return Response.json({ ok: true });
+      return Response.json({ error: res.error }, { status: 500 });
+    }
+
+    const answerMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/answer-question$/);
+    if (answerMatch && req.method === "POST") {
+      const sid = answerMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
+      const body = await req.json().catch(() => ({})) as { optionIndex?: number; freeText?: string };
+      const idx = Number(body.optionIndex);
+      if (!Number.isInteger(idx) || idx < 1 || idx > 20) return Response.json({ error: "invalid optionIndex" }, { status: 400 });
+      const freeText = typeof body.freeText === "string" ? body.freeText : undefined;
+      const res = await answerTuiQuestion(meta.tty, idx, freeText);
+      if (res.ok) return Response.json({ ok: true });
+      return Response.json({ error: res.error }, { status: 500 });
     }
 
     const sendMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/send$/);
@@ -2765,6 +5199,10 @@ Bun.serve({
       const text = (body.text ?? "").toString();
       if (!text.trim()) return Response.json({ error: "empty text" }, { status: 400 });
       console.log(`[/send sid=${sid} tty=${meta.tty}] text="${text.slice(0, 80)}"`);
+      // Если шлём /rename — сбрасываем кэш заголовка чтобы новое имя подхватилось быстро
+      if (text.trim().toLowerCase().startsWith("/rename ")) {
+        titleCache.delete(sid);
+      }
       const { result, stderr } = await controlTerminal(meta.tty, "send", text);
       if (result === "none") {
         return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто?` }, { status: 500 });
