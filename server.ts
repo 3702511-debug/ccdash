@@ -5264,6 +5264,17 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       if (text.trim().toLowerCase().startsWith("/rename ")) {
         titleCache.delete(sid);
       }
+      // Если text начинается с `!` — это shell-bang Claude Code (выполнить как bash).
+      // Claude Code включает bash-mode только при ЖИВОМ keypress `!`, не при AppleScript paste.
+      // Поэтому печатаем через CGEventKeyboardSetUnicodeString (живой набор), потом Enter отдельно.
+      if (text.trimStart().startsWith("!")) {
+        const typed = await sendTextToTui(meta.tty, text);
+        if (!typed.ok) return Response.json({ terminal: "Terminal", error: typed.error ?? "type-text failed" }, { status: 500 });
+        await new Promise(r => setTimeout(r, 120));
+        const enter = await sendRawKey(meta.tty, "enter");
+        if (!enter.ok) return Response.json({ terminal: "Terminal", error: enter.error ?? "enter failed" }, { status: 500 });
+        return Response.json({ terminal: "Terminal", pasteHint: true });
+      }
       const { result, stderr } = await controlTerminal(meta.tty, "send", text);
       if (result === "none") {
         return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто?` }, { status: 500 });
