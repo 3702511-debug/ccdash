@@ -1,4 +1,5 @@
 import { readdir, stat, mkdir, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHmac } from "node:crypto";
@@ -809,17 +810,30 @@ async function snapshot(): Promise<Session[]> {
 
   // TUI live AskUserQuestion: для каждой сессии с tty читаем visible-contents Terminal-вкладки
   // и парсим открытый модал. Это вылавливает вопросы, которые claude ещё не флашнул в jsonl.
+  // А также: используем TUI как источник правды для status — если в TUI нет spinner'а
+  // (вида «· Enchanting… (NNs · ↓ X tokens · …)»), значит claude закончил, status → waiting.
+  // Это покрывает gap'ы jsonl-эвристики (например свежий tool_result, но claude уже завершил).
   try {
     const all = await readAllTerminalContents();
     for (const s of sessions) {
       if (!s.tty) continue;
-      if (s.hasOpenQuestion) continue;  // уже есть jsonl-based, не перезаписываем
       const text = all.get(s.tty);
       if (!text) continue;
-      const q = parseTuiModal(text);
-      if (q) {
-        s.hasOpenQuestion = true;
-        s.openQuestion = q;
+      if (!s.hasOpenQuestion) {
+        const q = parseTuiModal(text);
+        if (q) {
+          s.hasOpenQuestion = true;
+          s.openQuestion = q;
+        }
+      }
+      // Spinner pattern: «(NNs · ↓ X tokens)» — точное определение что claude крутится сейчас.
+      // Если jsonl-status сказал thinking/tool, но TUI показывает чистый prompt — переписываем.
+      if (s.status === "thinking" || s.status === "tool") {
+        const hasSpinner = /\(\d+s\s+·\s+(?:↓|↑|⚒|⏵)/.test(text);
+        if (!hasSpinner) {
+          s.status = "waiting";
+          s.busySince = undefined;
+        }
       }
     }
   } catch (e) {
@@ -1621,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v30";
+const CACHE = "cc-dashboard-v32";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2124,8 +2138,8 @@ const HTML = `<!doctype html>
 
   /* === Light theme === */
   body.theme-light { color-scheme: light; background: #f6f8fa; color: #1f2328; }
-  body.theme-light h1, body.theme-light .drawer-title, body.theme-light .welcome-btn { color: #0d1117; text-shadow: 0 0 8px rgba(0,0,0,0.05); }
-  body.theme-light h1 .blood { color: #b30000; text-shadow: 0 0 10px rgba(180,0,0,0.4), 0 2px 4px rgba(60,0,0,0.3); }
+  body.theme-light h1, body.theme-light .drawer-title, body.theme-light .welcome-btn { color: #0d1117; text-shadow: none; }
+  body.theme-light h1 .blood { display: none; }
   body.theme-light .menu-btn { background: #eaeef2; color: #1f2328; }
   body.theme-light .menu-btn:hover { background: #d0d7de; }
   body.theme-light .meta { color: #57606a; }
@@ -4045,12 +4059,32 @@ async function sendInPanel(sid) {
   }
 }
 
+// Watchdog: если SSE молчит > 8 сек (нормально шлёт раз в 2 сек + heartbeat) — реконнект.
+// Это спасает iOS Safari PWA в фоне, где EventSource тихо умирает без events onerror.
+let sseLastEventAt = 0;
+let sseWatchdog = null;
 function connect() {
   const es = new EventSource("/api/stream");
-  es.onmessage = (e) => render(JSON.parse(e.data));
+  sseLastEventAt = Date.now();
+  if (sseWatchdog) clearInterval(sseWatchdog);
+  sseWatchdog = setInterval(() => {
+    if (Date.now() - sseLastEventAt > 8000) {
+      console.warn("[sse] silence > 8s — reconnecting");
+      try { es.close(); } catch {}
+      clearInterval(sseWatchdog);
+      sseWatchdog = null;
+      setTimeout(connect, 500);
+    }
+  }, 3000);
+  es.onmessage = (e) => {
+    sseLastEventAt = Date.now();
+    if (e.data === "ping") return;  // heartbeat
+    try { render(JSON.parse(e.data)); } catch {}
+  };
   es.onerror = () => {
     document.getElementById("meta").textContent = "соединение разорвано — переподключаюсь…";
-    es.close();
+    try { es.close(); } catch {}
+    if (sseWatchdog) { clearInterval(sseWatchdog); sseWatchdog = null; }
     // Probe via fetch — if cookie протухла, патченный window.fetch перенаправит на /login.
     fetch("/api/sessions").then(r => { if (r.ok) setTimeout(connect, 2000); }).catch(() => setTimeout(connect, 2000));
   };
@@ -4365,12 +4399,31 @@ async function deriveRawReleaseUrl(): Promise<string | null> {
 let rawReleaseUrl: string | null = await deriveRawReleaseUrl();
 if (rawReleaseUrl) console.log(`[update] poll URL: ${rawReleaseUrl}`);
 
+// Авто-apply: если в ~/.cc-dashboard/auto-update.flag существует — обновляемся без UI-confirmation.
+// Это для разработчика (автор репо). Обычные пользователи (без флага) видят кнопку с changelog.
+const AUTO_UPDATE_FLAG = join(homedir(), ".cc-dashboard", "auto-update.flag");
+async function autoApplyIfFlagged() {
+  try {
+    if (!existsSync(AUTO_UPDATE_FLAG)) return;
+    const local = localRelease?.version ?? "0.0.0";
+    const remote = remoteRelease?.version ?? local;
+    if (compareVersions(local, remote) >= 0) return;
+    console.log(`[auto-update] flag present, v${local} → v${remote}, applying…`);
+    const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
+    const cmd = `cd ${JSON.stringify(repoPath)} && git pull --ff-only && bun run setup-local.ts > /tmp/cc-dash-auto-update.log 2>&1`;
+    Bun.spawn(["bash", "-c", `(${cmd}) &`], { stdout: "ignore", stderr: "ignore" });
+  } catch (e) {
+    console.error("[auto-update] failed:", e);
+  }
+}
+
 async function pollRemoteRelease() {
   if (!rawReleaseUrl) return;
   try {
     const res = await fetch(rawReleaseUrl, { cache: "no-store" });
     if (!res.ok) return;
     remoteRelease = await res.json();
+    await autoApplyIfFlagged();
   } catch {}
 }
 pollRemoteRelease();
@@ -4667,15 +4720,24 @@ Bun.serve({
               if (closed) return;
               controller.enqueue(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e: any) {
-              if (e?.code !== "ERR_INVALID_STATE") console.error("snapshot:", e);
-              closed = true;
+              // НЕ закрываем stream при единичной ошибке snapshot — продолжаем пытаться.
+              // Только ERR_INVALID_STATE значит controller уже мёртв.
+              if (e?.code === "ERR_INVALID_STATE") { closed = true; return; }
+              console.error("[sse] snapshot error (continue):", e?.message ?? e);
             }
           };
           await send();
           const interval = setInterval(send, 2000);
+          // Heartbeat каждые 15 сек чтобы client watchdog знал что соединение живо
+          // (даже если snapshot ничего не отдал из-за ошибки).
+          const heartbeat = setInterval(() => {
+            if (closed) return;
+            try { controller.enqueue(`data: ping\n\n`); } catch { closed = true; }
+          }, 15000);
           req.signal.addEventListener("abort", () => {
             closed = true;
             clearInterval(interval);
+            clearInterval(heartbeat);
             try { controller.close(); } catch {}
           });
         },
