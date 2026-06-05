@@ -152,6 +152,9 @@ async function isHeadlessOrSidechain(jsonlPath: string): Promise<boolean> {
       try {
         const rec = JSON.parse(line);
         if (rec.isSidechain === true) { res = true; break; }
+        // queue-operation в первой записи — это Claude.app сессия. По умолчанию считаем
+        // её headless (без Terminal-вкладки → нечего показывать). НО snapshot loop отдельно
+        // проверит, есть ли для неё живой `claude --resume` процесс — если да, не пропустит.
         if (rec.type === "queue-operation") { res = true; break; }
       } catch {}
     }
@@ -534,18 +537,21 @@ async function gatherPidInfos(): Promise<PidInfo[]> {
 }
 
 function bindPid(jsonlSessionId: string, jsonlCwd: string | null, pidInfos: PidInfo[]): PidInfo | null {
-  // 1. exact sessionId match via claude metadata — most authoritative signal
+  // 1. exact sessionId match. ПРИОРИТЕТ: с tty (terminal-resume) > без tty (Claude.app headless).
+  // Иначе Claude.app перехватывает binding и наш Terminal-resume становится stub'ом.
   if (jsonlSessionId) {
-    for (const p of pidInfos) {
-      if (!p.used && p.sessionId === jsonlSessionId) return p;
+    const matches = pidInfos.filter(p => !p.used && p.sessionId === jsonlSessionId);
+    if (matches.length > 0) {
+      const withTty = matches.find(p => p.tty);
+      return withTty ?? matches[0];
     }
   }
   // 2. cwd fallback — но НЕ привязывать к pid'у, у которого известен другой sessionId.
-  // Иначе старый jsonl украдёт tty у нового claude, запущенного в той же папке/терминале,
-  // и пользовательские сообщения уйдут не в ту сессию.
   if (jsonlCwd) {
-    for (const p of pidInfos) {
-      if (!p.used && p.cwd === jsonlCwd && (!p.sessionId || p.sessionId === jsonlSessionId)) return p;
+    const matches = pidInfos.filter(p => !p.used && p.cwd === jsonlCwd && (!p.sessionId || p.sessionId === jsonlSessionId));
+    if (matches.length > 0) {
+      const withTty = matches.find(p => p.tty);
+      return withTty ?? matches[0];
     }
   }
   return null;
@@ -719,11 +725,17 @@ async function snapshot(): Promise<Session[]> {
   // 1. Show sessions with a recent jsonl (the activity-driven view)
   for (const j of freshJsonls) {
     try {
-      if (await isHeadlessOrSidechain(j.path)) continue;
       const fileName = j.path.split("/").pop() ?? "";
       const sessionId = fileName.replace(/\.jsonl$/, "");
+      // Headless: Claude.app или sidechain. Пропускаем ТОЛЬКО если нет живого
+      // `claude --resume` процесса с тем же sessionId — иначе resume через дашборд бы не работал.
+      if (await isHeadlessOrSidechain(j.path)) {
+        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId);
+        if (!hasLivePid) continue;
+      }
       const st = await readStatus(j.path);
       if (!st) continue;
+      // sessionId уже извлечён выше из имени файла
       const jsonlCwd = st.recordCwd;
       const customTitle = await getTitleCached(sessionId, j.path);
 
@@ -774,9 +786,13 @@ async function snapshot(): Promise<Session[]> {
   // 2. Stub cards for live terminal processes that didn't bind to any jsonl —
   //    these are running terminal windows that haven't written to a jsonl recently.
   //    Skip desktop/headless processes without tty — they're rarely useful as standalone cards.
+  //    Skip processes whose sessionId УЖЕ привязан к карточке (split-brain: Claude.app + Terminal
+  //    запущены параллельно для одного sessionId — показывать только основную, без дубля).
+  const boundSessionIds = new Set(sessions.map(s => s.sessionId));
   for (const p of pidInfos) {
     if (p.used) continue;
     if (!p.tty) continue;
+    if (p.sessionId && boundSessionIds.has(p.sessionId)) continue;
     const stubId = `pid-${p.pid}`;
     const tabTitle = tabTitles.get(p.tty) ?? null;
     sessions.push({
@@ -814,7 +830,17 @@ async function snapshot(): Promise<Session[]> {
   // (вида «· Enchanting… (NNs · ↓ X tokens · …)»), значит claude закончил, status → waiting.
   // Это покрывает gap'ы jsonl-эвристики (например свежий tool_result, но claude уже завершил).
   try {
-    const all = await readAllTerminalContents();
+    // Selective scrape: AppleScript только для активных tty (status thinking/tool/waiting).
+    // idle/unknown сессии — пропускаем, у них нет модалов и нет spinner'а.
+    // Это снижает нагрузку с ~15 tabs scrape до 2-3 на типичный snapshot.
+    const ttysToScrape = new Set<string>();
+    for (const s of sessions) {
+      if (!s.tty) continue;
+      if (s.status === "thinking" || s.status === "tool" || s.status === "waiting") {
+        ttysToScrape.add(s.tty);
+      }
+    }
+    const all = ttysToScrape.size > 0 ? await readAllTerminalContents(ttysToScrape) : new Map<string, string>();
     for (const s of sessions) {
       if (!s.tty) continue;
       const text = all.get(s.tty);
@@ -1119,10 +1145,19 @@ end run`;
 const RESTORE_SCRIPT = `on run argv
   set cwdArg to item 1 of argv
   set sidArg to item 2 of argv
+  set titleArg to ""
+  if (count of argv) >= 3 then set titleArg to item 3 of argv
   set cmd to "cd " & quoted form of cwdArg & " && claude --resume " & sidArg
   -- Без activate — пользователь остаётся в дашборде/браузере, Terminal не вылезает.
   tell application "Terminal"
-    do script cmd
+    set newTab to do script cmd
+    -- Если есть title — после старта claude шлём /rename, чтобы сессия в дашборде сразу получила имя
+    if titleArg is not "" then
+      delay 8
+      do script "/rename " & titleArg in newTab
+      delay 0.2
+      do script "" in newTab
+    end if
   end tell
   -- Скрыть Terminal сразу после запуска, чтобы окно не оставалось перед глазами.
   delay 0.5
@@ -1132,8 +1167,10 @@ const RESTORE_SCRIPT = `on run argv
   return "ok"
 end run`;
 
-async function restoreSession(sessionId: string, cwd: string): Promise<{ ok: boolean; error?: string }> {
-  const proc = Bun.spawn(["osascript", "-e", RESTORE_SCRIPT, "--", cwd, sessionId], {
+async function restoreSession(sessionId: string, cwd: string, title?: string): Promise<{ ok: boolean; error?: string }> {
+  const args = ["osascript", "-e", RESTORE_SCRIPT, "--", cwd, sessionId];
+  if (title && title.trim()) args.push(title.trim());
+  const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -1156,15 +1193,34 @@ async function restoreSession(sessionId: string, cwd: string): Promise<{ ok: boo
 const TUI_SCRAPE_TTL_MS = 4000;
 let tuiContentsCache: { at: number; byTty: Map<string, string> } = { at: 0, byTty: new Map() };
 
-async function readAllTerminalContents(): Promise<Map<string, string>> {
-  if (Date.now() - tuiContentsCache.at < TUI_SCRAPE_TTL_MS) return tuiContentsCache.byTty;
+// Selective scrape: если передан targetTtys, AppleScript обрабатывает только эти вкладки.
+// Без targetTtys — все вкладки (legacy для debug/tui-mirror endpoints).
+// Экономит огромную нагрузку: вместо 15 tabs scrape per snapshot, только 2-3 активных.
+async function readAllTerminalContents(targetTtys?: Set<string>): Promise<Map<string, string>> {
+  // Если запрашиваются конкретные tty и все они есть в кэше свежими — возвращаем сразу
+  if (targetTtys && targetTtys.size > 0 && Date.now() - tuiContentsCache.at < TUI_SCRAPE_TTL_MS) {
+    const have = new Map<string, string>();
+    let allCached = true;
+    for (const t of targetTtys) {
+      const v = tuiContentsCache.byTty.get(t);
+      if (v !== undefined) have.set(t, v);
+      else { allCached = false; break; }
+    }
+    if (allCached) return have;
+  }
+  if (!targetTtys && Date.now() - tuiContentsCache.at < TUI_SCRAPE_TTL_MS) return tuiContentsCache.byTty;
   // ВАЖНО: берём `history of t` но обрезаем в AppleScript до последних 6000 символов.
   // Без timeout-блоков AppleEvent ждал по умолчанию 60s и одна большая вкладка валила всю операцию
   // (ошибка -1712). Сейчас на каждый tab даём 8s, на всю операцию 60s — если кто-то висит,
   // остальные tabs всё равно обработаются.
+  // Если есть target tty — формируем фильтр-список как литерал AppleScript-массива
+  const ttyFilterScript = targetTtys && targetTtys.size > 0
+    ? `set targetSet to {${[...targetTtys].map(t => `"/dev/${t}"`).join(", ")}}\nset useFilter to true\n`
+    : `set targetSet to {}\nset useFilter to false\n`;
   const script = `set sepStart to "|||TTYSTART|||"
 set sepEnd to "|||TTYEND|||"
 set acc to ""
+${ttyFilterScript}
 with timeout of 60 seconds
 tell application "Terminal"
   if it is running then
@@ -1175,14 +1231,26 @@ tell application "Terminal"
             with timeout of 8 seconds
               set t to tab i of w
               set ttyStr to tty of t
-              set hist to history of t
-              set histLen to length of hist
-              if histLen > 6000 then
-                set cont to text (histLen - 5999) thru histLen of hist
-              else
-                set cont to hist
+              set shouldRead to true
+              if useFilter then
+                set shouldRead to false
+                repeat with target in targetSet
+                  if ttyStr is (target as string) then
+                    set shouldRead to true
+                    exit repeat
+                  end if
+                end repeat
               end if
-              set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+              if shouldRead then
+                set hist to history of t
+                set histLen to length of hist
+                if histLen > 6000 then
+                  set cont to text (histLen - 5999) thru histLen of hist
+                else
+                  set cont to hist
+                end if
+                set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+              end if
             end timeout
           end try
         end repeat
@@ -1212,8 +1280,15 @@ return acc`;
     const ttyShort = ttyPath.replace(/^\/dev\//, "");
     byTty.set(ttyShort, text);
   }
-  tuiContentsCache = { at: Date.now(), byTty };
-  return byTty;
+  // При selective scrape — мерджим в существующий кэш, при full — заменяем
+  if (targetTtys && targetTtys.size > 0) {
+    for (const [k, v] of byTty) tuiContentsCache.byTty.set(k, v);
+    tuiContentsCache.at = Date.now();
+    return byTty;  // возвращаем только то что scrape'или
+  } else {
+    tuiContentsCache = { at: Date.now(), byTty };
+    return byTty;
+  }
 }
 
 // Парсит из visible-text Claude Code TUI модал AskUserQuestion.
@@ -1386,7 +1461,7 @@ function parseTuiModal(text: string): OpenQuestion | null {
 
 async function getTuiQuestion(tty: string | null): Promise<OpenQuestion | null> {
   if (!tty) return null;
-  const all = await readAllTerminalContents();
+  const all = await readAllTerminalContents(new Set([tty]));
   const text = all.get(tty);
   if (!text) return null;
   return parseTuiModal(text);
@@ -1635,7 +1710,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v46";
+const CACHE = "cc-dashboard-v51";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -1770,6 +1845,12 @@ const HTML = `<!doctype html>
   .update-notes-title { font-size: 13px; color: #8b949e; margin-bottom: 6px; }
   .update-notes { margin: 0 0 18px; padding-left: 20px; color: #c9d1d9; font-size: 14px; line-height: 1.5; }
   .update-notes li { margin-bottom: 4px; }
+  .update-notes .upd-version-block { list-style: none; margin-bottom: 14px; }
+  .update-notes .upd-version-block strong { color: #58a6ff; font-size: 13px; font-weight: 600; }
+  body.theme-light .update-notes .upd-version-block strong { color: #0969da; }
+  .update-notes .upd-version-block .upd-date { color: #6e7681; font-size: 11px; margin-left: 4px; }
+  .update-notes .upd-sub-notes { margin: 4px 0 0 0; padding-left: 18px; }
+  .update-notes .upd-sub-notes li { font-size: 13px; margin-bottom: 3px; }
   .update-actions { display: flex; gap: 10px; justify-content: flex-end; }
   .update-actions button { padding: 9px 16px; border-radius: 8px; border: 0; font-size: 14px; cursor: pointer; }
   .upd-cancel { background: #21262d; color: #c9d1d9; }
@@ -2625,7 +2706,7 @@ function wireCards(container) {
         const res = await fetch("/api/restore", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd }),
+          body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd, title: btn.dataset.title || "" }),
         });
         const data = await res.json();
         if (!res.ok || data.error) {
@@ -4216,7 +4297,7 @@ function renderArchive(items) {
       previewHtml +
       '<div class="archive-item-meta">' + escapeHtml(s.lastActivityRel || "") + '</div>' +
       '</div>' +
-      '<button class="resume-btn" data-sid="' + escapeHtml(s.sid) + '" data-cwd="' + escapeHtml(s.cwd || "") + '">▶ Resume</button>' +
+      '<button class="resume-btn" data-sid="' + escapeHtml(s.sid) + '" data-cwd="' + escapeHtml(s.cwd || "") + '" data-title="' + escapeHtml(s.title || "") + '">▶ Resume</button>' +
       '</div>';
   }).join("");
   for (const btn of archiveListEl.querySelectorAll(".resume-btn")) {
@@ -4228,7 +4309,7 @@ function renderArchive(items) {
         const res = await fetch("/api/restore", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd }),
+          body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd, title: btn.dataset.title || "" }),
         });
         const d = await res.json().catch(() => ({}));
         if (res.ok) {
@@ -4399,9 +4480,24 @@ updateBtn.addEventListener("click", () => {
   const cancelBtn = document.getElementById("upd-cancel");
   if (info.available) {
     document.querySelector("#update-modal h2").textContent = "Доступно обновление";
-    document.querySelector("#update-modal .update-notes-title").textContent = "Что нового:";
+    const titleEl = document.querySelector("#update-modal .update-notes-title");
     document.querySelector("#update-modal .update-versions").style.display = "";
-    ul.innerHTML = (info.notes && info.notes.length ? info.notes : ["Без описания"]).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
+    // Накопленный changelog: показываем все пропущенные версии (info.releases — массив).
+    // Fallback на info.notes если releases пустой (старый клиент или одна версия).
+    const releases = Array.isArray(info.releases) ? info.releases : [];
+    if (releases.length > 1) {
+      titleEl.textContent = "Изменения за пропущенные релизы (" + releases.length + "):";
+      ul.innerHTML = releases.map(r => {
+        const notes = (r.notes || []).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
+        return '<li class="upd-version-block"><strong>v' + escapeHtml(r.version) + '</strong>' +
+          (r.date ? ' <span class="upd-date">' + escapeHtml(r.date) + '</span>' : '') +
+          '<ul class="upd-sub-notes">' + notes + '</ul></li>';
+      }).join("");
+    } else {
+      titleEl.textContent = "Что нового:";
+      const notes = releases.length === 1 ? releases[0].notes : info.notes;
+      ul.innerHTML = (notes && notes.length ? notes : ["Без описания"]).map(n => "<li>" + escapeHtml(n) + "</li>").join("");
+    }
     applyBtn.style.display = "";
     applyBtn.disabled = !info.canApply;
     applyBtn.textContent = info.canApply ? "Обновить сейчас" : "Авто-обновление недоступно";
@@ -4576,10 +4672,15 @@ setInterval(async () => {
 type Release = { version: string; date?: string; notes?: string[] };
 let localRelease: Release | null = null;
 let remoteRelease: Release | null = null;
+let remoteHistory: Release[] = [];  // массив прошлых релизов с github (для накопленного changelog'а)
 const RELEASE_FILE = join(homedir(), ".cc-dashboard", "RELEASE.json");
+const HISTORY_FILE = join(homedir(), ".cc-dashboard", "RELEASE-history.json");
 const REPO_PATH_FILE = join(homedir(), ".cc-dashboard", "repo-path.txt");
 try { localRelease = await Bun.file(RELEASE_FILE).json(); }
 catch { localRelease = { version: "0.0.0" }; }
+// Также читаем локальный history если есть — он копируется из репо через applyUpdate
+try { remoteHistory = await Bun.file(HISTORY_FILE).json(); }
+catch { remoteHistory = []; }
 
 async function deriveRawReleaseUrl(): Promise<string | null> {
   // Извлекает origin из git-репо и формирует raw.githubusercontent URL для RELEASE.json
@@ -4656,7 +4757,7 @@ async function applyUpdate(): Promise<{ ok: boolean; error?: string }> {
     updateState = { phase: "install-done", percent: 70, startedAt };
     // 3. Copy свежие файлы в RUNTIME (~/.cc-dashboard) (70 → 90%)
     const RUNTIME = join(homedir(), ".cc-dashboard");
-    for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "setup-local.ts", "RELEASE.json"]) {
+    for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "setup-local.ts", "RELEASE.json", "RELEASE-history.json"]) {
       try { cpSync(join(repoPath, f), join(RUNTIME, f)); } catch (e) { console.warn(`[update] skip ${f}:`, e); }
     }
     try { cpSync(join(repoPath, "node_modules"), join(RUNTIME, "node_modules"), { recursive: true }); } catch {}
@@ -4696,6 +4797,16 @@ async function pollRemoteRelease() {
     const res = await fetch(rawReleaseUrl, { cache: "no-store" });
     if (!res.ok) return;
     remoteRelease = await res.json();
+    // Параллельно подтягиваем RELEASE-history.json — массив прошлых версий.
+    // URL получаем заменой имени файла в rawReleaseUrl.
+    const historyUrl = rawReleaseUrl.replace(/RELEASE\.json$/, "RELEASE-history.json");
+    try {
+      const hr = await fetch(historyUrl, { cache: "no-store" });
+      if (hr.ok) {
+        const arr = await hr.json();
+        if (Array.isArray(arr)) remoteHistory = arr;
+      }
+    } catch {}
     await autoApplyIfFlagged();
   } catch {}
 }
@@ -4947,11 +5058,22 @@ Bun.serve({
       const local = localRelease?.version ?? "0.0.0";
       const remote = remoteRelease?.version ?? local;
       const available = compareVersions(local, remote) < 0;
+      // Если есть history — собираем все пропущенные релизы между local и remote.
+      // Иначе fallback на notes только последней версии (старое поведение).
+      let releases: Release[] = [];
+      if (available && remoteHistory.length > 0) {
+        releases = remoteHistory
+          .filter(r => compareVersions(r.version, local) > 0 && compareVersions(r.version, remote) <= 0)
+          .sort((a, b) => compareVersions(b.version, a.version));  // сначала самые свежие
+      } else if (available && remoteRelease) {
+        releases = [remoteRelease];
+      }
       return Response.json({
         local, remote, available,
-        notes: available ? (remoteRelease?.notes ?? []) : [],
+        notes: available ? (remoteRelease?.notes ?? []) : [],  // backward-compat для старых клиентов
+        releases,  // новое поле: массив пропущенных релизов с их notes
         date: remoteRelease?.date,
-        canApply: !!rawReleaseUrl,  // если репо-путь известен — можно нажать кнопку
+        canApply: !!rawReleaseUrl,
       }, { headers: { "cache-control": "no-store" } });
     }
     if (url.pathname === "/api/update-apply" && req.method === "POST") {
@@ -5395,12 +5517,15 @@ return "ok"`;
       return Response.json(result);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
-      const body = await req.json().catch(() => ({})) as { sessionId?: string; cwd?: string };
+      const body = await req.json().catch(() => ({})) as { sessionId?: string; cwd?: string; title?: string };
       const sid = String(body.sessionId ?? "").trim();
       const cwd = String(body.cwd ?? "").trim();
+      const title = String(body.title ?? "").trim();
       if (!sid || !cwd) return Response.json({ error: "missing sessionId or cwd" }, { status: 400 });
       if (!/^[0-9a-f-]+$/i.test(sid)) return Response.json({ error: "bad sessionId" }, { status: 400 });
-      const r = await restoreSession(sid, cwd);
+      // Защита от инъекции в AppleScript (хотя через argv безопасно, дополнительный фильтр)
+      const cleanTitle = title.replace(/[\r\n"]/g, "").slice(0, 80);
+      const r = await restoreSession(sid, cwd, cleanTitle || undefined);
       if (!r.ok) return Response.json({ error: r.error }, { status: 500 });
       return Response.json({ ok: true });
     }
@@ -5554,7 +5679,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
         new Response(proc.stderr).text(),
       ]);
       await proc.exited;
-      const all = await readAllTerminalContents();
+      const all = await readAllTerminalContents(new Set([tty]));
       const text = all.get(tty) ?? "";
       const parsed = parseTuiModal(text);
       return Response.json({
@@ -5663,7 +5788,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const sid = mirrorMatch[1];
       const meta = sessionMeta.get(sid);
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
-      const all = await readAllTerminalContents();
+      const all = await readAllTerminalContents(new Set([meta.tty]));
       const text = all.get(meta.tty) ?? "";
       const lines = text.split("\n");
       const tail = lines.slice(-50).join("\n");
