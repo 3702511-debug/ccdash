@@ -1635,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v38";
+const CACHE = "cc-dashboard-v39";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -1931,6 +1931,22 @@ const HTML = `<!doctype html>
   .welcome-inner { width: 100%; max-width: 1200px; margin: 0 auto; }
   .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; align-items: start; }
   .welcome-grid .card { padding: 16px; }
+  /* Архив сессий — раскрывалка под welcome-grid */
+  .archive-block { margin-top: 28px; max-width: 800px; margin-left: auto; margin-right: auto; padding: 0 16px; }
+  .archive-toggle { width: 100%; background: transparent; border: 1px dashed #30363d; color: #8b949e; padding: 12px 16px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 14px; text-align: center; transition: all 0.15s; }
+  .archive-toggle:hover { border-color: #58a6ff; color: #58a6ff; }
+  body.theme-light .archive-toggle { border-color: #d0d7de; color: #57606a; }
+  body.theme-light .archive-toggle:hover { border-color: #0969da; color: #0969da; }
+  .archive-list { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; max-height: 60vh; overflow-y: auto; }
+  .archive-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; background: rgba(110,118,129,0.08); border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; }
+  body.theme-light .archive-item { background: #ffffff; border-color: #d0d7de; }
+  .archive-item-info { min-width: 0; }
+  .archive-item-title { font-size: 13px; color: #c9d1d9; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.theme-light .archive-item-title { color: #1f2328; }
+  .archive-item-cwd { font-size: 11px; color: #6e7681; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.theme-light .archive-item-cwd { color: #57606a; }
+  .archive-item-meta { font-size: 10px; color: #6e7681; margin-top: 2px; }
+  .archive-empty { color: #6e7681; font-size: 13px; padding: 16px; text-align: center; }
   .new-session-card { display: flex; align-items: center; justify-content: center; background: transparent !important; border: 1.5px solid #ffffff !important; transition: background 0.15s, transform 0.15s; }
   .new-session-card span { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: 0.04em; text-shadow: 0 0 10px rgba(255,255,255,0.15); line-height: 1.2; }
   .new-session-card:hover { background: rgba(255,255,255,0.05) !important; transform: scale(1.02); }
@@ -2357,6 +2373,10 @@ const HTML = `<!doctype html>
   <div class="welcome-inner">
     <div id="welcome-grid" class="welcome-grid"></div>
     <div id="welcome-empty" class="welcome-empty" style="display:none">Нет запущенных claude-процессов</div>
+    <div id="archive-block" class="archive-block">
+      <button id="archive-toggle" class="archive-toggle">📦 Архив сессий</button>
+      <div id="archive-list" class="archive-list" style="display:none"></div>
+    </div>
   </div>
 </div>
 <div id="panels"></div>
@@ -4153,6 +4173,70 @@ async function pollUpdateStatus() {
 pollUpdateStatus();
 setInterval(pollUpdateStatus, 1000);
 
+// === Архив сессий — lazy load по клику на «📦 Архив» ===
+const archiveToggle = document.getElementById("archive-toggle");
+const archiveListEl = document.getElementById("archive-list");
+let archiveLoaded = false;
+async function loadArchive() {
+  archiveToggle.textContent = "📦 загружаю архив…";
+  try {
+    const r = await fetch("/api/archived-sessions");
+    const list = await r.json();
+    if (!Array.isArray(list)) throw new Error("bad response");
+    if (list.length === 0) {
+      archiveListEl.innerHTML = '<div class="archive-empty">архив пуст</div>';
+    } else {
+      archiveListEl.innerHTML = list.map(s => {
+        return '<div class="archive-item">' +
+          '<div class="archive-item-info">' +
+          '<div class="archive-item-title">' + escapeHtml(s.title || "(без названия)") + '</div>' +
+          '<div class="archive-item-cwd">' + escapeHtml(s.cwdLabel || s.cwd || "") + '</div>' +
+          '<div class="archive-item-meta">' + escapeHtml(s.lastActivityRel || "") + '</div>' +
+          '</div>' +
+          '<button class="resume-btn" data-sid="' + escapeHtml(s.sid) + '" data-cwd="' + escapeHtml(s.cwd || "") + '">▶ Resume</button>' +
+          '</div>';
+      }).join("");
+      for (const btn of archiveListEl.querySelectorAll(".resume-btn")) {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          const origText = btn.textContent;
+          btn.textContent = "⏳…";
+          try {
+            const res = await fetch("/api/restore", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd }),
+            });
+            const d = await res.json().catch(() => ({}));
+            if (res.ok) {
+              btn.textContent = "✓ Открываю…";
+              setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+            } else {
+              btn.textContent = "✗ " + (d.error || "ошибка");
+              setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+            }
+          } catch (e) {
+            btn.textContent = "✗ " + (e.message || e);
+            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+          }
+        });
+      }
+    }
+    archiveListEl.style.display = "block";
+    archiveToggle.textContent = "📦 Архив (" + list.length + ") — скрыть";
+    archiveLoaded = true;
+  } catch (e) {
+    archiveToggle.textContent = "📦 Архив (ошибка загрузки)";
+    setTimeout(() => { archiveToggle.textContent = "📦 Архив сессий"; }, 3000);
+  }
+}
+archiveToggle.addEventListener("click", () => {
+  if (!archiveLoaded) { loadArchive(); return; }
+  const shown = archiveListEl.style.display !== "none";
+  archiveListEl.style.display = shown ? "none" : "block";
+  archiveToggle.textContent = shown ? "📦 Архив сессий" : "📦 Архив — скрыть";
+});
+
 // === Connection health monitor ===
 // Каждые 10 сек дёргает /api/health (без авторизации, дешёвый ping). По коду ответа определяет
 // конкретную причину и показывает баннер. Без этого, при разрыве Mac-VPS туннеля, дашборд просто молчит.
@@ -5172,6 +5256,75 @@ return "ok"`;
       console.log(`[new-session] name="${name}" rc=${rc} out="${out.trim()}" err="${err.trim()}"`);
       if (err.trim() && proc.exitCode !== 0) return Response.json({ error: err.trim() }, { status: 500 });
       return Response.json({ ok: true });
+    }
+    if (url.pathname === "/api/archived-sessions") {
+      // Все jsonl старше FRESH_MS, без живого pid → архив. Lazy-loaded по нажатию.
+      // Кэш 30с чтобы не сканировать диск при каждом тыке.
+      const ARCH_TTL = 30_000;
+      const cached = (globalThis as any).__archCache as { at: number; data: any[] } | undefined;
+      if (cached && Date.now() - cached.at < ARCH_TTL) {
+        return Response.json(cached.data);
+      }
+      const now = Date.now();
+      const livePids = await gatherPidInfos();
+      const liveSids = new Set(livePids.map(p => p.sessionId).filter(Boolean));
+      const arch: { sid: string; path: string; mtime: number }[] = [];
+      try {
+        const dirs = await readdir(PROJECTS_DIR);
+        for (const d of dirs) {
+          const projectDir = join(PROJECTS_DIR, d);
+          const files = await readdir(projectDir).catch(() => [] as string[]);
+          for (const f of files) {
+            if (!f.endsWith(".jsonl")) continue;
+            const sid = f.replace(/\.jsonl$/, "");
+            if (liveSids.has(sid)) continue;
+            const filePath = join(projectDir, f);
+            try {
+              const st = await stat(filePath);
+              if (now - st.mtimeMs < FRESH_MS) continue;  // в основном списке
+              arch.push({ sid, path: filePath, mtime: st.mtimeMs });
+            } catch {}
+          }
+        }
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 });
+      }
+      arch.sort((a, b) => b.mtime - a.mtime);
+      // Ограничиваем 300 самыми свежими — иначе UI повиснет на тысячах
+      const limited = arch.slice(0, 300);
+      // Для каждого: вытащим cwd из jsonl и customTitle
+      const result = await Promise.all(limited.map(async (j) => {
+        let cwd = "";
+        let title: string | null = null;
+        try {
+          const head = await readHead(j.path, 8 * 1024);
+          const lines = head.split("\n").filter(l => l.trim().startsWith("{"));
+          for (const line of lines) {
+            try {
+              const rec = JSON.parse(line);
+              if (!cwd && typeof rec.cwd === "string" && rec.cwd.startsWith("/")) cwd = rec.cwd;
+              if (cwd) break;
+            } catch {}
+          }
+          title = await getTitle(j.path);
+        } catch {}
+        if (!cwd) {
+          // Fallback: декодируем encoded имя папки (эвристика, не идеальна)
+          const encoded = j.path.split("/").slice(-2, -1)[0] || "";
+          cwd = encoded.startsWith("-") ? "/" + encoded.slice(1).replace(/-/g, "/") : encoded;
+        }
+        const ts = new Date(j.mtime).toISOString();
+        return {
+          sid: j.sid,
+          cwd,
+          cwdLabel: cwd.replace(homedir(), "~"),
+          title: title ?? "(без названия)",
+          lastActivity: ts,
+          lastActivityRel: relTime(ts),
+        };
+      }));
+      (globalThis as any).__archCache = { at: Date.now(), data: result };
+      return Response.json(result);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       const body = await req.json().catch(() => ({})) as { sessionId?: string; cwd?: string };
