@@ -1741,7 +1741,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v59";
+const CACHE = "cc-dashboard-v62";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2204,6 +2204,8 @@ const HTML = `<!doctype html>
   .msg .body .link-copy svg { width: 14px; height: 14px; display: block; }
   .msg .body .folder-open-btn { background: #21262d; border: 1px solid #444c56; color: #c9d1d9; border-radius: 4px; padding: 1px 5px; cursor: pointer; margin-left: 4px; vertical-align: middle; transition: background 0.15s; display: inline-flex; align-items: center; }
   .msg .body .folder-open-btn:hover { background: #1f6feb; color: white; border-color: #1f6feb; }
+  .msg .body .folder-open-btn.find { border-style: dashed; }
+  .msg .body .folder-open-btn.find:hover { border-style: solid; }
   .msg .body .folder-open-btn.opened { background: #2ea043; color: white; border-color: #2ea043; }
   .msg .body .folder-open-btn svg { width: 13px; height: 13px; display: block; }
   body.theme-light .msg .body .folder-open-btn { background: #eaeef2; border-color: #d0d7de; color: #1f2328; }
@@ -2650,9 +2652,16 @@ function renderMd(text) {
   text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => {
     const code = inlineCodes[+i];
     const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/cc-dashboard\\/)[^\\s'"]+$/.test(code);
+    // Bare-имя файла с расширением (без пути) — будем искать через Spotlight при клике
+    const isBareFile = !isPath && /^[A-Za-z0-9_.\\-]+\\.(zip|tar|gz|bz2|7z|rar|bat|cmd|sh|py|ts|tsx|js|jsx|json|yaml|yml|toml|txt|md|csv|xlsx|xls|docx|doc|pdf|png|jpg|jpeg|gif|webp|webm|mp4|mp3|wav|app|dmg|pkg|exe|html|css)$/i.test(code);
     const codeHtml = '<code class="inline-code">' + escapeHtml(code) + '</code>';
-    if (!isPath) return codeHtml;
-    return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+    if (isPath) {
+      return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+    }
+    if (isBareFile) {
+      return codeHtml + '<button class="folder-open-btn find" data-find="' + encodeURIComponent(code) + '" title="Найти файл на диске и открыть в Finder">' + folderBtnIcon + '</button>';
+    }
+    return codeHtml;
   });
   // 8. Restore markdown link placeholders
   text = text.replace(/\\x00ML(\\d+)\\x00/g, (_, i) => {
@@ -3789,20 +3798,41 @@ function openPanel(sid) {
     if (folderBtn) {
       e.preventDefault();
       e.stopPropagation();
-      const p = decodeURIComponent(folderBtn.dataset.path);
       const origHTML = folderBtn.innerHTML;
+      const origTitle = folderBtn.title;
       folderBtn.classList.add("opening");
       try {
-        const r = await revealPath(p);
+        let pathToOpen = folderBtn.dataset.path ? decodeURIComponent(folderBtn.dataset.path) : "";
+        if (!pathToOpen && folderBtn.dataset.find) {
+          // Bare-имя файла → ищем через Spotlight
+          const name = decodeURIComponent(folderBtn.dataset.find);
+          folderBtn.title = "Ищу...";
+          const fr = await fetch("/api/find-by-name", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          const fd = await fr.json().catch(() => ({}));
+          if (fd.matches && fd.matches.length > 0) {
+            pathToOpen = fd.matches[0];
+          } else {
+            folderBtn.innerHTML = '?';
+            folderBtn.title = "Файл не найден на диске";
+            setTimeout(() => { folderBtn.innerHTML = origHTML; folderBtn.title = origTitle; }, 2500);
+            folderBtn.classList.remove("opening");
+            return;
+          }
+        }
+        const r = await revealPath(pathToOpen);
         if (r?.error) {
           folderBtn.innerHTML = '!';
           folderBtn.title = r.error;
-          setTimeout(() => { folderBtn.innerHTML = origHTML; folderBtn.title = "Открыть в Finder"; }, 2000);
+          setTimeout(() => { folderBtn.innerHTML = origHTML; folderBtn.title = origTitle; }, 2000);
         } else {
           folderBtn.classList.add("opened");
           setTimeout(() => folderBtn.classList.remove("opened"), 1300);
         }
-      } catch (err) { console.error("open-path failed:", err); }
+      } catch (err) { console.error("folder-btn failed:", err); }
       folderBtn.classList.remove("opening");
       return;
     }
@@ -5231,6 +5261,23 @@ Bun.serve({
       });
     }
 
+    if (url.pathname === "/api/find-by-name" && req.method === "POST") {
+      // Поиск файла по имени через Spotlight (mdfind). Используется для inline-code-блоков
+      // где упомянуто только имя файла без пути. Возвращает первое совпадение под $HOME.
+      const body = await req.json().catch(() => ({})) as { name?: string };
+      const rawName = String(body.name ?? "").trim();
+      // Безопасность: только разрешённые символы в имени (без пробелов, кавычек, спец-чаров)
+      const name = rawName.replace(/[^a-zA-Z0-9_.\-]/g, "").slice(0, 100);
+      if (!name || name.length < 3) return Response.json({ error: "bad name" }, { status: 400 });
+      const proc = Bun.spawn(["mdfind", "-name", name, "-onlyin", homedir()], { stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(proc.stdout).text();
+      await proc.exited;
+      const paths = out.trim().split("\n").filter(p => p && p.startsWith("/"));
+      // Фильтр: точное совпадение имени файла (mdfind может вернуть substring match'и)
+      const exactMatches = paths.filter(p => p.split("/").pop() === name);
+      const matches = exactMatches.length > 0 ? exactMatches : paths;
+      return Response.json({ matches: matches.slice(0, 5) });
+    }
     if (url.pathname === "/api/open-path" && req.method === "POST") {
       const body = await req.json().catch(() => ({})) as { path?: string };
       let p = String(body.path ?? "").trim();
@@ -5616,11 +5663,24 @@ return "ok"`;
 
         const outDir = join(UPLOAD_DIR, `whisper-${tag}`);
         await mkdir(outDir, { recursive: true });
-        const modelPath = join(homedir(), ".cc-dashboard", "whisper-models", "ggml-base.bin");
+        // Предпочитаем large-v3-turbo (1.5GB, заметно точнее на русском со специфической
+        // лексикой), fallback на base. Initial prompt — словарь пользовательских терминов,
+        // помогает модели не угадывать профессиональный жаргон.
+        const modelsDir = join(homedir(), ".cc-dashboard", "whisper-models");
+        const preferredModels = ["ggml-large-v3-turbo.bin", "ggml-medium.bin", "ggml-small.bin", "ggml-base.bin"];
+        let modelPath = join(modelsDir, "ggml-base.bin");
+        for (const m of preferredModels) {
+          const p = join(modelsDir, m);
+          if (existsSync(p)) { modelPath = p; break; }
+        }
+        const initialPrompt = "Claude Code, дашборд, runtime, jsonl, sessionId, watchdog, GitHub, push, commit, deploy, репозиторий. Кристина, Николь, kid-dash, kid dash, дашборд. Касса парковки, оффлайн касса, 2ATM, два АТМ, шиномонтаж, табло автомоек, мойка, бридж, OpentAM, RUNBOOK, RELEASE.json. Selective scrape, headless, snapshot, Spotlight, mdfind, idleTimeout, hysteresis, claude metadata, Bun, AppleScript.";
         const outPrefix = join(outDir, "out");
         const t0 = Date.now();
+        // threads = количество CPU ядер (вместо дефолтных 4 — у M-чипов 8-14 ядер)
+        const cpuCount = navigator?.hardwareConcurrency ?? 8;
         const proc = Bun.spawn(
-          ["whisper-cli", "-m", modelPath, "-l", "ru", "-otxt", "-nt", "-of", outPrefix, wavPath],
+          ["whisper-cli", "-m", modelPath, "-l", "ru", "-otxt", "-nt", "-np",
+           "-t", String(cpuCount), "-of", outPrefix, "--prompt", initialPrompt, wavPath],
           { stdout: "pipe", stderr: "pipe" }
         );
         const [stdout, stderr] = await Promise.all([
