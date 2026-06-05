@@ -1,5 +1,5 @@
 import { readdir, stat, mkdir, unlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, unlinkSync, statSync, cpSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHmac } from "node:crypto";
@@ -1635,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v37";
+const CACHE = "cc-dashboard-v38";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -1730,6 +1730,18 @@ const HTML = `<!doctype html>
   .menu-btn:hover { background: #30363d; }
   .menu-btn svg { width: 18px; height: 18px; display: block; }
   .topbar-spacer { display: block; width: 40px; height: 36px; flex-shrink: 0; }
+  /* Update overlay — полноэкранный фон в цвет темы, минимализм: заголовок + полоса + проценты */
+  #upd-overlay { position: fixed; inset: 0; background: #0d1117; z-index: 9999; display: flex; align-items: center; justify-content: center; }
+  body.theme-light #upd-overlay { background: #f6f8fa; }
+  .upd-content { text-align: center; }
+  .upd-title { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: clamp(28px, 5vw, 40px); font-weight: 700; color: #f0f6fc; letter-spacing: 0.04em; margin: 0 0 28px; text-shadow: 0 0 10px rgba(255,255,255,0.08); }
+  body.theme-light .upd-title { color: #0d1117; text-shadow: none; }
+  .upd-bar-bg { width: clamp(220px, 60vw, 320px); height: 4px; background: #30363d; border-radius: 2px; overflow: hidden; margin: 0 auto; }
+  body.theme-light .upd-bar-bg { background: #d0d7de; }
+  .upd-bar { height: 100%; width: 0%; background: #58a6ff; transition: width 0.5s ease; }
+  body.theme-light .upd-bar { background: #0969da; }
+  .upd-percent { font-size: 13px; margin-top: 14px; color: #8b949e; font-variant-numeric: tabular-nums; letter-spacing: 0.05em; }
+  body.theme-light .upd-percent { color: #57606a; }
   .conn-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 250; display: flex; align-items: center; justify-content: center; padding: 24px; }
   .conn-modal-inner { background: #0d1117; border: 1.5px solid #f85149; border-radius: 16px; padding: 36px 32px 28px; max-width: 460px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; box-shadow: 0 16px 48px rgba(248,81,73,0.18), 0 0 60px rgba(248,81,73,0.12); }
   .conn-modal.warn .conn-modal-inner { border-color: #d4a500; box-shadow: 0 16px 48px rgba(212,165,0,0.18), 0 0 60px rgba(212,165,0,0.12); }
@@ -2206,6 +2218,13 @@ const HTML = `<!doctype html>
 </style>
 </head>
 <body>
+<div id="upd-overlay" style="display:none">
+  <div class="upd-content">
+    <div class="upd-title">Обновление</div>
+    <div class="upd-bar-bg"><div class="upd-bar" id="upd-bar"></div></div>
+    <div class="upd-percent" id="upd-percent">0%</div>
+  </div>
+</div>
 <div id="conn-modal" class="conn-modal" style="display:none">
   <div class="conn-modal-inner">
     <div class="conn-icon" id="conn-icon"></div>
@@ -4104,6 +4123,36 @@ function connect() {
 }
 connect();
 
+// === Update overlay polling ===
+// Каждую секунду спрашиваем /api/update-status. Когда phase !== "idle" — показываем overlay.
+// Когда phase === "done" и percent === 100 — авто-reload страницы через ~1.5 сек.
+const updOverlay = document.getElementById("upd-overlay");
+const updBar = document.getElementById("upd-bar");
+const updPercent = document.getElementById("upd-percent");
+let updReloadScheduled = false;
+async function pollUpdateStatus() {
+  try {
+    const r = await fetch("/api/update-status", { cache: "no-store" });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.phase === "idle" || s.phase == null) {
+      updOverlay.style.display = "none";
+      updReloadScheduled = false;
+      return;
+    }
+    updOverlay.style.display = "flex";
+    const p = Math.max(0, Math.min(100, Number(s.percent) || 0));
+    updBar.style.width = p + "%";
+    updPercent.textContent = p + "%";
+    if (s.phase === "done" && p >= 100 && !updReloadScheduled) {
+      updReloadScheduled = true;
+      setTimeout(() => location.reload(), 1500);
+    }
+  } catch {}
+}
+pollUpdateStatus();
+setInterval(pollUpdateStatus, 1000);
+
 // === Connection health monitor ===
 // Каждые 10 сек дёргает /api/health (без авторизации, дешёвый ping). По коду ответа определяет
 // конкретную причину и показывает баннер. Без этого, при разрыве Mac-VPS туннеля, дашборд просто молчит.
@@ -4415,16 +4464,91 @@ if (rawReleaseUrl) console.log(`[update] poll URL: ${rawReleaseUrl}`);
 // Авто-apply: если в ~/.cc-dashboard/auto-update.flag существует — обновляемся без UI-confirmation.
 // Это для разработчика (автор репо). Обычные пользователи (без флага) видят кнопку с changelog.
 const AUTO_UPDATE_FLAG = join(homedir(), ".cc-dashboard", "auto-update.flag");
+const UPDATE_STATUS_FILE = join(homedir(), ".cc-dashboard", "update-status.json");
+
+// Глобальное состояние процесса обновления. null = ничего не идёт.
+// Phase прогрессирует: start (5) → git (15) → install (40) → copy (75) → restart (95) → finalize (99) → done (100).
+let updateState: { phase: string; percent: number; startedAt: string } | null = null;
+
+// При старте процесса: если есть update-status.json — мы только что перезапустились после апдейта.
+// Доводим прогресс до 100% и убираем оверлей через 4 сек (за это время фронт делает location.reload()).
+try {
+  if (existsSync(UPDATE_STATUS_FILE)) {
+    const saved = await Bun.file(UPDATE_STATUS_FILE).json();
+    updateState = { phase: "finalize", percent: 99, startedAt: saved.startedAt || new Date().toISOString() };
+    setTimeout(() => {
+      updateState = { phase: "done", percent: 100, startedAt: updateState!.startedAt };
+      try { unlinkSync(UPDATE_STATUS_FILE); } catch {}
+      setTimeout(() => { updateState = null; }, 4000);
+    }, 1500);
+  }
+} catch (e) { console.error("[update] cannot finalize:", e); }
+
+// Универсальный apply: используется и auto-apply, и UI кнопкой «Обновить сейчас».
+// Без bash-child-process'ов, без launchctl unload — просто in-process: pull, copy, exit.
+// LaunchAgent KeepAlive=true сам перезапустит — новый процесс прочтёт UPDATE_STATUS_FILE и доведёт прогресс.
+async function applyUpdate(): Promise<{ ok: boolean; error?: string }> {
+  if (updateState && updateState.phase !== "done") return { ok: false, error: "уже идёт обновление" };
+  const startedAt = new Date().toISOString();
+  updateState = { phase: "start", percent: 5, startedAt };
+  console.log(`[update] starting at ${startedAt}`);
+  try {
+    const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
+    // 1. git pull --ff-only (5 → 30%)
+    updateState = { phase: "git", percent: 15, startedAt };
+    const oldLockMtime = existsSync(join(repoPath, "bun.lock")) ? statSync(join(repoPath, "bun.lock")).mtimeMs : 0;
+    const gp = Bun.spawnSync(["git", "pull", "--ff-only"], { cwd: repoPath });
+    if (gp.exitCode !== 0) {
+      const err = gp.stderr?.toString() || "git pull failed";
+      console.error(`[update] git pull failed: ${err}`);
+      updateState = null;
+      return { ok: false, error: err.trim() };
+    }
+    updateState = { phase: "git-done", percent: 30, startedAt };
+    // 2. bun install — только если bun.lock изменился (30 → 70%)
+    const newLockMtime = existsSync(join(repoPath, "bun.lock")) ? statSync(join(repoPath, "bun.lock")).mtimeMs : 0;
+    if (newLockMtime !== oldLockMtime) {
+      console.log("[update] bun.lock changed → bun install");
+      updateState = { phase: "install", percent: 40, startedAt };
+      const bi = Bun.spawnSync(["bun", "install"], { cwd: repoPath });
+      if (bi.exitCode !== 0) {
+        console.error("[update] bun install failed");
+        updateState = null;
+        return { ok: false, error: "bun install failed" };
+      }
+    }
+    updateState = { phase: "install-done", percent: 70, startedAt };
+    // 3. Copy свежие файлы в RUNTIME (~/.cc-dashboard) (70 → 90%)
+    const RUNTIME = join(homedir(), ".cc-dashboard");
+    for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "setup-local.ts", "RELEASE.json"]) {
+      try { cpSync(join(repoPath, f), join(RUNTIME, f)); } catch (e) { console.warn(`[update] skip ${f}:`, e); }
+    }
+    try { cpSync(join(repoPath, "node_modules"), join(RUNTIME, "node_modules"), { recursive: true }); } catch {}
+    try { cpSync(join(repoPath, "icons"), join(RUNTIME, "icons"), { recursive: true }); } catch {}
+    updateState = { phase: "copied", percent: 90, startedAt };
+    // 4. Persist state для нового процесса
+    await Bun.write(UPDATE_STATUS_FILE, JSON.stringify({ phase: "restart", percent: 95, startedAt }));
+    updateState = { phase: "restart", percent: 95, startedAt };
+    // 5. process.exit — KeepAlive=true рестартит
+    console.log("[update] exit for restart by launchd");
+    setTimeout(() => process.exit(0), 600);
+    return { ok: true };
+  } catch (e: any) {
+    updateState = null;
+    console.error("[update] failed:", e);
+    return { ok: false, error: String(e?.message ?? e) };
+  }
+}
+
 async function autoApplyIfFlagged() {
   try {
     if (!existsSync(AUTO_UPDATE_FLAG)) return;
     const local = localRelease?.version ?? "0.0.0";
     const remote = remoteRelease?.version ?? local;
     if (compareVersions(local, remote) >= 0) return;
+    if (updateState) return;  // уже идёт
     console.log(`[auto-update] flag present, v${local} → v${remote}, applying…`);
-    const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
-    const cmd = `cd ${JSON.stringify(repoPath)} && git pull --ff-only && bun run setup-local.ts > /tmp/cc-dash-auto-update.log 2>&1`;
-    Bun.spawn(["bash", "-c", `(${cmd}) &`], { stdout: "ignore", stderr: "ignore" });
+    await applyUpdate();
   } catch (e) {
     console.error("[auto-update] failed:", e);
   }
@@ -4603,6 +4727,10 @@ f.addEventListener("submit", async (e) => {
 
 Bun.serve({
   port: PORT,
+  // idleTimeout 60s — без этого тяжёлые операции (whisper transcribe 7-8с, snapshot,
+  // upload) затыкают event loop, и Bun рвёт HTTP-соединения через дефолтные 10с.
+  // С 60с все обычные запросы помещаются.
+  idleTimeout: 60,
   async fetch(req) {
     const url = new URL(req.url);
 
@@ -4691,15 +4819,21 @@ Bun.serve({
       }, { headers: { "cache-control": "no-store" } });
     }
     if (url.pathname === "/api/update-apply" && req.method === "POST") {
-      try {
-        const repoPath = (await Bun.file(REPO_PATH_FILE).text()).trim();
-        // Detached: сервер сам перезагрузится через launchctl, ответ клиенту вернётся ДО рестарта.
-        const cmd = `cd ${JSON.stringify(repoPath)} && git pull --ff-only && bun run setup-local.ts > /tmp/cc-dash-update.log 2>&1`;
-        Bun.spawn(["bash", "-c", `(${cmd}) &`], { stdout: "ignore", stderr: "ignore" });
-        return Response.json({ ok: true, message: "Обновление запущено. Дашборд перезагрузится через несколько секунд." });
-      } catch (e: any) {
-        return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
-      }
+      // In-process apply: НЕ запускаем setup-local.ts через bash-фон (parent gets killed by launchctl unload,
+      // children умирают, до launchctl load не доходит → сервер мёртв до watchdog). Вместо этого:
+      // pull → cpSync → process.exit(0). LaunchAgent KeepAlive=true сам перезапустит.
+      // Запускаем в фоне чтоб быстро вернуть HTTP-ответ клиенту (он начнёт показывать overlay).
+      (async () => {
+        const r = await applyUpdate();
+        if (!r.ok) console.error(`[update-apply] failed: ${r.error}`);
+      })();
+      return Response.json({ ok: true, message: "Обновление запущено. Дашборд перезагрузится через несколько секунд." });
+    }
+    if (url.pathname === "/api/update-status") {
+      // Polling от фронта пока показывается overlay. Возвращаем текущий phase/percent.
+      return Response.json(updateState || { phase: "idle", percent: 0 }, {
+        headers: { "cache-control": "no-store" },
+      });
     }
     if (url.pathname === "/api/push/vapid-public-key") {
       return Response.json({ key: vapidKeys?.publicKey ?? null });
