@@ -458,6 +458,9 @@ interface PidInfo {
   used: boolean;
   sessionId: string;
   name: string;
+  claudeStatus?: string;  // "idle" | "busy" — реальный статус от самого claude (из ~/.claude/sessions/<pid>.json)
+  claudeStatusAt?: number;  // unix-ms updatedAt этого статуса
+  lastBusyAt?: number;  // для hysteresis: пока < 2с от последнего busy — показываем "думает"
 }
 
 async function findAllFreshJsonls(): Promise<{ path: string; mtime: number }[]> {
@@ -487,12 +490,15 @@ interface CachedPidInfo {
   isDesktop: boolean;
   sessionId: string;
   name: string;
+  claudeStatus?: string;
+  claudeStatusAt?: number;
+  lastBusyAt?: number;  // unix-ms когда последний раз видели busy — для hysteresis
   lastProbedAt: number;
 }
 const pidInfoCache = new Map<number, CachedPidInfo>();
 const PID_CACHE_TTL_MS = 10_000;
 
-async function readPidMetadata(pid: number): Promise<{ sessionId: string; name: string; cwd: string } | null> {
+async function readPidMetadata(pid: number): Promise<{ sessionId: string; name: string; cwd: string; status: string; updatedAt: number } | null> {
   try {
     const fp = join(homedir(), ".claude", "sessions", `${pid}.json`);
     const data = await Bun.file(fp).json();
@@ -500,6 +506,10 @@ async function readPidMetadata(pid: number): Promise<{ sessionId: string; name: 
       sessionId: typeof data?.sessionId === "string" ? data.sessionId : "",
       name: typeof data?.name === "string" ? data.name : "",
       cwd: typeof data?.cwd === "string" ? data.cwd : "",
+      // Claude САМ пишет сюда свой реальный статус: "idle" или "busy". Это надёжнее
+      // эвристик по jsonl и AppleScript spinner-парсинга. Используем как источник правды.
+      status: typeof data?.status === "string" ? data.status : "",
+      updatedAt: typeof data?.updatedAt === "number" ? data.updatedAt : 0,
     };
   } catch { return null; }
 }
@@ -514,24 +524,35 @@ async function gatherPidInfos(): Promise<PidInfo[]> {
   const infos: PidInfo[] = [];
   await Promise.all(pids.map(async pid => {
     const cached = pidInfoCache.get(pid);
+    // claudeStatus читаем ВСЕГДА (даже из cache) — это real-time live-статус от claude.
+    // Остальные поля (cwd, tty, sessionId) можно из cache, они меняются редко.
+    const liveMeta = await readPidMetadata(pid);
+    const claudeStatus = liveMeta?.status;
+    const claudeStatusAt = liveMeta?.updatedAt;
+    // Hysteresis: запоминаем когда последний раз видели busy. Это позволит status логике
+    // показывать "думает" ещё ~2с после первого idle — чтоб не было дребезга на короткой паузе.
+    let lastBusyAt = cached?.lastBusyAt;
+    if (claudeStatus === "busy") lastBusyAt = now;
     if (cached && now - cached.lastProbedAt < PID_CACHE_TTL_MS) {
-      infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name });
+      infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
+      cached.claudeStatus = claudeStatus;
+      cached.claudeStatusAt = claudeStatusAt;
+      cached.lastBusyAt = lastBusyAt;
       return;
     }
     const info = await pidInfo(pid);
-    const meta = await readPidMetadata(pid);
-    const cwd = info.cwd || meta?.cwd || "";
+    const cwd = info.cwd || liveMeta?.cwd || "";
     if (!cwd) {
       if (cached) {
-        infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name });
+        infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
       }
       return;
     }
     const isDesktop = /disclaimer/i.test(info.ppidComm) || info.tty === null;
-    const sessionId = meta?.sessionId ?? "";
-    const name = meta?.name ?? "";
-    pidInfoCache.set(pid, { cwd, tty: info.tty, isDesktop, sessionId, name, lastProbedAt: now });
-    infos.push({ pid, cwd, tty: info.tty, isDesktop, used: false, sessionId, name });
+    const sessionId = liveMeta?.sessionId ?? "";
+    const name = liveMeta?.name ?? "";
+    pidInfoCache.set(pid, { cwd, tty: info.tty, isDesktop, sessionId, name, claudeStatus, claudeStatusAt, lastBusyAt, lastProbedAt: now });
+    infos.push({ pid, cwd, tty: info.tty, isDesktop, used: false, sessionId, name, claudeStatus, claudeStatusAt, lastBusyAt });
   }));
   return infos;
 }
@@ -761,7 +782,23 @@ async function snapshot(): Promise<Session[]> {
         tty: bound?.tty ?? null,
         isDesktop: bound ? bound.isDesktop : true,
         isSelf: selfId !== "" && sessionId === selfId,
-        status: st.status,
+        // Status: реальный live-статус от самого claude (если есть) → надёжнее эвристик.
+        // claude пишет "busy" когда обрабатывает / отвечает, "idle" когда ждёт пользователя.
+        // Hysteresis: после busy ещё HYST_MS показываем "думает" — claude между шагами
+        // на доли секунды переключается в idle (создаёт дребезг).
+        status: (() => {
+          const HYST_MS = 2500;
+          const cs = bound?.claudeStatus;
+          const now = Date.now();
+          const lastBusy = bound?.lastBusyAt ?? 0;
+          if (cs === "busy" || (lastBusy && now - lastBusy < HYST_MS)) return "thinking";
+          if (cs === "idle") {
+            const csAt = bound?.claudeStatusAt ?? 0;
+            const ageMin = (now - csAt) / 60000;
+            return ageMin < 10 ? "waiting" : "idle";
+          }
+          return st.status;  // fallback на jsonl-эвристику если metadata нет
+        })(),
         lastActivity: st.lastActivity,
         lastActivityRel: relTime(st.lastActivity),
         busySince: st.busySince,
@@ -852,15 +889,9 @@ async function snapshot(): Promise<Session[]> {
           s.openQuestion = q;
         }
       }
-      // Spinner pattern: «(NNs · ↓ X tokens)» — точное определение что claude крутится сейчас.
-      // Если jsonl-status сказал thinking/tool, но TUI показывает чистый prompt — переписываем.
-      if (s.status === "thinking" || s.status === "tool") {
-        const hasSpinner = /\(\d+s\s+·\s+(?:↓|↑|⚒|⏵)/.test(text);
-        if (!hasSpinner) {
-          s.status = "waiting";
-          s.busySince = undefined;
-        }
-      }
+      // Spinner-override УБРАН: claude metadata теперь source of truth для статуса,
+      // и TUI spinner detection ломает hysteresis (видит чистый prompt между шагами claude
+      // и сбрасывает status на waiting). Сохраняем здесь только модал-парсинг.
     }
   } catch (e) {
     console.error("[tui-scrape]", e);
@@ -1710,7 +1741,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v51";
+const CACHE = "cc-dashboard-v59";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2084,6 +2115,7 @@ const HTML = `<!doctype html>
   .warn.kid-locked .kid-override-btn:hover { background: rgba(248,81,73,0.25); }
   .warn.kid-locked .kid-override-btn:disabled { opacity: 0.6; cursor: default; }
   .feed { flex: 1; overflow-y: auto; padding: 14px 16px; }
+
   .feed > * { max-width: 900px; margin-left: auto; margin-right: auto; }
   .msg { margin-bottom: 12px; }
   .msg .who { font-size: 11px; color: #6e7681; margin-bottom: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -2295,6 +2327,7 @@ const HTML = `<!doctype html>
   body.theme-light .msg.tool .who { color: #424a53; }
   body.theme-light .msg .body { color: #1f2328; }
   body.theme-light .msg .body b { color: #0d1117; }
+  body.theme-light .msg .body h1, body.theme-light .msg .body h2, body.theme-light .msg .body h3 { color: #0d1117; }
   body.theme-light .msg.tool .body { color: #24292f; }
   body.theme-light .msg.tool .body code.inline-code { color: #4c1d95; background: rgba(175,184,193,0.25); }
   body.theme-light .msg .body code.inline-code { background: rgba(175,184,193,0.2); color: #0550ae; }
@@ -3283,7 +3316,22 @@ async function refreshFeedPanel(sid) {
   const p = panels.get(sid);
   if (!p) return;
   try {
-    const res = await fetch("/api/session/" + sid + "/messages", { cache: "no-store" });
+    // Параллельно: messages (медленный) и status (лёгкий, обновляет панельный header
+    // независимо от SSE-стрима, чтоб статус не тормозил при открытых нескольких чатах).
+    const [res, sres] = await Promise.all([
+      fetch("/api/session/" + sid + "/messages", { cache: "no-store" }),
+      fetch("/api/session/" + sid + "/status", { cache: "no-store" }).catch(() => null),
+    ]);
+    if (sres && sres.ok) {
+      try {
+        const sd = await sres.json();
+        const cached = findSession(sid);
+        if (cached && sd.status && cached.status !== sd.status) {
+          cached.status = sd.status;
+          updatePanelHeader(sid);
+        }
+      } catch {}
+    }
     if (!res.ok) return;
     const msgs = await res.json();
     const feed = p.el.querySelector(".feed");
@@ -4039,7 +4087,14 @@ function openPanel(sid) {
     fileInput.value = "";
   });
 
-  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("drag-over"); });
+  // dragover ставит .drag-over ТОЛЬКО для drag'а файлов из ОС. Иначе при перетаскивании
+  // самих панелей (или текста) выскакивает голубая пунктирная обводка — это раздражает.
+  el.addEventListener("dragover", (e) => {
+    const isFile = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+    if (!isFile) return;
+    e.preventDefault();
+    el.classList.add("drag-over");
+  });
   el.addEventListener("dragleave", (e) => {
     if (e.target === el) el.classList.remove("drag-over");
   });
@@ -5692,6 +5747,39 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
         allTtys: [...all.keys()],
         contentTail: text.slice(-3000),
         parsed,
+      });
+    }
+
+    // Лёгкий status-endpoint: только статус сессии, без чтения jsonl.
+    // Фронт вызывает его в feed-полле (каждые 1.5с), чтобы статус панели обновлялся
+    // независимо от SSE-стрима (который под нагрузкой задерживается).
+    const statusMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/status$/);
+    if (statusMatch) {
+      const sid = statusMatch[1];
+      const meta = sessionMeta.get(sid);
+      if (!meta) return Response.json({ error: "session not found" }, { status: 404 });
+      let claudeStatus: string | undefined;
+      let claudeStatusAt: number | undefined;
+      let lastBusyAt: number | undefined;
+      if (meta.pid > 0) {
+        const m = await readPidMetadata(meta.pid);
+        if (m) { claudeStatus = m.status; claudeStatusAt = m.updatedAt; }
+        // Hysteresis: используем lastBusyAt из cache (pidInfoCache)
+        const cached = pidInfoCache.get(meta.pid);
+        if (cached?.lastBusyAt) lastBusyAt = cached.lastBusyAt;
+        // Если в этот момент busy — обновляем cache lastBusyAt тоже
+        if (claudeStatus === "busy" && cached) cached.lastBusyAt = Date.now();
+      }
+      const HYST_MS = 2500;
+      const now = Date.now();
+      let status = "unknown";
+      if (claudeStatus === "busy" || (lastBusyAt && now - lastBusyAt < HYST_MS)) status = "thinking";
+      else if (claudeStatus === "idle") {
+        const ageMin = (now - (claudeStatusAt ?? 0)) / 60000;
+        status = ageMin < 10 ? "waiting" : "idle";
+      }
+      return Response.json({ status, claudeStatus, claudeStatusAt }, {
+        headers: { "cache-control": "no-store" },
       });
     }
 
