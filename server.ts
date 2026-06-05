@@ -1635,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v32";
+const CACHE = "cc-dashboard-v37";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2027,6 +2027,9 @@ const HTML = `<!doctype html>
   .card.has-question .q-badge { display: inline-block; margin-left: 6px; color: #d29922; font-weight: 700; animation: q-pulse 1.6s ease-in-out infinite; font-size: 14px; }
   @keyframes q-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   .msg .body pre.code-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; overflow-x: auto; font: 12px/1.45 ui-monospace, "SF Mono", monospace; color: #c9d1d9; margin: 6px 0; white-space: pre; }
+  .msg .body .code-wrap.action { position: relative; }
+  .msg .body .code-wrap.action pre.code-block { background: rgba(255,193,7,0.08); border: 2px solid #f0c674; color: #f0c674; box-shadow: 0 0 0 4px rgba(240,198,116,0.08); }
+  .msg .body .action-label { font-size: 12px; font-weight: 600; color: #f0c674; padding: 4px 2px; letter-spacing: 0.03em; text-transform: uppercase; }
   .msg .body code.inline-code { background: rgba(110,118,129,0.15); border-radius: 3px; padding: 1px 5px; font: 12px ui-monospace, monospace; color: #79c0ff; cursor: pointer; transition: background 0.15s; }
   .msg .body code.inline-code:hover { background: rgba(110,118,129,0.35); }
   .msg .body code.inline-code.copied { background: rgba(63,185,80,0.25); color: #3fb950; }
@@ -2163,15 +2166,19 @@ const HTML = `<!doctype html>
   body.theme-light .panel-header .cwd-line { color: #57606a; }
   body.theme-light .panel-header button { background: #eaeef2; color: #57606a; }
   body.theme-light .panel-header button:hover { background: #d0d7de; color: #1f2328; }
+  body.theme-light .panel-header .interrupt-btn { background: #d73a49; color: white; }
+  body.theme-light .panel-header .interrupt-btn:hover { background: #cb2431; color: white; }
   body.theme-light .msg .who { color: #57606a; }
   body.theme-light .msg.user .who { color: #0550ae; }
-  body.theme-light .msg.tool .who { color: #57606a; }
+  body.theme-light .msg.tool .who { color: #424a53; }
   body.theme-light .msg .body { color: #1f2328; }
   body.theme-light .msg .body b { color: #0d1117; }
-  body.theme-light .msg.tool .body { color: #57606a; }
-  body.theme-light .msg.tool .body code.inline-code { color: #6639ba; }
+  body.theme-light .msg.tool .body { color: #24292f; }
+  body.theme-light .msg.tool .body code.inline-code { color: #4c1d95; background: rgba(175,184,193,0.25); }
   body.theme-light .msg .body code.inline-code { background: rgba(175,184,193,0.2); color: #0550ae; }
   body.theme-light .msg .body pre.code-block { background: #f6f8fa; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .msg .body .code-wrap.action pre.code-block { background: #fff8dc; border-color: #d29922; color: #4d2d00; box-shadow: 0 0 0 4px rgba(210,153,34,0.15); }
+  body.theme-light .msg .body .action-label { color: #9a6700; }
   body.theme-light .msg .body a { color: #0969da; }
   body.theme-light .composer-wrap { background: #ffffff; }
   body.theme-light .composer textarea { background: #f6f8fa; border-color: #d0d7de; color: #1f2328; }
@@ -2496,13 +2503,19 @@ function renderMd(text) {
     const items = m.trim().split(/\\n/).map(l => l.replace(/^\\d+\\. /, '')).map(s => '<li>' + s + '</li>').join('');
     return '<ol>' + items + '</ol>';
   });
-  // 6. Restore code blocks (with copy button)
+  // 6. Restore code blocks (with copy button). Если блок выглядит как запуск shell-команды
+  // (первая строка начинается с "! " — синтаксис Claude Code для exec), визуально
+  // выделяем — чтобы пользователь не пропускал «запустишь это сам через bash» предложения.
   text = text.replace(/\\x00CB(\\d+)\\x00/g, (_, i) => {
     const code = codeBlocks[+i];
     const escaped = escapeHtml(code);
     const enc = encodeURIComponent(code);
+    const isAction = /^!\\s/.test(code);
+    const wrapClass = isAction ? "code-wrap action" : "code-wrap";
+    const blockClass = isAction ? "code-block action" : "code-block";
     const copyIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-    return '<div class="code-wrap"><button class="copy-btn" data-copy="' + enc + '" title="Скопировать">' + copyIcon + '</button><pre class="code-block"><code>' + escaped + '</code></pre></div>';
+    const actionLabel = isAction ? '<div class="action-label">⚡ запусти через ! у себя</div>' : '';
+    return '<div class="' + wrapClass + '">' + actionLabel + '<button class="copy-btn" data-copy="' + enc + '" title="Скопировать">' + copyIcon + '</button><pre class="' + blockClass + '"><code>' + escaped + '</code></pre></div>';
   });
   return text;
 }
@@ -4502,13 +4515,29 @@ const LOGIN_HTML = `<!doctype html>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=UnifrakturCook:wght@700&display=swap" rel="stylesheet">
 <title> </title>
+<script>
+  // Применяем сохранённую тему ДО рендера, чтобы не было «вспышки» тёмной при светлой
+  (function() {
+    try {
+      var t = localStorage.getItem("theme") || "dark";
+      document.documentElement.classList.add("theme-" + t);
+      if (t === "light") {
+        document.querySelector('meta[name="theme-color"]').setAttribute("content", "#f6f8fa");
+      }
+    } catch (e) {}
+  })();
+</script>
 <style>
-  :root { color-scheme: dark; }
+  html.theme-dark { color-scheme: dark; }
+  html.theme-light { color-scheme: light; }
   * { box-sizing: border-box; }
   body { font: 14px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  html.theme-light body { background: #f6f8fa; color: #1f2328; }
   .login-box { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 22px; }
   h1 { font-family: 'UnifrakturCook', serif; font-size: clamp(34px, 8vw, 52px); font-weight: 700; margin: 0 0 8px; text-align: center; color: #f0f6fc; letter-spacing: 0.04em; text-shadow: 0 0 14px rgba(255,255,255,0.1), 0 2px 6px rgba(0,0,0,0.5); position: relative; }
+  html.theme-light h1 { color: #0d1117; text-shadow: none; }
   h1 .blood { position: absolute; left: 0; right: 0; top: 0; color: #a30000; pointer-events: none; text-shadow: 0 0 10px rgba(180,0,0,0.55), 0 2px 6px rgba(60,0,0,0.7); clip-path: inset(0 0 100% 0); animation: bloodDrip 90s linear infinite; animation-delay: -80s; will-change: clip-path, opacity; }
+  html.theme-light h1 .blood { display: none; }
   @keyframes bloodDrip {
     0%, 94% { clip-path: inset(0 0 100% 0); opacity: 0.92; }
     97% { clip-path: inset(0 0 50% 0); opacity: 0.92; }
@@ -4518,10 +4547,14 @@ const LOGIN_HTML = `<!doctype html>
   }
   form { display: flex; flex-direction: column; gap: 12px; }
   input { background: #161b22; border: 1px solid #30363d; color: #e6edf3; border-radius: 24px; padding: 14px 22px; font-size: 16px; font-family: inherit; width: 100%; box-sizing: border-box; }
+  html.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
   input::placeholder { color: #6e7681; }
   input:focus { outline: 0; border-color: #58a6ff; }
+  html.theme-light input:focus { border-color: #0969da; }
   button { background: #21262d; border: 0; color: #ffffff; border-radius: 24px; padding: 14px 22px; font-size: 16px; font-weight: 500; cursor: pointer; font-family: inherit; transition: background 0.15s, transform 0.15s; margin-top: 4px; }
   button:hover { background: #30363d; }
+  html.theme-light button { background: #eaeef2; color: #1f2328; }
+  html.theme-light button:hover { background: #d0d7de; }
   button:active { transform: scale(0.98); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .err { color: #f85149; font-size: 13px; min-height: 18px; text-align: center; }
