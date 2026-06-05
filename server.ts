@@ -1635,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v39";
+const CACHE = "cc-dashboard-v40";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -1946,7 +1946,17 @@ const HTML = `<!doctype html>
   .archive-item-cwd { font-size: 11px; color: #6e7681; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.theme-light .archive-item-cwd { color: #57606a; }
   .archive-item-meta { font-size: 10px; color: #6e7681; margin-top: 2px; }
+  .archive-item-preview { font-size: 11px; color: #8b949e; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-style: italic; }
+  body.theme-light .archive-item-preview { color: #57606a; }
+  .archive-item-sid { font-size: 10px; color: #6e7681; font-family: ui-monospace, monospace; }
   .archive-empty { color: #6e7681; font-size: 13px; padding: 16px; text-align: center; }
+  .archive-search-wrap { margin-top: 10px; }
+  .archive-search { width: 100%; background: rgba(110,118,129,0.08); border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; padding: 8px 12px; font: inherit; font-size: 13px; box-sizing: border-box; }
+  .archive-search::placeholder { color: #6e7681; }
+  .archive-search:focus { outline: 0; border-color: #58a6ff; }
+  body.theme-light .archive-search { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .archive-search:focus { border-color: #0969da; }
+  .archive-item.hidden { display: none; }
   .new-session-card { display: flex; align-items: center; justify-content: center; background: transparent !important; border: 1.5px solid #ffffff !important; transition: background 0.15s, transform 0.15s; }
   .new-session-card span { font-family: 'UnifrakturCook', 'Pirata One', serif; font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: 0.04em; text-shadow: 0 0 10px rgba(255,255,255,0.15); line-height: 1.2; }
   .new-session-card:hover { background: rgba(255,255,255,0.05) !important; transform: scale(1.02); }
@@ -2374,7 +2384,10 @@ const HTML = `<!doctype html>
     <div id="welcome-grid" class="welcome-grid"></div>
     <div id="welcome-empty" class="welcome-empty" style="display:none">Нет запущенных claude-процессов</div>
     <div id="archive-block" class="archive-block">
-      <button id="archive-toggle" class="archive-toggle">📦 Архив сессий</button>
+      <button id="archive-toggle" class="archive-toggle">Сессии из Claude.app</button>
+      <div id="archive-search-wrap" class="archive-search-wrap" style="display:none">
+        <input id="archive-search" class="archive-search" type="search" placeholder="Поиск по названию, папке, тексту, sid…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      </div>
       <div id="archive-list" class="archive-list" style="display:none"></div>
     </div>
   </div>
@@ -4173,69 +4186,99 @@ async function pollUpdateStatus() {
 pollUpdateStatus();
 setInterval(pollUpdateStatus, 1000);
 
-// === Архив сессий — lazy load по клику на «📦 Архив» ===
+// === Архив сессий (Claude.app + старые CLI) — lazy load по клику ===
 const archiveToggle = document.getElementById("archive-toggle");
 const archiveListEl = document.getElementById("archive-list");
+const archiveSearchWrap = document.getElementById("archive-search-wrap");
+const archiveSearchInput = document.getElementById("archive-search");
 let archiveLoaded = false;
+let archiveData = [];
+const ARCHIVE_LABEL = "Сессии из Claude.app";
+function renderArchive(items) {
+  if (items.length === 0) {
+    archiveListEl.innerHTML = '<div class="archive-empty">нет совпадений</div>';
+    return;
+  }
+  archiveListEl.innerHTML = items.map(s => {
+    const titleHtml = s.title
+      ? '<div class="archive-item-title">' + escapeHtml(s.title) + '</div>'
+      : '<div class="archive-item-title">без названия · <span class="archive-item-sid">' + escapeHtml(s.sid.slice(0, 8)) + '</span></div>';
+    const previewHtml = s.preview
+      ? '<div class="archive-item-preview">' + escapeHtml(s.preview) + '</div>'
+      : '';
+    return '<div class="archive-item">' +
+      '<div class="archive-item-info">' +
+      titleHtml +
+      '<div class="archive-item-cwd">' + escapeHtml(s.cwdLabel || s.cwd || "") + '</div>' +
+      previewHtml +
+      '<div class="archive-item-meta">' + escapeHtml(s.lastActivityRel || "") + '</div>' +
+      '</div>' +
+      '<button class="resume-btn" data-sid="' + escapeHtml(s.sid) + '" data-cwd="' + escapeHtml(s.cwd || "") + '">▶ Resume</button>' +
+      '</div>';
+  }).join("");
+  for (const btn of archiveListEl.querySelectorAll(".resume-btn")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      const origText = btn.textContent;
+      btn.textContent = "⏳…";
+      try {
+        const res = await fetch("/api/restore", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok) {
+          btn.textContent = "✓ Открываю…";
+          setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+        } else {
+          btn.textContent = "✗ " + (d.error || "ошибка");
+          setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+        }
+      } catch (e) {
+        btn.textContent = "✗ " + (e.message || e);
+        setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
+      }
+    });
+  }
+}
+function filterArchive(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) { renderArchive(archiveData); return; }
+  const filtered = archiveData.filter(s => {
+    return (s.title || "").toLowerCase().includes(q)
+      || (s.cwdLabel || "").toLowerCase().includes(q)
+      || (s.cwd || "").toLowerCase().includes(q)
+      || (s.preview || "").toLowerCase().includes(q)
+      || s.sid.toLowerCase().includes(q);
+  });
+  renderArchive(filtered);
+}
 async function loadArchive() {
-  archiveToggle.textContent = "📦 загружаю архив…";
+  archiveToggle.textContent = "загружаю…";
   try {
     const r = await fetch("/api/archived-sessions");
     const list = await r.json();
     if (!Array.isArray(list)) throw new Error("bad response");
-    if (list.length === 0) {
-      archiveListEl.innerHTML = '<div class="archive-empty">архив пуст</div>';
-    } else {
-      archiveListEl.innerHTML = list.map(s => {
-        return '<div class="archive-item">' +
-          '<div class="archive-item-info">' +
-          '<div class="archive-item-title">' + escapeHtml(s.title || "(без названия)") + '</div>' +
-          '<div class="archive-item-cwd">' + escapeHtml(s.cwdLabel || s.cwd || "") + '</div>' +
-          '<div class="archive-item-meta">' + escapeHtml(s.lastActivityRel || "") + '</div>' +
-          '</div>' +
-          '<button class="resume-btn" data-sid="' + escapeHtml(s.sid) + '" data-cwd="' + escapeHtml(s.cwd || "") + '">▶ Resume</button>' +
-          '</div>';
-      }).join("");
-      for (const btn of archiveListEl.querySelectorAll(".resume-btn")) {
-        btn.addEventListener("click", async () => {
-          btn.disabled = true;
-          const origText = btn.textContent;
-          btn.textContent = "⏳…";
-          try {
-            const res = await fetch("/api/restore", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ sessionId: btn.dataset.sid, cwd: btn.dataset.cwd }),
-            });
-            const d = await res.json().catch(() => ({}));
-            if (res.ok) {
-              btn.textContent = "✓ Открываю…";
-              setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
-            } else {
-              btn.textContent = "✗ " + (d.error || "ошибка");
-              setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
-            }
-          } catch (e) {
-            btn.textContent = "✗ " + (e.message || e);
-            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 4000);
-          }
-        });
-      }
-    }
+    archiveData = list;
+    renderArchive(list);
     archiveListEl.style.display = "block";
-    archiveToggle.textContent = "📦 Архив (" + list.length + ") — скрыть";
+    archiveSearchWrap.style.display = list.length > 0 ? "block" : "none";
+    archiveToggle.textContent = ARCHIVE_LABEL + " (" + list.length + ") — скрыть";
     archiveLoaded = true;
   } catch (e) {
-    archiveToggle.textContent = "📦 Архив (ошибка загрузки)";
-    setTimeout(() => { archiveToggle.textContent = "📦 Архив сессий"; }, 3000);
+    archiveToggle.textContent = ARCHIVE_LABEL + " (ошибка загрузки)";
+    setTimeout(() => { archiveToggle.textContent = ARCHIVE_LABEL; }, 3000);
   }
 }
 archiveToggle.addEventListener("click", () => {
   if (!archiveLoaded) { loadArchive(); return; }
   const shown = archiveListEl.style.display !== "none";
   archiveListEl.style.display = shown ? "none" : "block";
-  archiveToggle.textContent = shown ? "📦 Архив сессий" : "📦 Архив — скрыть";
+  archiveSearchWrap.style.display = shown ? "none" : "block";
+  archiveToggle.textContent = shown ? ARCHIVE_LABEL : (ARCHIVE_LABEL + " (" + archiveData.length + ") — скрыть");
 });
+archiveSearchInput.addEventListener("input", (e) => filterArchive(e.target.value));
 
 // === Connection health monitor ===
 // Каждые 10 сек дёргает /api/health (без авторизации, дешёвый ping). По коду ответа определяет
@@ -5292,24 +5335,33 @@ return "ok"`;
       arch.sort((a, b) => b.mtime - a.mtime);
       // Ограничиваем 300 самыми свежими — иначе UI повиснет на тысячах
       const limited = arch.slice(0, 300);
-      // Для каждого: вытащим cwd из jsonl и customTitle
+      // Для каждого: вытащим cwd, customTitle и preview (первое user-сообщение)
       const result = await Promise.all(limited.map(async (j) => {
         let cwd = "";
         let title: string | null = null;
+        let preview = "";
         try {
-          const head = await readHead(j.path, 8 * 1024);
+          const head = await readHead(j.path, 16 * 1024);
           const lines = head.split("\n").filter(l => l.trim().startsWith("{"));
           for (const line of lines) {
             try {
               const rec = JSON.parse(line);
               if (!cwd && typeof rec.cwd === "string" && rec.cwd.startsWith("/")) cwd = rec.cwd;
-              if (cwd) break;
+              // первое user-сообщение с реальным текстом (не tool_result, не slash)
+              if (!preview && rec.type === "user") {
+                const c = rec.message?.content;
+                let txt = typeof c === "string" ? c : (Array.isArray(c) ? c.filter((x: any) => x?.type === "text").map((x: any) => x.text || "").join("") : "");
+                txt = txt.trim();
+                if (txt && !txt.startsWith("<command-") && !txt.startsWith("<system-reminder") && !txt.startsWith("/")) {
+                  preview = txt.replace(/\s+/g, " ").slice(0, 120);
+                }
+              }
+              if (cwd && preview) break;
             } catch {}
           }
           title = await getTitle(j.path);
         } catch {}
         if (!cwd) {
-          // Fallback: декодируем encoded имя папки (эвристика, не идеальна)
           const encoded = j.path.split("/").slice(-2, -1)[0] || "";
           cwd = encoded.startsWith("-") ? "/" + encoded.slice(1).replace(/-/g, "/") : encoded;
         }
@@ -5318,11 +5370,18 @@ return "ok"`;
           sid: j.sid,
           cwd,
           cwdLabel: cwd.replace(homedir(), "~"),
-          title: title ?? "(без названия)",
+          title: title ?? "",
+          preview,
           lastActivity: ts,
           lastActivityRel: relTime(ts),
         };
       }));
+      // Sort: named first (с непустым title), потом unnamed; внутри групп — по mtime DESC.
+      result.sort((a, b) => {
+        const aN = a.title ? 0 : 1, bN = b.title ? 0 : 1;
+        if (aN !== bN) return aN - bN;
+        return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
+      });
       (globalThis as any).__archCache = { at: Date.now(), data: result };
       return Response.json(result);
     }
