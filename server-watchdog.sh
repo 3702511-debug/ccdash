@@ -8,7 +8,7 @@ URL="http://localhost:8787/api/health"
 STATE_FILE="$HOME/.cc-dashboard/server-watchdog-fails.count"
 LOG="$HOME/.cc-dashboard/server-watchdog.log"
 SERVER_AGENT="$HOME/Library/LaunchAgents/com.user.cc-dashboard.plist"
-FAIL_THRESHOLD=3
+FAIL_THRESHOLD=2
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
