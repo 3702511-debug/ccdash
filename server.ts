@@ -1635,7 +1635,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 </svg>`;
 
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v40";
+const CACHE = "cc-dashboard-v46";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -1924,20 +1924,22 @@ const HTML = `<!doctype html>
   .resume-btn:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
 
   /* Panels (multi-session workspace) */
-  #panels { display: flex; gap: 12px; overflow-x: auto; flex: 1; min-height: 0; padding-bottom: 12px; }
+  #panels { display: flex; gap: 12px; overflow-x: auto; flex: 1 1 0; min-height: 0; padding-bottom: 12px; }
+  #panels:empty { flex: 0 0 0; padding: 0; min-height: 0; }
   #panels:empty::before { content: ''; }
-  .welcome { display: none; flex: 1; flex-direction: column; padding: 32px 24px; overflow-y: auto; }
+  .welcome { display: none; flex: 1 1 0; min-height: 0; flex-direction: column; padding: 32px 24px 80px; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .welcome.show { display: flex; }
-  .welcome-inner { width: 100%; max-width: 1200px; margin: 0 auto; }
+  .welcome-inner { width: 100%; margin: 0 auto; padding-bottom: env(safe-area-inset-bottom, 0px); flex-shrink: 0; }
   .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; align-items: start; }
   .welcome-grid .card { padding: 16px; }
   /* Архив сессий — раскрывалка под welcome-grid */
-  .archive-block { margin-top: 28px; max-width: 800px; margin-left: auto; margin-right: auto; padding: 0 16px; }
+  .archive-block { margin-top: 28px; padding: 0 16px; }
   .archive-toggle { width: 100%; background: transparent; border: 1px dashed #30363d; color: #8b949e; padding: 12px 16px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 14px; text-align: center; transition: all 0.15s; }
   .archive-toggle:hover { border-color: #58a6ff; color: #58a6ff; }
   body.theme-light .archive-toggle { border-color: #d0d7de; color: #57606a; }
   body.theme-light .archive-toggle:hover { border-color: #0969da; color: #0969da; }
-  .archive-list { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; max-height: 60vh; overflow-y: auto; }
+  .archive-list { margin-top: 12px; display: none; flex-direction: column; gap: 6px; }
+  .archive-list.open { display: flex; }
   .archive-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; background: rgba(110,118,129,0.08); border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; }
   body.theme-light .archive-item { background: #ffffff; border-color: #d0d7de; }
   .archive-item-info { min-width: 0; }
@@ -1950,7 +1952,8 @@ const HTML = `<!doctype html>
   body.theme-light .archive-item-preview { color: #57606a; }
   .archive-item-sid { font-size: 10px; color: #6e7681; font-family: ui-monospace, monospace; }
   .archive-empty { color: #6e7681; font-size: 13px; padding: 16px; text-align: center; }
-  .archive-search-wrap { margin-top: 10px; }
+  .archive-search-wrap { margin-top: 10px; display: none; }
+  .archive-search-wrap.open { display: block; }
   .archive-search { width: 100%; background: rgba(110,118,129,0.08); border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; padding: 8px 12px; font: inherit; font-size: 13px; box-sizing: border-box; }
   .archive-search::placeholder { color: #6e7681; }
   .archive-search:focus { outline: 0; border-color: #58a6ff; }
@@ -2136,7 +2139,7 @@ const HTML = `<!doctype html>
   @media (max-width: 768px) {
     body { padding: 0; }
     .topbar { padding: max(10px, env(safe-area-inset-top, 10px)) 12px 8px; }
-    .welcome { padding: 16px 12px; }
+    .welcome { padding: 16px 12px 100px; }
     .welcome-grid { grid-template-columns: 1fr; gap: 10px; }
     .welcome-grid .card { padding: 14px; }
     .meta { padding: 0 12px 8px; font-size: 11px; margin: 0; }
@@ -2385,10 +2388,10 @@ const HTML = `<!doctype html>
     <div id="welcome-empty" class="welcome-empty" style="display:none">Нет запущенных claude-процессов</div>
     <div id="archive-block" class="archive-block">
       <button id="archive-toggle" class="archive-toggle">Сессии из Claude.app</button>
-      <div id="archive-search-wrap" class="archive-search-wrap" style="display:none">
+      <div id="archive-search-wrap" class="archive-search-wrap">
         <input id="archive-search" class="archive-search" type="search" placeholder="Поиск по названию, папке, тексту, sid…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
       </div>
-      <div id="archive-list" class="archive-list" style="display:none"></div>
+      <div id="archive-list" class="archive-list"></div>
     </div>
   </div>
 </div>
@@ -4262,8 +4265,8 @@ async function loadArchive() {
     if (!Array.isArray(list)) throw new Error("bad response");
     archiveData = list;
     renderArchive(list);
-    archiveListEl.style.display = "block";
-    archiveSearchWrap.style.display = list.length > 0 ? "block" : "none";
+    archiveListEl.classList.add("open");
+    if (list.length > 0) archiveSearchWrap.classList.add("open");
     archiveToggle.textContent = ARCHIVE_LABEL + " (" + list.length + ") — скрыть";
     archiveLoaded = true;
   } catch (e) {
@@ -4273,10 +4276,16 @@ async function loadArchive() {
 }
 archiveToggle.addEventListener("click", () => {
   if (!archiveLoaded) { loadArchive(); return; }
-  const shown = archiveListEl.style.display !== "none";
-  archiveListEl.style.display = shown ? "none" : "block";
-  archiveSearchWrap.style.display = shown ? "none" : "block";
-  archiveToggle.textContent = shown ? ARCHIVE_LABEL : (ARCHIVE_LABEL + " (" + archiveData.length + ") — скрыть");
+  const shown = archiveListEl.classList.contains("open");
+  if (shown) {
+    archiveListEl.classList.remove("open");
+    archiveSearchWrap.classList.remove("open");
+    archiveToggle.textContent = ARCHIVE_LABEL;
+  } else {
+    archiveListEl.classList.add("open");
+    if (archiveData.length > 0) archiveSearchWrap.classList.add("open");
+    archiveToggle.textContent = ARCHIVE_LABEL + " (" + archiveData.length + ") — скрыть";
+  }
 });
 archiveSearchInput.addEventListener("input", (e) => filterArchive(e.target.value));
 
