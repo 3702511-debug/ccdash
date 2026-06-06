@@ -1740,8 +1740,9 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
+const CACHE_VERSION = "cc-dashboard-v78";
 const SERVICE_WORKER_JS = `
-const CACHE = "cc-dashboard-v62";
+const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["/"])).catch(() => {}));
   self.skipWaiting();
@@ -2079,7 +2080,7 @@ const HTML = `<!doctype html>
   body.theme-light .new-session-card span { color: #0d1117; text-shadow: 0 0 6px rgba(0,0,0,0.06); }
   body.theme-light .new-session-card:hover { background: rgba(0,0,0,0.04) !important; }
   .welcome-empty { color: #6e7681; text-align: center; padding: 60px 20px; font-size: 16px; }
-  .panel { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; min-width: 460px; flex: 1 1 0; display: flex; flex-direction: column; max-height: calc(100vh - 60px); }
+  .panel { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; min-width: 460px; flex: 1 1 0; display: flex; flex-direction: column; max-height: calc(100vh - 60px); overflow: hidden; }
   .panel-header { padding: 12px 16px; display: flex; align-items: center; gap: 8px; cursor: grab; }
   .panel-header:active { cursor: grabbing; }
   .panel-header button, .panel-header .title-block { cursor: pointer; }
@@ -2231,15 +2232,17 @@ const HTML = `<!doctype html>
   .attach-btn, .mic-btn { background: #21262d; border: 0; color: #c9d1d9; padding: 0; border-radius: 50%; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; min-width: 40px; flex-shrink: 0; }
   .attach-btn:hover, .mic-btn:hover { background: #30363d; color: white; }
   .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
-  .mic-btn { transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
-  .mic-btn.recording { background: #d73a49; transform: scale(1.8); box-shadow: 0 0 22px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.35); animation: mic-glow 1.4s ease-in-out infinite; z-index: 5; }
-  .mic-btn .rec-arrow { display: none; width: 18px; height: 18px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.3)); }
-  .mic-btn.recording .mic-icon { display: none; }
-  .mic-btn.recording .rec-arrow { display: block; }
-  .mic-btn.transcribing { background: #1f6feb; }
+  .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
+  /* Маленький красный кружок-подложка в центре + большое мерцающее свечение вокруг кнопки */
+  .mic-btn.recording { background: radial-gradient(circle, #d73a49 22%, rgba(215,58,73,0.45) 38%, rgba(215,58,73,0.15) 55%, transparent 72%); color: #fff; transform: scale(1.8); box-shadow: 0 0 28px rgba(215,58,73,0.85), 0 0 60px rgba(215,58,73,0.55); animation: mic-glow 1.2s ease-in-out infinite; z-index: 5; }
+  /* Белая иконка микрофона внутри */
+  .mic-btn.recording .mic-icon { color: #fff; filter: drop-shadow(0 0 4px rgba(255,255,255,0.85)); }
+  .mic-btn .rec-waves { display: none; }
+  .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
+  /* Сильное мерцание красного свечения — главная анимация во время записи */
   @keyframes mic-glow {
-    0%, 100% { box-shadow: 0 0 22px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.35); }
-    50% { box-shadow: 0 0 32px rgba(215,58,73,0.95), 0 0 64px rgba(215,58,73,0.55); }
+    0%, 100% { box-shadow: 0 0 20px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.3); }
+    50% { box-shadow: 0 0 54px rgba(255,85,96,1), 0 0 110px rgba(255,85,96,0.8), 0 0 180px rgba(255,85,96,0.45); }
   }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
   .mic-btn.transcribing svg { animation: spin 1s linear infinite; }
@@ -3467,8 +3470,8 @@ function openPanel(sid) {
         </button>
         <textarea placeholder="Сообщение" rows="1"></textarea>
         <button class="mic-btn" title="Записать голос → whisper расшифрует в текст">
-          <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-          <svg class="rec-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="4"/><polyline points="5 11 12 4 19 11"/></svg>
+          <svg class="mic-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 0 0-7 0v5.5A3.5 3.5 0 0 0 12 14z"/><path d="M19 10.5a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.57A7 7 0 0 0 19 10.5z" fill-opacity="0.85"/></svg>
+          <div class="rec-waves" aria-hidden="true"></div>
         </button>
         <button class="send-btn" style="display:none" title="Отправить">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -4011,9 +4014,8 @@ function openPanel(sid) {
 
   // Voice recording → whisper transcription
   const micBtn = el.querySelector(".mic-btn");
-  const MIC_SVG_IDLE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-  const MIC_SVG_STOP = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
-  const MIC_SVG_SPIN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9" /></svg>';
+  const MIC_SVG_IDLE = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  const MIC_SVG_SPIN = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9" /></svg>';
   let mediaRecorder = null;
   let recordedChunks = [];
   let audioContext = null;
@@ -4098,7 +4100,6 @@ function openPanel(sid) {
       peakLevel = 999; // skip "empty recording" guard below; let whisper decide
       mediaRecorder.start(250); // emit chunks every 250ms to guarantee data flow
       micBtn.classList.add("recording");
-      micBtn.innerHTML = MIC_SVG_STOP;
     } catch (e) {
       alert("Не получилось включить микрофон: " + e);
     }
@@ -4622,8 +4623,33 @@ document.getElementById("upd-apply").addEventListener("click", async () => {
   }
 });
 // Register service worker for PWA installability + push notifications.
+// Авто-обновление SW: при mismatch версии — unregister + сброс кэшей + reload.
+// Это нужно для случаев когда Chrome/Safari PWA агрессивно держит старый SW и
+// даже Cmd+Shift+R не помогает (PWA не открывает контекстное меню браузера).
+const __SERVER_CACHE_VERSION = "${CACHE_VERSION}";
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js").catch(() => {});
+  (async () => {
+    try {
+      const lastSeen = localStorage.getItem("cc-sw-version");
+      const regs = await navigator.serviceWorker.getRegistrations();
+      // Жёсткое сброс если: (а) lastSeen есть и не совпадает, ИЛИ
+      // (б) lastSeen пустой, но SW уже зарегистрирован (значит он от старого кода без этой логики).
+      const versionMismatch = lastSeen && lastSeen !== __SERVER_CACHE_VERSION;
+      const firstTimeWithStaleSw = !lastSeen && regs.length > 0;
+      if (versionMismatch || firstTimeWithStaleSw) {
+        await Promise.all(regs.map(r => r.unregister()));
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+        localStorage.setItem("cc-sw-version", __SERVER_CACHE_VERSION);
+        location.reload();
+        return;
+      }
+      localStorage.setItem("cc-sw-version", __SERVER_CACHE_VERSION);
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    } catch (e) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+  })();
 }
 
 // === Push notifications subscribe flow ===
@@ -5113,13 +5139,27 @@ Bun.serve({
 
     // === ROUTING ===
     if (url.pathname === "/") {
-      return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+      return new Response(HTML, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-cache, no-store, must-revalidate",
+          "pragma": "no-cache",
+          "expires": "0",
+        },
+      });
     }
     if (url.pathname === "/manifest.json") {
       return new Response(MANIFEST_JSON, { headers: { "content-type": "application/manifest+json" } });
     }
     if (url.pathname === "/sw.js") {
-      return new Response(SERVICE_WORKER_JS, { headers: { "content-type": "application/javascript" } });
+      return new Response(SERVICE_WORKER_JS, {
+        headers: {
+          "content-type": "application/javascript",
+          "cache-control": "no-cache, no-store, must-revalidate",
+          "pragma": "no-cache",
+          "expires": "0",
+        },
+      });
     }
     if (url.pathname === "/icon.svg") {
       return new Response(ICON_SVG, { headers: { "content-type": "image/svg+xml" } });
@@ -5909,6 +5949,21 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
           } catch {}
         }
       } catch {}
+      // Перед отправкой проверяем TUI: если там login-prompt / retry-screen,
+      // сначала шлём Esc чтобы Claude вернулся в нормальный input — иначе наш
+      // текст застрянет в этом модале.
+      try {
+        const tuiContents = await readAllTerminalContents(new Set([meta.tty]));
+        const text = tuiContents.get(meta.tty) ?? "";
+        const isStuckScreen = /Press Enter to retry|Esc to cancel|OAuth error|Login|Use [/]login/i.test(text);
+        if (isStuckScreen) {
+          console.log(`[/wake sid=${sid}] detected stuck screen, sending Esc first`);
+          await sendRawKey(meta.tty, "escape");
+          await new Promise(r => setTimeout(r, 300));
+        }
+      } catch (e) {
+        console.warn(`[/wake sid=${sid}] tui-probe failed:`, e);
+      }
       if (!lastUserText) {
         // Fallback: пустой Enter
         const { result } = await controlTerminal(meta.tty, "send", "");
