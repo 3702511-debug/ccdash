@@ -1740,7 +1740,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v78";
+const CACHE_VERSION = "cc-dashboard-v79";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2345,6 +2345,9 @@ const HTML = `<!doctype html>
   body.theme-light .composer textarea:focus { border-color: #0969da; }
   body.theme-light .attach-btn, body.theme-light .mic-btn { background: #eaeef2; color: #57606a; }
   body.theme-light .attach-btn:hover, body.theme-light .mic-btn:hover { background: #d0d7de; }
+  /* Светлая тема: при записи фон прозрачный (виден только мерцающий glow), микрофон — красный */
+  body.theme-light .mic-btn.recording { background: radial-gradient(circle, rgba(215,58,73,0.22) 22%, rgba(215,58,73,0.08) 50%, transparent 72%); color: #d73a49; }
+  body.theme-light .mic-btn.recording .mic-icon { color: #d73a49; filter: drop-shadow(0 0 4px rgba(215,58,73,0.55)); }
   body.theme-light .send-btn { background: #0969da; }
   body.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
   body.theme-light input::placeholder { color: #6e7681; }
