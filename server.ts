@@ -1740,7 +1740,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v79";
+const CACHE_VERSION = "cc-dashboard-v80";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2657,9 +2657,10 @@ function renderMd(text) {
   const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
   text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => {
     const code = inlineCodes[+i];
-    const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/cc-dashboard\\/)[^\\s'"]+$/.test(code);
-    // Bare-имя файла с расширением (без пути) — будем искать через Spotlight при клике
-    const isBareFile = !isPath && /^[A-Za-z0-9_.\\-]+\\.(zip|tar|gz|bz2|7z|rar|bat|cmd|sh|py|ts|tsx|js|jsx|json|yaml|yml|toml|txt|md|csv|xlsx|xls|docx|doc|pdf|png|jpg|jpeg|gif|webp|webm|mp4|mp3|wav|app|dmg|pkg|exe|html|css)$/i.test(code);
+    // Путь под $HOME / /tmp/cc-dashboard — пробелы и юникод разрешены (содержимое уже зажато backtick'ами)
+    const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/cc-dashboard\\/)[^'"]+$/.test(code);
+    // Bare-имя файла с расширением (без пути) — будем искать через Spotlight при клике; \\p{L}/\\p{N} для кириллицы и др.
+    const isBareFile = !isPath && /^[\\p{L}\\p{N}_.\\-]+\\.(zip|tar|gz|bz2|7z|rar|bat|cmd|sh|py|ts|tsx|js|jsx|json|yaml|yml|toml|txt|md|csv|xlsx|xls|docx|doc|pdf|png|jpg|jpeg|gif|webp|webm|mp4|mp3|wav|app|dmg|pkg|exe|html|css)$/iu.test(code);
     const codeHtml = '<code class="inline-code">' + escapeHtml(code) + '</code>';
     if (isPath) {
       return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
