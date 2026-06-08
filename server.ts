@@ -765,6 +765,11 @@ async function snapshot(): Promise<Session[]> {
       if (!bound) bound = bindPidByTitle(customTitle, pidInfos, tabTitles, sessionId);
       if (bound) bound.used = true;
 
+      // Headless background process (например `claude --print` из run.py / launchd job):
+      // нет TTY, нет /title — это рабочая лошадка, не интерактивный чат.
+      // jsonl без queue-operation, isHeadlessOrSidechain не сработал, но визуально это шум.
+      if (bound && !bound.tty && !customTitle && !bound.name) continue;
+
       // Filter out orphan jsonls (no live pid bound) older than ORPHAN_MAX_AGE_MS —
       // these are historical session files whose process has already exited.
       if (!bound && now - j.mtime > ORPHAN_MAX_AGE_MS) continue;
@@ -1740,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v81";
+const CACHE_VERSION = "cc-dashboard-v82";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
