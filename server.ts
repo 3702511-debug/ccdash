@@ -1740,7 +1740,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v80";
+const CACHE_VERSION = "cc-dashboard-v81";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5310,8 +5310,8 @@ Bun.serve({
       // где упомянуто только имя файла без пути. Возвращает первое совпадение под $HOME.
       const body = await req.json().catch(() => ({})) as { name?: string };
       const rawName = String(body.name ?? "").trim();
-      // Безопасность: только разрешённые символы в имени (без пробелов, кавычек, спец-чаров)
-      const name = rawName.replace(/[^a-zA-Z0-9_.\-]/g, "").slice(0, 100);
+      // Безопасность: только разрешённые символы в имени (без пробелов, кавычек, спец-чаров); юникод-буквы разрешены
+      const name = rawName.replace(/[^\p{L}\p{N}_.\-]/gu, "").slice(0, 100);
       if (!name || name.length < 3) return Response.json({ error: "bad name" }, { status: 400 });
       const proc = Bun.spawn(["mdfind", "-name", name, "-onlyin", homedir()], { stdout: "pipe", stderr: "pipe" });
       const out = await new Response(proc.stdout).text();
