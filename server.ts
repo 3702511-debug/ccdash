@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v82";
+const CACHE_VERSION = "cc-dashboard-v83";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6068,6 +6068,13 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       }
       if (stderr) {
         return Response.json({ terminal: result, error: stderr }, { status: 500 });
+      }
+      // Длинное/multi-line сообщение: Claude TUI 2.x после paste остаётся в edit-mode,
+      // trailing newline от `do script` идёт как ещё одна пустая строка, а не submit.
+      // Гарантируем submit физическим Enter через CGEvent.
+      if (text.includes("\n") || text.length > 200) {
+        await new Promise(r => setTimeout(r, 250));
+        await sendRawKey(meta.tty, "enter");
       }
       return Response.json({ terminal: result, pasteHint: true });
     }
