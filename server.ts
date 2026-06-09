@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v83";
+const CACHE_VERSION = "cc-dashboard-v84";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3052,15 +3052,17 @@ let nsResumeState = null; // null = новая | {sid, title, hasLivePid}
 function nsReset() {
   nsName.value = "";
   nsCwd.value = "";
-  nsRcToggle.classList.remove("on");
+  // Remote Control теперь включён по умолчанию и не отключаем — без него дашборд не может
+  // ни читать сообщения, ни писать в сессию, и весь смысл инструмента теряется.
+  nsRcToggle.classList.add("on");
+  nsRcToggle.classList.add("locked");
+  nsRcRow.style.pointerEvents = "none";
   nsError.textContent = "";
   nsApply.disabled = false;
   nsApply.textContent = "Создать";
   nsResumeHint.style.display = "none";
   nsName.classList.remove("locked");
   nsName.readOnly = false;
-  nsRcToggle.classList.remove("locked");
-  nsRcRow.style.pointerEvents = "";
   nsResumeState = null;
 }
 async function nsCheckExisting() {
@@ -3068,7 +3070,7 @@ async function nsCheckExisting() {
   if (!cwd) {
     nsResumeHint.style.display = "none";
     nsName.classList.remove("locked"); nsName.readOnly = false;
-    nsRcToggle.classList.remove("locked"); nsRcRow.style.pointerEvents = "";
+    // Remote Control остаётся включённым и locked — он обязателен для всех сессий, не разлочиваем.
     nsApply.textContent = "Создать";
     nsResumeState = null;
     return;
@@ -3079,7 +3081,7 @@ async function nsCheckExisting() {
     if (!info.exists) {
       nsResumeHint.style.display = "none";
       nsName.classList.remove("locked"); nsName.readOnly = false;
-      nsRcToggle.classList.remove("locked"); nsRcRow.style.pointerEvents = "";
+      // Remote Control остаётся включённым и locked — он обязателен для всех сессий, не разлочиваем.
       nsApply.textContent = "Создать";
       nsResumeState = null;
       return;

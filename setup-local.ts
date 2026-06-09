@@ -214,6 +214,39 @@ try {
   log("(сервер ещё не стартовал, проверь через секунду: curl localhost:8787/api/health)");
 }
 
+// 8. Full Disk Access для bun — обязательный шаг, иначе launchd-запущенный bun
+//    не сможет читать ~/.claude/projects/ и дашборд покажет 0 сессий.
+//    Программно дать FDA нельзя (политика macOS), но открываем нужную панель System Settings
+//    и инструктируем пользователя добавить bun.
+console.log();
+console.log("════════════════════════════════════════════════════════════");
+console.log("⚠  ВАЖНО: дай bun полный доступ к диску (Full Disk Access)");
+console.log("════════════════════════════════════════════════════════════");
+console.log();
+console.log("Без этого launchd-bun не увидит сессии Claude Code, и дашборд");
+console.log("будет показывать 0 чатов даже когда они активны в Terminal.");
+console.log();
+console.log("Сейчас откроется панель Системных настроек. Что сделать:");
+console.log(`  1. Нажми «+» в списке`);
+console.log(`  2. В диалоге Finder: Shift+Cmd+G → введи путь к bun (см. ниже)`);
+console.log(`     bun: ${bunPath}`);
+console.log(`  3. Выбери файл bun и нажми «Открыть»`);
+console.log(`  4. Включи слайдер напротив bun`);
+console.log(`  5. Вернись в этот терминал и нажми Enter, чтобы продолжить`);
+console.log();
+// Открываем панель Privacy & Security → Full Disk Access напрямую через URL scheme
+Bun.spawnSync(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]);
+process.stdout.write("Жму Enter после того как добавил bun в Full Disk Access... ");
+// читаем одну строку из stdin для ожидания подтверждения
+await new Promise<void>(resolve => {
+  process.stdin.once("data", () => resolve());
+  process.stdin.resume();
+});
+process.stdin.pause();
+// После FDA нужно перезапустить launchd-bun, чтобы новые TCC права применились
+Bun.spawnSync(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/com.user.cc-dashboard`]);
+ok("LaunchAgent перезапущен — новый bun теперь с FDA");
+
 console.log();
 console.log("====================================");
 console.log("✓ Локальная установка завершена.");
