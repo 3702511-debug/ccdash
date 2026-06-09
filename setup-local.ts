@@ -27,7 +27,25 @@ const die = (m: string): never => { console.error(`[setup-local] ✗ ${m}`); pro
 
 // 0. Sanity
 if (process.platform !== "darwin") die("Только macOS (LaunchAgent специфичен для macOS).");
-const bunPath = Bun.which("bun") ?? die("bun не найден в PATH. Установи: brew install bun");
+// Bun.which() может вернуть ephemeral путь типа /private/tmp/bun-node-XXX/bun
+// (если setup запущен через npx/bunx), который очищается при ребуте macOS — после первой
+// перезагрузки plist становится битым и launchd падает с Input/output error.
+// Поэтому если найденный bun в /tmp, пытаемся подобрать постоянный путь.
+function resolveStableBunPath(): string {
+  const found = Bun.which("bun");
+  const isEphemeral = (p: string | null) => !!p && (p.startsWith("/private/tmp/") || p.startsWith("/tmp/"));
+  if (found && !isEphemeral(found)) return found;
+  const candidates = [
+    "/opt/homebrew/bin/bun",
+    "/usr/local/bin/bun",
+    join(HOME, ".bun/bin/bun"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  die("bun не найден в постоянной директории. Установи через brew install bun или curl -fsSL https://bun.sh/install | bash");
+}
+const bunPath = resolveStableBunPath();
 log(`bun: ${bunPath}`);
 
 // 1. Deps

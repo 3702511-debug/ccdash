@@ -1,5 +1,12 @@
 [
   {
+    "version": "1.0.21",
+    "date": "2026-06-09",
+    "notes": [
+      "setup-local.ts больше не записывает в LaunchAgent ephemeral путь к bun (вида /private/tmp/bun-node-XXX/bun). Раньше: если setup запускался через npx/bunx — Bun.which() возвращал временный путь из /private/tmp/, и при следующей перезагрузке macOS папка очищалась, бинаря не было, launchd выдавал «Input/output error» и дашборд переставал стартовать. Теперь: если найденный bun под /tmp/ — setup ищет постоянный (/opt/homebrew/bin/bun, /usr/local/bin/bun или ~/.bun/bin/bun) и пишет в plist именно его. После обновления и однократного `bun run ~/.cc-dashboard/setup-local.ts` plist станет ребут-устойчивым."
+    ]
+  },
+  {
     "version": "1.0.20",
     "date": "2026-06-09",
     "notes": [
