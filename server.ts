@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v84";
+const CACHE_VERSION = "cc-dashboard-v85";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2199,6 +2199,11 @@ const HTML = `<!doctype html>
   .code-wrap .copy-btn:hover { background: #30363d; color: white; opacity: 1; }
   .code-wrap .copy-btn.copied { opacity: 1; color: #3fb950; }
   .code-wrap .copy-btn svg { width: 12px; height: 12px; display: block; }
+  /* Кнопка «открыть в Finder» в fenced-блоке (для одной строки-пути) — справа, левее copy-btn */
+  .code-wrap > .folder-open-btn { position: absolute; top: 6px; right: 38px; background: rgba(33,38,45,0.85); border: 1px solid #30363d; color: #8b949e; border-radius: 4px; padding: 3px 6px; cursor: pointer; opacity: 0; transition: opacity 0.15s; display: inline-flex; align-items: center; justify-content: center; margin-left: 0; vertical-align: top; }
+  .code-wrap:hover > .folder-open-btn { opacity: 0.9; }
+  .code-wrap > .folder-open-btn:hover { background: #1f6feb; color: white; border-color: #1f6feb; opacity: 1; }
+  .code-wrap > .folder-open-btn svg { width: 12px; height: 12px; display: block; }
   .msg.tool .body code.inline-code { color: #d2a8ff; }
   .msg .body b { font-weight: 600; color: #e6edf3; }
   .msg .body i { font-style: italic; }
@@ -2662,8 +2667,8 @@ function renderMd(text) {
   const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
   text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => {
     const code = inlineCodes[+i];
-    // Путь под $HOME / /tmp/cc-dashboard — пробелы и юникод разрешены (содержимое уже зажато backtick'ами)
-    const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/cc-dashboard\\/)[^'"]+$/.test(code);
+    // Путь под $HOME / /tmp — пробелы и юникод разрешены (содержимое уже зажато backtick'ами)
+    const isPath = /^(~\\/|\\/Users\\/|\\/tmp\\/)[^'"]+$/.test(code);
     // Bare-имя файла с расширением (без пути) — будем искать через Spotlight при клике; \\p{L}/\\p{N} для кириллицы и др.
     const isBareFile = !isPath && /^[\\p{L}\\p{N}_.\\-]+\\.(zip|tar|gz|bz2|7z|rar|bat|cmd|sh|py|ts|tsx|js|jsx|json|yaml|yml|toml|txt|md|csv|xlsx|xls|docx|doc|pdf|png|jpg|jpeg|gif|webp|webm|mp4|mp3|wav|app|dmg|pkg|exe|html|css)$/iu.test(code);
     const codeHtml = '<code class="inline-code">' + escapeHtml(code) + '</code>';
@@ -2705,7 +2710,12 @@ function renderMd(text) {
     const blockClass = isAction ? "code-block action" : "code-block";
     const copyIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
     const actionLabel = isAction ? '<div class="action-label">⚡ запусти через ! у себя</div>' : '';
-    return '<div class="' + wrapClass + '">' + actionLabel + '<button class="copy-btn" data-copy="' + enc + '" title="Скопировать">' + copyIcon + '</button><pre class="' + blockClass + '"><code>' + escaped + '</code></pre></div>';
+    // Если в fenced-блоке одна строка и она похожа на путь — добавим кнопку «открыть в Finder» рядом
+    const trimmed = code.trim();
+    const isSingleLinePath = !trimmed.includes("\\n") && /^(~\\/|\\/Users\\/|\\/tmp\\/)[^'"]+$/.test(trimmed);
+    const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+    const folderBtn = isSingleLinePath ? '<button class="folder-open-btn" data-path="' + encodeURIComponent(trimmed) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>' : '';
+    return '<div class="' + wrapClass + '">' + actionLabel + '<button class="copy-btn" data-copy="' + enc + '" title="Скопировать">' + copyIcon + '</button>' + folderBtn + '<pre class="' + blockClass + '"><code>' + escaped + '</code></pre></div>';
   });
   return text;
 }
@@ -5337,8 +5347,8 @@ Bun.serve({
       p = p.replace(/:\d+(:\d+)?$/, "");
       // Tilde-expand
       if (p.startsWith("~")) p = p.replace(/^~/, homedir());
-      // Безопасность: разрешаем только пути под $HOME или /tmp/cc-dashboard/
-      const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/cc-dashboard/");
+      // Безопасность: разрешаем только пути под $HOME или /tmp/ (system temp — пользователь его и так писал)
+      const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/");
       if (!allowed) return Response.json({ error: "path outside allowed scope" }, { status: 403 });
       const pathEsc = p.replace(/"/g, '\\"');
       // reveal POSIX file работает и для папок (подсвечивает в Finder), и для файлов (показывает в родительской)
