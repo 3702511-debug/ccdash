@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v85";
+const CACHE_VERSION = "cc-dashboard-v86";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5350,6 +5350,9 @@ Bun.serve({
       // Безопасность: разрешаем только пути под $HOME или /tmp/ (system temp — пользователь его и так писал)
       const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/");
       if (!allowed) return Response.json({ error: "path outside allowed scope" }, { status: 403 });
+      // Если файла нет — AppleScript reveal тихо откроет какую-то ближайшую папку,
+      // пользователь не поймёт куда его «привело». Сразу возвращаем 404 с понятной ошибкой.
+      if (!existsSync(p)) return Response.json({ error: "файл удалён (видимо macOS почистила /tmp)" }, { status: 404 });
       const pathEsc = p.replace(/"/g, '\\"');
       // reveal POSIX file работает и для папок (подсвечивает в Finder), и для файлов (показывает в родительской)
       const script = `tell application "Finder"
