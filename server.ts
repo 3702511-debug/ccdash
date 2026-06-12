@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v88";
+const CACHE_VERSION = "cc-dashboard-v89";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3140,26 +3140,48 @@ document.getElementById("ns-rc-row").addEventListener("click", () => nsRcToggle.
 
 // Folder picker: при клике показываем выпадающий список из cwd живых сессий + стандартные.
 const nsFolderList = document.getElementById("ns-folder-list");
+// Fallback-список: только recent папки из ТВОИХ собственных сессий, никакого хардкода чужих путей.
 function buildFolderList() {
-  const fromSessions = (sessionsCache || []).map(s => s.cwd).filter(Boolean);
-  const std = ["~/", "~/Documents", "~/Documents/клод", "~/Documents/2ATM"];
-  const all = [...new Set([...std, ...fromSessions])];
-  nsFolderList.innerHTML = all.map(p => '<div class="ns-folder-item" data-path="' + escapeHtml(p) + '">' + escapeHtml(p) + '</div>').join("");
-  nsFolderList.querySelectorAll(".ns-folder-item").forEach(el => {
+  const fromSessions = [...new Set((sessionsCache || []).map(s => s.cwd).filter(Boolean))];
+  if (fromSessions.length === 0) {
+    nsFolderList.innerHTML = '<div class="ns-folder-item" style="opacity:0.6; cursor:default">Недавних папок нет — введи путь вручную</div>';
+    return;
+  }
+  nsFolderList.innerHTML = fromSessions.map(p => '<div class="ns-folder-item" data-path="' + escapeHtml(p) + '">' + escapeHtml(p) + '</div>').join("");
+  nsFolderList.querySelectorAll(".ns-folder-item[data-path]").forEach(el => {
     el.addEventListener("click", () => {
       nsCwd.value = el.dataset.path;
       nsFolderList.style.display = "none";
     });
   });
 }
-document.getElementById("ns-folder-btn").addEventListener("click", (e) => {
+// Кнопка папки — пробуем нативный Finder picker (через AppleScript на сервере).
+// Если не получилось (timeout, fail) — показываем fallback-dropdown с recent папками.
+document.getElementById("ns-folder-btn").addEventListener("click", async (e) => {
   e.stopPropagation();
-  if (nsFolderList.style.display === "none") {
+  const btn = document.getElementById("ns-folder-btn");
+  const origHTML = btn.innerHTML;
+  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>';
+  btn.style.pointerEvents = "none";
+  try {
+    const r = await fetch("/api/pick-folder", { method: "POST" });
+    const d = await r.json();
+    if (d.path) {
+      nsCwd.value = d.path;
+      nsFolderList.style.display = "none";
+    } else if (d.cancelled) {
+      // пользователь нажал Cancel в Finder — ничего не делаем
+    } else if (d.error) {
+      // picker не сработал — показываем fallback dropdown
+      buildFolderList();
+      nsFolderList.style.display = "block";
+    }
+  } catch {
     buildFolderList();
     nsFolderList.style.display = "block";
-  } else {
-    nsFolderList.style.display = "none";
   }
+  btn.innerHTML = origHTML;
+  btn.style.pointerEvents = "";
 });
 document.addEventListener("click", (e) => {
   if (!nsFolderList.contains(e.target) && e.target.id !== "ns-folder-btn") {
@@ -5802,6 +5824,40 @@ return "ok"`;
       } catch { return new Response("not found", { status: 404 }); }
     }
 
+    if (url.pathname === "/api/pick-folder" && req.method === "POST") {
+      // Открываем нативный Finder picker папок на той машине, где работает сервер.
+      // Возвращаем выбранный POSIX path. Если пользователь нажал Cancel — { cancelled: true }.
+      // В диалоге Finder есть нативная кнопка «New Folder» — пользователь может создать прямо там.
+      const script = `try
+        tell application "System Events" to set frontApp to name of first process whose frontmost is true
+      end try
+      try
+        tell application frontApp to activate
+      end try
+      try
+        set f to choose folder with prompt "Выбери рабочую папку"
+        return POSIX path of f
+      on error errMsg number errNum
+        if errNum is -128 then
+          return "CANCELLED"
+        else
+          error errMsg number errNum
+        end if
+      end try`;
+      const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      const result = out.trim();
+      const stderr = err.trim();
+      if (result === "CANCELLED") return Response.json({ cancelled: true });
+      if (stderr) return Response.json({ error: stderr }, { status: 500 });
+      // POSIX path для папки заканчивается на "/", срежем для единообразия
+      const path = result.replace(/\/$/, "");
+      return Response.json({ path });
+    }
     if (url.pathname === "/api/upload" && req.method === "POST") {
       try {
         const formData = await req.formData();
