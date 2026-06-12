@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v87";
+const CACHE_VERSION = "cc-dashboard-v88";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2360,7 +2360,9 @@ const HTML = `<!doctype html>
   body.theme-light .composer textarea:focus { border-color: #0969da; }
   body.theme-light .attach-btn, body.theme-light .mic-btn { background: #eaeef2; color: #57606a; }
   body.theme-light .attach-btn:hover, body.theme-light .mic-btn:hover { background: #d0d7de; }
-  /* Светлая тема при записи — фон чисто красный (как в тёмной), белые полоски эквалайзера контрастны */
+  /* Светлая тема при записи — фон чисто красный (как в тёмной), белые полоски эквалайзера контрастны.
+     Specificity-фикс: body.theme-light .mic-btn (0,2,1) перебивает .mic-btn.recording (0,2,0), поэтому нужен явный override. */
+  body.theme-light .mic-btn.recording { background: #d73a49; color: #fff; box-shadow: 0 0 18px rgba(215,58,73,0.7), 0 0 36px rgba(215,58,73,0.4); }
   body.theme-light .send-btn { background: #0969da; }
   body.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
   body.theme-light input::placeholder { color: #6e7681; }
