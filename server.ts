@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v86";
+const CACHE_VERSION = "cc-dashboard-v87";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2243,17 +2243,22 @@ const HTML = `<!doctype html>
   .attach-btn:hover, .mic-btn:hover { background: #30363d; color: white; }
   .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
   .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
-  /* Маленький красный кружок-подложка в центре + большое мерцающее свечение вокруг кнопки */
-  .mic-btn.recording { background: radial-gradient(circle, #d73a49 22%, rgba(215,58,73,0.45) 38%, rgba(215,58,73,0.15) 55%, transparent 72%); color: #fff; transform: scale(1.8); box-shadow: 0 0 28px rgba(215,58,73,0.85), 0 0 60px rgba(215,58,73,0.55); animation: mic-glow 1.2s ease-in-out infinite; z-index: 5; }
-  /* Белая иконка микрофона внутри */
-  .mic-btn.recording .mic-icon { color: #fff; filter: drop-shadow(0 0 4px rgba(255,255,255,0.85)); }
-  .mic-btn .rec-waves { display: none; }
-  .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
-  /* Сильное мерцание красного свечения — главная анимация во время записи */
-  @keyframes mic-glow {
-    0%, 100% { box-shadow: 0 0 20px rgba(215,58,73,0.65), 0 0 44px rgba(215,58,73,0.3); }
-    50% { box-shadow: 0 0 54px rgba(255,85,96,1), 0 0 110px rgba(255,85,96,0.8), 0 0 180px rgba(255,85,96,0.45); }
+  /* В режиме записи микрофон скрывается, появляется живой эквалайзер из 5 полосок */
+  .mic-btn.recording { background: #d73a49; color: #fff; transform: scale(1.8); box-shadow: 0 0 18px rgba(215,58,73,0.7), 0 0 36px rgba(215,58,73,0.4); z-index: 5; }
+  .mic-btn.recording .mic-icon { display: none; }
+  .mic-btn .rec-waves { display: none; gap: 3px; align-items: center; justify-content: center; height: 22px; }
+  .mic-btn.recording .rec-waves { display: flex; }
+  .mic-btn.recording .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 6px; box-shadow: 0 0 6px rgba(255,255,255,0.6); animation: mic-eq 0.8s ease-in-out infinite; }
+  .mic-btn.recording .rec-waves span:nth-child(1) { animation-delay: 0s; }
+  .mic-btn.recording .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
+  .mic-btn.recording .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
+  .mic-btn.recording .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
+  .mic-btn.recording .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
+  @keyframes mic-eq {
+    0%, 100% { height: 4px; }
+    50% { height: 18px; }
   }
+  .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
   .mic-btn.transcribing svg { animation: spin 1s linear infinite; }
   .composer textarea { flex: 1; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 22px; padding: 10px 16px; font: 13px/1.4 -apple-system, sans-serif; resize: none; height: 40px; min-height: 40px; max-height: 50vh; overflow-y: auto; box-sizing: border-box; }
@@ -2355,9 +2360,7 @@ const HTML = `<!doctype html>
   body.theme-light .composer textarea:focus { border-color: #0969da; }
   body.theme-light .attach-btn, body.theme-light .mic-btn { background: #eaeef2; color: #57606a; }
   body.theme-light .attach-btn:hover, body.theme-light .mic-btn:hover { background: #d0d7de; }
-  /* Светлая тема: при записи фон прозрачный (виден только мерцающий glow), микрофон — красный */
-  body.theme-light .mic-btn.recording { background: radial-gradient(circle, rgba(215,58,73,0.22) 22%, rgba(215,58,73,0.08) 50%, transparent 72%); color: #d73a49; }
-  body.theme-light .mic-btn.recording .mic-icon { color: #d73a49; filter: drop-shadow(0 0 4px rgba(215,58,73,0.55)); }
+  /* Светлая тема при записи — фон чисто красный (как в тёмной), белые полоски эквалайзера контрастны */
   body.theme-light .send-btn { background: #0969da; }
   body.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
   body.theme-light input::placeholder { color: #6e7681; }
@@ -3492,7 +3495,7 @@ function openPanel(sid) {
         <textarea placeholder="Сообщение" rows="1"></textarea>
         <button class="mic-btn" title="Записать голос → whisper расшифрует в текст">
           <svg class="mic-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 0 0-7 0v5.5A3.5 3.5 0 0 0 12 14z"/><path d="M19 10.5a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.57A7 7 0 0 0 19 10.5z" fill-opacity="0.85"/></svg>
-          <div class="rec-waves" aria-hidden="true"></div>
+          <div class="rec-waves" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
         </button>
         <button class="send-btn" style="display:none" title="Отправить">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
