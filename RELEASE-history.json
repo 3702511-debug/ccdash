@@ -1,5 +1,12 @@
 [
   {
+    "version": "1.0.28",
+    "date": "2026-06-12",
+    "notes": [
+      "Finder picker папок больше не показывает лишнее окно «Choose Application» перед собой. В v1.0.27 я пытался активировать foreground-приложение (`tell application frontApp to activate`), но frontApp при работе из PWA-Chrome бывал пустым/невалидным, и macOS открывала диалог выбора приложения. Теперь сразу активирую Finder и показываю picker — без промежуточного окна."
+    ]
+  },
+  {
     "version": "1.0.27",
     "date": "2026-06-12",
     "notes": [

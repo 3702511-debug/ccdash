@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v89";
+const CACHE_VERSION = "cc-dashboard-v90";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5829,10 +5829,7 @@ return "ok"`;
       // Возвращаем выбранный POSIX path. Если пользователь нажал Cancel — { cancelled: true }.
       // В диалоге Finder есть нативная кнопка «New Folder» — пользователь может создать прямо там.
       const script = `try
-        tell application "System Events" to set frontApp to name of first process whose frontmost is true
-      end try
-      try
-        tell application frontApp to activate
+        tell application "Finder" to activate
       end try
       try
         set f to choose folder with prompt "Выбери рабочую папку"
