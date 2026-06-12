@@ -276,6 +276,7 @@ cat > ~/.cc-dashboard/tunnel-watchdog.sh <<'EOF'
 URL="https://<PUBLIC_DOMAIN>/api/health"
 STATE_FILE="$HOME/.cc-dashboard/watchdog-fails.count"
 LOG="$HOME/.cc-dashboard/watchdog.log"
+TUNNEL_ERR="$HOME/.cc-dashboard/tunnel.err.log"
 TUNNEL_AGENT="$HOME/Library/LaunchAgents/com.user.cc-tunnel.plist"
 FAIL_THRESHOLD=3
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -292,11 +293,25 @@ fails=$((fails + 1))
 echo "$fails" > "$STATE_FILE"
 echo "[$(ts)] fail #$fails (http $http_code)" >> "$LOG"
 if [ "$fails" -lt "$FAIL_THRESHOLD" ]; then exit 0; fi
+
+# Если autossh жив и в tunnel.err.log за последнюю минуту "remote port forwarding failed" —
+# это значит порт занят зомби-сессией на VPS. pkill+reload локально бесполезен,
+# просто ждём — sshd на VPS отпустит мёртвый forward за ~60с (ClientAliveInterval/CountMax).
+if [ -f "$TUNNEL_ERR" ] \
+   && find "$TUNNEL_ERR" -newermt '1 minute ago' -print 2>/dev/null | grep -q . \
+   && grep -q "remote port forwarding failed" "$TUNNEL_ERR" \
+   && pgrep -f "autossh" >/dev/null 2>&1; then
+  echo "[$(ts)] skip reload — autossh жив, порт занят на VPS, ждём освобождения" >> "$LOG"
+  sleep 30
+  exit 0
+fi
+
 echo "[$(ts)] threshold reached, reloading tunnel..." >> "$LOG"
 launchctl unload "$TUNNEL_AGENT" 2>> "$LOG"
-sleep 2
+# 15с между unload и pkill — даём VPS освободить порт от мёртвой сессии перед новым connect.
+sleep 15
 pkill -f "autossh" 2>> "$LOG"
-sleep 1
+sleep 2
 launchctl load "$TUNNEL_AGENT" 2>> "$LOG"
 echo 0 > "$STATE_FILE"
 EOF

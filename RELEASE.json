@@ -1,7 +1,8 @@
 {
-  "version": "1.0.28",
+  "version": "1.0.29",
   "date": "2026-06-12",
   "notes": [
-    "Finder picker папок больше не показывает лишнее окно «Choose Application» перед собой. В v1.0.27 я пытался активировать foreground-приложение (`tell application frontApp to activate`), но frontApp при работе из PWA-Chrome бывал пустым/невалидным, и macOS открывала диалог выбора приложения. Теперь сразу активирую Finder и показываю picker — без промежуточного окна."
+    "Туннель больше не флаппит каждые 3.5 минуты, когда VPS sshd ещё держит занятым порт прошлой сессии. Изменены два места: на VPS — sshd_config получил ClientAliveInterval 30 + ClientAliveCountMax 2, мёртвые reverse-forward теперь освобождаются за ~60с (на стороне моей VPS уже применено). В RUNBOOK обновлён tunnel-watchdog.sh: между unload и pkill autossh теперь sleep 15 (даём VPS освободить порт), плюс новая проверка — если autossh жив и в tunnel.err.log свежее «remote port forwarding failed», скрипт пропускает reload и ждёт 30с, потому что локальный pkill всё равно бесполезен.",
+    "ВАЖНО для существующих инсталляций: чтобы применить новый watchdog у себя, пересоздай файл по новой версии RUNBOOK секция Б7, или попроси автора (он добавил для своего инстанса вручную)."
   ]
 }
