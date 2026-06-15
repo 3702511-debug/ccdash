@@ -1745,7 +1745,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v90";
+const CACHE_VERSION = "cc-dashboard-v95";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2098,7 +2098,10 @@ const HTML = `<!doctype html>
   .panel-header button { background: #21262d; border: 0; color: #c9d1d9; padding: 0; border-radius: 50%; width: 36px; height: 36px; min-width: 36px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .panel-header button:hover { background: #30363d; color: white; }
   /* Status-line в стиле claude code: эмблема ✻ + текст «думает…», между feed и composer */
-  .status-line { display: flex; align-items: center; gap: 8px; padding: 6px 16px 8px; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; color: #c9d1d9; }
+  /* Высота status-line всегда зарезервирована (~28px), чтобы при смене thinking/waiting/idle
+     контент сверху и снизу не дёргался. Когда статус не нужен — visibility:hidden, не display:none. */
+  .status-line { display: flex; align-items: center; gap: 8px; padding: 6px 16px 8px; font-family: ui-monospace, "SF Mono", monospace; font-size: 12px; color: #c9d1d9; min-height: 28px; box-sizing: border-box; }
+  .status-line.hidden { visibility: hidden; }
   .status-line .claude-mark { color: #f0c674; font-size: 14px; line-height: 1; animation: claude-pulse 1.4s ease-in-out infinite; }
   .status-line.tool .claude-mark { color: #58a6ff; }
   .status-line.waiting .claude-mark { color: #3fb950; animation: none; }
@@ -2130,23 +2133,29 @@ const HTML = `<!doctype html>
   .msg.tool .who { color: #8b949e; }
   .msg .body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
   .msg.tool .body { color: #8b949e; font-size: 12px; }
-  .msg.question .who { color: #d29922; }
-  .q-card { background: rgba(187,128,9,0.08); border: 1px solid rgba(210,153,34,0.45); border-radius: 8px; padding: 12px 14px; }
-  .msg.question.answered .q-card { background: rgba(63,185,80,0.05); border-color: rgba(63,185,80,0.35); }
-  .q-header { font-size: 11px; color: #d29922; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-weight: 600; }
+  .msg.question .who { color: #58a6ff; }
+  /* Синяя «информационная» плашка с акцентной левой полосой (вариант V3). */
+  .q-card { background: rgba(56,139,253,0.12); border: 1px solid rgba(56,139,253,0.55); border-left: 4px solid #58a6ff; border-radius: 8px; padding: 12px 14px; }
+  .msg.question.answered .q-card { background: rgba(63,185,80,0.12); border-color: rgba(63,185,80,0.65); border-left-color: #3fb950; }
+  .q-card.submitting { background: rgba(63,185,80,0.10); border-color: rgba(63,185,80,0.55); border-left-color: #3fb950; }
+  .q-header { font-size: 11px; color: #79c0ff; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-weight: 700; }
   .msg.question.answered .q-header { color: #3fb950; }
-  .q-question { font-size: 14px; color: #e6edf3; font-weight: 500; margin-bottom: 10px; }
+  .q-question { font-size: 15px; color: #f0f6fc; font-weight: 600; margin-bottom: 10px; line-height: 1.4; }
   .q-opts { display: flex; flex-direction: column; gap: 6px; }
   .q-opt { display: block; width: 100%; text-align: left; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; color: #c9d1d9; font: inherit; cursor: default; transition: all 0.15s; position: relative; }
   button.q-opt.active { cursor: pointer; }
-  button.q-opt.active:hover { background: #1f2937; border-color: #d29922; transform: translateY(-1px); }
-  .q-num { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; text-align: center; background: #30363d; border-radius: 50%; color: #d29922; font-size: 11px; font-weight: 700; margin-right: 8px; vertical-align: middle; }
-  button.q-opt.active:hover .q-num { background: #d29922; color: #0d1117; }
+  button.q-opt.active:hover { background: #1f2937; border-color: #58a6ff; transform: translateY(-1px); }
+  .q-num { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; text-align: center; background: #30363d; border-radius: 50%; color: #58a6ff; font-size: 11px; font-weight: 700; margin-right: 8px; vertical-align: middle; }
+  button.q-opt.active:hover .q-num { background: #58a6ff; color: #0d1117; }
   .q-label { font-weight: 500; }
   .q-desc { font-size: 12px; color: #8b949e; margin-top: 4px; padding-left: 26px; line-height: 1.4; }
-  .q-status { margin-top: 10px; font-size: 12px; color: #d29922; }
+  /* Высота q-status всегда зарезервирована — чтобы при смене текста или появлении/исчезновении
+     карточка не «прыгала», а кнопка-действий не сдвигалась под пальцем. */
+  .q-status { margin-top: 10px; font-size: 12px; color: #79c0ff; min-height: 18px; display: flex; align-items: center; }
   .msg.question.answered .q-status { color: #3fb950; }
-  .q-status.multitab { background: rgba(210,153,34,0.08); border: 1px solid rgba(210,153,34,0.35); border-radius: 6px; padding: 8px 12px; color: #d29922; }
+  .q-status.multitab { background: rgba(56,139,253,0.10); border: 1px solid rgba(56,139,253,0.45); border-radius: 6px; padding: 8px 12px; color: #79c0ff; min-height: 36px; }
+  /* Q-actions тоже фиксированной высоты — кнопки не дёргаются вертикально при смене состояния. */
+  .q-actions { display: flex; gap: 8px; margin-top: 12px; min-height: 36px; align-items: center; }
   .q-rawkey { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; }
   .q-rawkey:hover { background: #2d333b; border-color: #58a6ff; }
   .q-rawkey.q-esc { color: #f85149; border-color: rgba(248,81,73,0.4); margin-left: auto; }
@@ -2161,8 +2170,9 @@ const HTML = `<!doctype html>
   button.q-opt.selected .q-num { background: #3fb950; color: #0d1117; }
   /* Кнопки всегда видимы и всегда полностью отрисованы.
      Если нет выбора — клик игнорируется на JS-уровне; чтобы не было визуальной игры
-     с opacity при ре-рендерах, не применяем никаких dim-стилей. */
-  .q-actions { display: flex; gap: 8px; margin-top: 12px; }
+     с opacity при ре-рендерах, не применяем никаких dim-стилей.
+     Высота q-actions фиксируется выше (min-height 36) — чтобы кнопки не сдвигались
+     по вертикали при смене состояния карточки. */
   .q-confirm { background: #238636; border: 0; color: #fff; padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500; }
   .q-confirm:hover { background: #2ea043; }
   .q-confirm:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -2182,9 +2192,9 @@ const HTML = `<!doctype html>
   button.q-opt.free-text.selected .q-free-input { border-color: #3fb950; }
   button.q-opt.free-text.selected .q-free-input:focus { border-color: #58a6ff; }
   /* Бейдж «?» на карточке сессии */
-  .card.has-question { box-shadow: 0 0 0 2px rgba(210,153,34,0.55); border-left-color: #d29922 !important; }
+  .card.has-question { box-shadow: 0 0 0 2px rgba(56,139,253,0.55); border-left-color: #58a6ff !important; }
   .card .q-badge { display: none; }
-  .card.has-question .q-badge { display: inline-block; margin-left: 6px; color: #d29922; font-weight: 700; animation: q-pulse 1.6s ease-in-out infinite; font-size: 14px; }
+  .card.has-question .q-badge { display: inline-block; margin-left: 6px; color: #58a6ff; font-weight: 700; animation: q-pulse 1.6s ease-in-out infinite; font-size: 14px; }
   @keyframes q-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   .msg .body pre.code-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; overflow-x: auto; font: 12px/1.45 ui-monospace, "SF Mono", monospace; color: #c9d1d9; margin: 6px 0; white-space: pre; }
   .msg .body .code-wrap.action { position: relative; }
@@ -2348,6 +2358,44 @@ const HTML = `<!doctype html>
   body.theme-light .msg .body { color: #1f2328; }
   body.theme-light .msg .body b { color: #0d1117; }
   body.theme-light .msg .body h1, body.theme-light .msg .body h2, body.theme-light .msg .body h3 { color: #0d1117; }
+  /* === Светлая тема: опросы (AskUserQuestion) — синяя информационная плашка с левой полосой === */
+  body.theme-light .msg.question .who { color: #0969da; }
+  body.theme-light .q-card { background: rgba(9,105,218,0.08); border-color: rgba(9,105,218,0.55); border-left: 4px solid #0969da; }
+  body.theme-light .msg.question.answered .q-card { background: rgba(31,136,61,0.10); border-color: rgba(31,136,61,0.6); border-left-color: #1f883d; }
+  body.theme-light .q-card.submitting { background: rgba(31,136,61,0.08); border-color: rgba(31,136,61,0.5); border-left-color: #1f883d; }
+  body.theme-light .q-header { color: #0969da; }
+  body.theme-light .msg.question.answered .q-header { color: #1f883d; }
+  body.theme-light .q-question { color: #0d1117; }
+  body.theme-light .q-opt { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light button.q-opt.active:hover { background: #f6f8fa; border-color: #0969da; }
+  body.theme-light .q-num { background: #eaeef2; color: #0969da; }
+  body.theme-light button.q-opt.active:hover .q-num { background: #0969da; color: #ffffff; }
+  body.theme-light .q-desc { color: #57606a; }
+  body.theme-light .q-status { color: #0969da; }
+  body.theme-light .msg.question.answered .q-status { color: #1f883d; }
+  body.theme-light .q-status.multitab { background: rgba(9,105,218,0.10); border-color: rgba(9,105,218,0.45); color: #0969da; }
+  body.theme-light .q-rawkey { background: #eaeef2; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .q-rawkey:hover { background: #ffffff; border-color: #0969da; }
+  body.theme-light .q-rawkey.q-esc { color: #cf222e; border-color: rgba(207,34,46,0.4); }
+  body.theme-light .q-rawkey.q-esc:hover { background: rgba(207,34,46,0.1); border-color: #cf222e; }
+  body.theme-light button.q-opt.selected { background: rgba(31,136,61,0.12); border-color: #1f883d; box-shadow: 0 0 0 1px rgba(31,136,61,0.35); }
+  body.theme-light button.q-opt.selected .q-num { background: #1f883d; color: #ffffff; }
+  body.theme-light .q-confirm { background: #1f883d; }
+  body.theme-light .q-confirm:hover { background: #2c9c4d; }
+  body.theme-light .q-cancel { border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .q-cancel:hover { border-color: #cf222e; color: #cf222e; }
+  body.theme-light .q-opt.picked { background: rgba(31,136,61,0.10); border-color: rgba(31,136,61,0.55); }
+  body.theme-light .q-opt.free-text-answered .q-label { color: #1f2328; }
+  body.theme-light button.q-opt.free-text .q-label { color: #6e7681; }
+  body.theme-light button.q-opt.free-text.selected .q-label { color: #1f2328; }
+  body.theme-light .q-free-input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
+  body.theme-light .q-free-input:focus { border-color: #0969da; box-shadow: 0 0 0 2px rgba(9,105,218,0.2); }
+  body.theme-light button.q-opt.free-text.selected .q-free-input { border-color: #1f883d; }
+  body.theme-light button.q-opt.free-text.selected .q-free-input:focus { border-color: #0969da; }
+  body.theme-light .q-next-tab, body.theme-light .q-final-submit { background: #1f883d; }
+  body.theme-light .q-next-tab:hover, body.theme-light .q-final-submit:hover { background: #2c9c4d; }
+  body.theme-light .card.has-question { box-shadow: 0 0 0 2px rgba(9,105,218,0.55); border-left-color: #0969da !important; }
+  body.theme-light .card.has-question .q-badge { color: #0969da; }
   body.theme-light .msg.tool .body { color: #24292f; }
   body.theme-light .msg.tool .body code.inline-code { color: #4c1d95; background: rgba(175,184,193,0.25); }
   body.theme-light .msg .body code.inline-code { background: rgba(175,184,193,0.2); color: #0550ae; }
@@ -2587,6 +2635,13 @@ let sessionsCache = [];
 const panels = new Map(); // sid → { el, pollInterval }
 const questionSelections = new Map(); // sid → { toolUseId, idx } — выбор пользователем варианта ДО подтверждения
 const questionFreeTexts = new Map(); // sid → { toolUseId, value } — введённый текст в free-text input, переживает re-render
+// sid → toolUseId — «карточка в процессе подтверждения»: ответ отправили в TUI, jsonl ещё не записал.
+// Пока эта пометка стоит, refreshFeedPanel НЕ перерисовывает фид (чтоб не мигать) и поллит чаще.
+const questionSubmitting = new Map();
+const questionFastPollTimers = new Map(); // sid → setInterval id (быстрый поллинг во время submitting)
+// sid → Set<toolUseId> — Submit-Review карточки которые мы уже автоматически отправили,
+// чтобы не зациклить (карточка остаётся в DOM до тех пор пока answered=true не подтянется из jsonl).
+const autoSubmittedReviews = new Map();
 
 function applyQuestionSelection(p, sid) {
   const sel = questionSelections.get(sid);
@@ -3347,9 +3402,10 @@ function updatePanelHeader(sid) {
         } catch (e2) { alert("Сеть: " + e2.message); }
         setTimeout(() => { btn.disabled = false; btn.textContent = "Разбудить"; }, 3000);
       });
-      statusLine.style.display = "flex";
     } else if (!s.tty || s.status === "idle" || s.status === "unknown") {
-      statusLine.style.display = "none";
+      // Высота зарезервирована (см. CSS .status-line min-height) — просто скрываем содержимое.
+      statusLine.className = "status-line hidden";
+      statusLine.innerHTML = "";
     } else {
       statusLine.className = "status-line " + s.status;
       let extras = [];
@@ -3367,7 +3423,6 @@ function updatePanelHeader(sid) {
       }
       const suffix = extras.length ? \` (\${extras.join(" · ")})\` : "";
       statusLine.innerHTML = '<span class="claude-mark">✻</span><span class="status-text">' + escapeHtml((labels[s.status] || s.status) + suffix) + '</span>';
-      statusLine.style.display = "flex";
     }
   }
 }
@@ -3441,18 +3496,20 @@ async function refreshFeedPanel(sid) {
           ? \`<div class=q-status>✓ отвечено</div>\`
           : isMultiTab
             ? (isSubmitReview
-                ? \`<div class="q-status multitab">Финальный шаг — отправить все ответы или отменить.</div>\`
+                ? \`<div class="q-status multitab">Отправляю ответы…</div>\`
                 : \`<div class="q-status multitab">Выбери ответ, потом нажми «Далее». В этом опросе несколько вопросов — после Далее покажется следующий.</div>\`)
             : \`<div class=q-status>⚠ ждёт твой выбор</div>\`;
-        // Single-tab — Отправить/Отмена. Multi-tab — Далее (или Отправить ответы на финальном экране).
+        // Single-tab — Отправить/Отмена. Multi-tab — Далее. Submit-Review экран автонажимается фронтом
+        // (см. refreshFeedPanel auto-submit), кнопку «Отправить ответы» не показываем — лишний клик.
         const actionsHtml = q.answered
           ? ""
           : isMultiTab
             ? (isSubmitReview
-                ? \`<div class="q-actions"><button class="q-final-submit" type="button">✓ Отправить ответы</button><button class="q-rawkey q-esc" data-key="escape" type="button">Отмена</button></div>\`
+                ? \`\`
                 : \`<div class="q-actions"><button class="q-next-tab" type="button" disabled>Далее</button><button class="q-rawkey q-esc" data-key="escape" type="button">Esc</button></div>\`)
             : \`<div class="q-actions"><button class="q-confirm" type="button">Отправить</button><button class="q-cancel" type="button">Отмена</button></div>\`;
-        return \`<div class="msg question \${q.answered?"answered":"open"}" data-tool-use-id="\${q.toolUseId}"><div class="who">вопрос</div><div class="q-card" data-tool-use-id="\${q.toolUseId}">\${headerHtml}<div class=q-question>\${renderMd(q.question)}</div><div class=q-opts>\${optsHtml}\${extraFreeTextHtml}</div>\${actionsHtml}\${statusHtml}</div></div>\`;
+        const autoSubmitAttr = (isSubmitReview && !q.answered) ? \` data-auto-submit="1"\` : "";
+        return \`<div class="msg question \${q.answered?"answered":"open"}" data-tool-use-id="\${q.toolUseId}"><div class="who">вопрос</div><div class="q-card\${isSubmitReview && !q.answered ? " submitting" : ""}" data-tool-use-id="\${q.toolUseId}"\${autoSubmitAttr}>\${headerHtml}<div class=q-question>\${renderMd(q.question)}</div><div class=q-opts>\${optsHtml}\${extraFreeTextHtml}</div>\${actionsHtml}\${statusHtml}</div></div>\`;
       }
       return \`
       <div class="msg \${m.role}">
@@ -3461,12 +3518,54 @@ async function refreshFeedPanel(sid) {
       </div>
     \`;
     }).join("");
+    // Anti-flicker: если у нас есть карточка в состоянии «submitting» (только что нажали Отправить),
+    // и в новом feed.html answered ещё false — НЕ перерисовываем фид. Ждём пока answered=true появится,
+    // тогда чистим submitting и обновляем фид одной перерисовкой.
+    const submittingTid = questionSubmitting.get(sid);
+    if (submittingTid) {
+      const matchedAnswered = msgs.some(m =>
+        m.role === "question" && m.question &&
+        m.question.toolUseId === submittingTid && m.question.answered);
+      if (matchedAnswered) {
+        // Ответ записан в jsonl — можно очищать локальное состояние и обновить фид
+        questionSubmitting.delete(sid);
+        questionSelections.delete(sid);
+        questionFreeTexts.delete(sid);
+        const t = questionFastPollTimers.get(sid);
+        if (t) { clearInterval(t); questionFastPollTimers.delete(sid); }
+      } else {
+        // ещё ждём — не перерисовываем фид, пользователь видит «submitting»-состояние
+        return;
+      }
+    }
     if (p.lastFeedHtml === html) return;
     p.lastFeedHtml = html;
     const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
     feed.innerHTML = html;
     applyQuestionSelection(p, sid);
     if (nearBottom) feed.scrollTop = feed.scrollHeight;
+    // Auto-submit Submit-Review карточек (multi-tab финальный экран): пользователь не должен
+    // дважды нажимать «Отправить» → «Отправить ответы». Сразу шлём idx=1 (Submit answers).
+    const reviewCards = feed.querySelectorAll('.q-card[data-auto-submit="1"]');
+    let submitted = autoSubmittedReviews.get(sid);
+    if (!submitted) { submitted = new Set(); autoSubmittedReviews.set(sid, submitted); }
+    for (const card of reviewCards) {
+      const tuid = card.dataset.toolUseId;
+      if (!tuid || submitted.has(tuid)) continue;
+      submitted.add(tuid);
+      (async () => {
+        try {
+          await new Promise(r => setTimeout(r, 200));
+          await fetch("/api/session/" + sid + "/answer-question", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ optionIndex: 1 }),
+          });
+        } catch (err) {
+          console.error("auto-submit review failed:", err);
+        }
+      })();
+    }
   } catch {}
 }
 
@@ -3720,6 +3819,10 @@ function openPanel(sid) {
       }
       qConfirm.disabled = true;
       qConfirm.textContent = "…";
+      // Anti-flicker: помечаем карточку как «отправляется» прямо в DOM, чтобы visual feedback
+      // был мгновенный (зелёный фон), а не моргал между «выбранная» и «answered».
+      const submittingCard = e.target.closest(".q-card");
+      if (submittingCard) submittingCard.classList.add("submitting");
       try {
         const body = { optionIndex: sel.idx };
         if (freeText) body.freeText = freeText;
@@ -3733,14 +3836,28 @@ function openPanel(sid) {
           alert("Не удалось ответить: " + (err.error || res.status));
           qConfirm.disabled = false;
           qConfirm.textContent = "Отправить";
+          if (submittingCard) submittingCard.classList.remove("submitting");
         } else {
-          questionSelections.delete(sid);
-          questionFreeTexts.delete(sid);
+          // Помечаем карточку как «в процессе подтверждения», чтобы refreshFeedPanel НЕ перерисовывал
+          // до момента, когда answered=true появится в jsonl. Это устраняет мерцание.
+          questionSubmitting.set(sid, sel.toolUseId);
+          // Включаем fast-poll (раз в 300мс) чтобы answered=true подхватился быстрее.
+          if (!questionFastPollTimers.has(sid)) {
+            const timer = setInterval(() => refreshFeedPanel(sid), 300);
+            questionFastPollTimers.set(sid, timer);
+            // Авто-выключение через 8с на случай, если что-то застряло.
+            setTimeout(() => {
+              const t = questionFastPollTimers.get(sid);
+              if (t) { clearInterval(t); questionFastPollTimers.delete(sid); }
+              questionSubmitting.delete(sid);
+            }, 8000);
+          }
         }
       } catch (err) {
         alert("Сеть: " + err);
         qConfirm.disabled = false;
         qConfirm.textContent = "Отправить";
+        if (submittingCard) submittingCard.classList.remove("submitting");
       }
       return;
     }
