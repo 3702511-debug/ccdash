@@ -10,7 +10,18 @@ import { join } from "node:path";
 
 const AUTH_FILE = join(homedir(), ".cc-dashboard", "auth.json");
 
-type AuthConfig = { users: { login: string; hash: string }[]; secret: string };
+type AuthUser = { login: string; hash: string; allowedSessionTitles?: string[] };
+type AuthConfig = { users: AuthUser[]; secret: string };
+
+// CLI флаг: --restrict "title1,title2,..." → создаёт пользователя только с доступом
+// к сессиям из whitelist (по custom-title). Без флага — admin (видит всё).
+function parseRestrictArg(): string[] | null {
+  const idx = process.argv.indexOf("--restrict");
+  if (idx < 0) return null;
+  const v = process.argv[idx + 1];
+  if (!v) return [];
+  return v.split(",").map(s => s.trim()).filter(Boolean);
+}
 
 async function prompt(label: string, hidden = false): Promise<string> {
   process.stdout.write(label);
@@ -75,12 +86,25 @@ if (confirm !== password) { console.error("Пароли не совпадают.
 
 const hash = await Bun.password.hash(password, { algorithm: "argon2id" });
 
+// Whitelist: --restrict из CLI или интерактивный prompt. Пусто = admin (видит всё).
+let restrictTitles: string[] | null = parseRestrictArg();
+if (restrictTitles === null) {
+  const restrictRaw = await prompt("Ограничить пользователя сессиями (custom-title через запятую, пусто = admin): ");
+  if (restrictRaw) {
+    restrictTitles = restrictRaw.split(",").map(s => s.trim()).filter(Boolean);
+  }
+}
+
 const idx = existing.users.findIndex(u => u.login === login);
+const newUser: AuthUser = { login, hash };
+if (restrictTitles && restrictTitles.length > 0) {
+  newUser.allowedSessionTitles = restrictTitles;
+}
 if (idx >= 0) {
-  console.log(`Обновляю пароль для ${login}`);
-  existing.users[idx].hash = hash;
+  console.log(`Обновляю пользователя ${login}`);
+  existing.users[idx] = { ...newUser, hash };
 } else {
-  existing.users.push({ login, hash });
+  existing.users.push(newUser);
 }
 
 await Bun.write(AUTH_FILE, JSON.stringify(existing, null, 2));

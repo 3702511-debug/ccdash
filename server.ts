@@ -1753,7 +1753,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v106";
+const CACHE_VERSION = "cc-dashboard-v107";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2092,6 +2092,11 @@ const HTML = `<!doctype html>
   body.theme-light .new-session-card { border-color: #0d1117 !important; }
   body.theme-light .new-session-card span { color: #0d1117; text-shadow: 0 0 6px rgba(0,0,0,0.06); }
   body.theme-light .new-session-card:hover { background: rgba(0,0,0,0.04) !important; }
+  /* Restricted user (allowedSessionTitles в auth.json) — без админских действий */
+  body.restricted-user .new-session-btn,
+  body.restricted-user .new-session-card,
+  body.restricted-user [data-section="hidden"],
+  body.restricted-user [data-section="archived"] { display: none !important; }
   .welcome-empty { color: #6e7681; text-align: center; padding: 60px 20px; font-size: 16px; }
   .panel { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; min-width: 460px; flex: 1 1 0; display: flex; flex-direction: column; max-height: calc(100vh - 60px); overflow: hidden; }
   .panel-header { padding: 12px 16px; display: flex; align-items: center; gap: 8px; cursor: grab; }
@@ -4508,6 +4513,13 @@ function connect() {
 }
 connect();
 
+// Подгружаем кто текущий юзер и есть ли у него ограничения. Restricted-юзеры (с
+// allowedSessionTitles в auth.json) не должны видеть кнопку «+ Новая сессия» и
+// прочие admin-элементы. Если запрос упал — оставляем как admin (UX-fallback).
+fetch("/api/me").then(r => r.ok ? r.json() : null).then(me => {
+  if (me?.isRestricted) document.body.classList.add("restricted-user");
+}).catch(() => {});
+
 // === Update overlay polling ===
 // Каждую секунду спрашиваем /api/update-status. Когда phase !== "idle" — показываем overlay.
 // Когда phase === "done" и percent === 100 — авто-reload страницы через ~1.5 сек.
@@ -5118,7 +5130,15 @@ function compareVersions(a: string, b: string): number {
 // === Auth ===
 const AUTH_FILE = join(homedir(), ".cc-dashboard", "auth.json");
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;  // 24h server-side token validity. Cookie itself is session-only (см. cookieHeader).
-type AuthConfig = { users: { login: string; hash: string }[]; secret: string };
+type AuthUser = {
+  login: string;
+  hash: string;
+  // Опциональный whitelist по custom-title. Если задан и непустой — пользователь
+  // видит и работает только с этими сессиями, не создаёт новые. Если поле
+  // отсутствует или пустой массив — admin (видит всё, как раньше).
+  allowedSessionTitles?: string[];
+};
+type AuthConfig = { users: AuthUser[]; secret: string };
 let authConfig: AuthConfig | null = null;
 try { authConfig = await Bun.file(AUTH_FILE).json(); } catch {}
 if (!authConfig) console.warn(`[auth] ${AUTH_FILE} not found — server will refuse all traffic. Run: bun run ~/.cc-dashboard/setup-auth.ts`);
@@ -5153,6 +5173,26 @@ function getSessionLogin(req: Request): string | null {
   const m = cookie.match(/(?:^|;\s*)cc_session=([^;]+)/);
   if (!m) return null;
   return verifyToken(decodeURIComponent(m[1]), authConfig.secret);
+}
+function getCurrentUser(req: Request): AuthUser | null {
+  const login = getSessionLogin(req);
+  if (!login || !authConfig) return null;
+  return authConfig.users.find(u => u.login === login) ?? null;
+}
+function isRestrictedUser(u: AuthUser | null): boolean {
+  return !!(u?.allowedSessionTitles && u.allowedSessionTitles.length > 0);
+}
+function filterSnapshotForUser<T extends { title?: string | null }>(snap: T[], u: AuthUser | null): T[] {
+  if (!isRestrictedUser(u)) return snap;
+  const allowed = new Set(u!.allowedSessionTitles);
+  return snap.filter(s => s.title != null && allowed.has(s.title));
+}
+async function checkSessionAccess(u: AuthUser | null, sid: string): Promise<boolean> {
+  if (!isRestrictedUser(u)) return true;
+  const snap = await snapshot();
+  const s = snap.find((x: any) => x.sessionId === sid);
+  if (!s || !s.title) return false;
+  return u!.allowedSessionTitles!.includes(s.title);
 }
 function cookieHeader(token: string | null): string {
   if (!token) return `cc_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
@@ -5309,6 +5349,7 @@ Bun.serve({
     // Public assets bypass auth (PWA needs manifest/icons before login)
     const isPublic = isPublicAsset(url.pathname);
     let authedLogin: string | null = null;
+    let authedUser: AuthUser | null = null;
     if (!isPublic) {
       authedLogin = getSessionLogin(req);
       if (!authedLogin) {
@@ -5316,6 +5357,24 @@ Bun.serve({
           return new Response(null, { status: 302, headers: { location: "/login" } });
         }
         return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      authedUser = authConfig?.users.find(u => u.login === authedLogin) ?? null;
+    }
+
+    // Per-user whitelist guard для restricted-пользователей:
+    // 1) /api/session/new запрещаем (создание сессий)
+    // 2) любые /api/session/<sid>/* запросы пропускаем только если sid в whitelist
+    // Поверх этого фильтруются /api/sessions и /api/stream (см. filterSnapshotForUser).
+    if (!isPublic && isRestrictedUser(authedUser)) {
+      if (url.pathname === "/api/session/new" && req.method === "POST") {
+        return Response.json({ error: "forbidden: creating sessions is not allowed for restricted users" }, { status: 403 });
+      }
+      const sessionMatch = url.pathname.match(/^\/api\/session\/([^/]+)(\/|$)/);
+      if (sessionMatch) {
+        const sid = sessionMatch[1];
+        if (!await checkSessionAccess(authedUser, sid)) {
+          return Response.json({ error: "forbidden: session not in your whitelist" }, { status: 403 });
+        }
       }
     }
 
@@ -5427,7 +5486,14 @@ Bun.serve({
       return Response.json({ ok: true, subs: pushSubscriptions.length });
     }
     if (url.pathname === "/api/sessions") {
-      return Response.json(await snapshot());
+      return Response.json(filterSnapshotForUser(await snapshot(), authedUser));
+    }
+    if (url.pathname === "/api/me") {
+      return Response.json({
+        login: authedLogin,
+        isRestricted: isRestrictedUser(authedUser),
+        allowedSessionTitles: authedUser?.allowedSessionTitles ?? [],
+      });
     }
     // kid-dash override: мама подтвердила «точно прервать урок» → разблокировка на 60 сек
     if (url.pathname === "/api/kid-dash/override" && req.method === "POST") {
@@ -5448,7 +5514,7 @@ Bun.serve({
           const send = async () => {
             if (closed) return;
             try {
-              const data = await snapshot();
+              const data = filterSnapshotForUser(await snapshot(), authedUser);
               if (closed) return;
               controller.enqueue(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e: any) {
