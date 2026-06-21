@@ -2096,7 +2096,11 @@ const HTML = `<!doctype html>
   body.restricted-user .new-session-btn,
   body.restricted-user .new-session-card,
   body.restricted-user [data-section="hidden"],
-  body.restricted-user [data-section="archived"] { display: none !important; }
+  body.restricted-user [data-section="archived"],
+  body.restricted-user #archive-toggle,
+  body.restricted-user #upd-overlay,
+  body.restricted-user .update-banner,
+  body.restricted-user .update-btn { display: none !important; }
   .welcome-empty { color: #6e7681; text-align: center; padding: 60px 20px; font-size: 16px; }
   .panel { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; min-width: 460px; flex: 1 1 0; display: flex; flex-direction: column; max-height: calc(100vh - 60px); overflow: hidden; }
   .panel-header { padding: 12px 16px; display: flex; align-items: center; gap: 8px; cursor: grab; }
@@ -5363,11 +5367,24 @@ Bun.serve({
 
     // Per-user whitelist guard для restricted-пользователей:
     // 1) /api/session/new запрещаем (создание сессий)
-    // 2) любые /api/session/<sid>/* запросы пропускаем только если sid в whitelist
-    // Поверх этого фильтруются /api/sessions и /api/stream (см. filterSnapshotForUser).
+    // 2) admin-операции на ФС / процессах / обновлении запрещаем целиком
+    // 3) любые /api/session/<sid>/* запросы пропускаем только если sid в whitelist
+    // Поверх этого фильтруются /api/sessions, /api/stream, /api/archived-sessions,
+    // /api/hidden-sessions, /api/restore (см. соответствующие handlers).
     if (!isPublic && isRestrictedUser(authedUser)) {
       if (url.pathname === "/api/session/new" && req.method === "POST") {
         return Response.json({ error: "forbidden: creating sessions is not allowed for restricted users" }, { status: 403 });
+      }
+      // admin-операции
+      const ADMIN_PATHS = new Set([
+        "/api/find-by-name",
+        "/api/open-path",
+        "/api/check-existing",
+        "/api/update-apply",
+        "/api/update-info",
+      ]);
+      if (ADMIN_PATHS.has(url.pathname)) {
+        return Response.json({ error: "forbidden: admin-only endpoint" }, { status: 403 });
       }
       const sessionMatch = url.pathname.match(/^\/api\/session\/([^/]+)(\/|$)/);
       if (sessionMatch) {
@@ -5680,6 +5697,8 @@ end tell`;
       return Response.json({ ok: true, total: hiddenSids.size });
     }
     if (url.pathname === "/api/hidden-sessions") {
+      // Restricted-юзер не видит закрытые/скрытые сессии — у него их быть не может.
+      if (isRestrictedUser(authedUser)) return Response.json([]);
       return Response.json([...hiddenSids].map(([sid, info]) => ({ sid, ...info })));
     }
     if (url.pathname === "/api/check-existing" && req.method === "GET") {
@@ -5825,6 +5844,8 @@ return "ok"`;
       return Response.json({ ok: true });
     }
     if (url.pathname === "/api/archived-sessions") {
+      // Restricted-юзер не видит архивные сессии — это всегда чужие jsonl.
+      if (isRestrictedUser(authedUser)) return Response.json([]);
       // Все jsonl старше FRESH_MS, без живого pid → архив. Lazy-loaded по нажатию.
       // Кэш 30с чтобы не сканировать диск при каждом тыке.
       const ARCH_TTL = 30_000;
@@ -5910,6 +5931,8 @@ return "ok"`;
       return Response.json(result);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
+      // Restricted-юзер не может восстанавливать архивные сессии — это создание процесса.
+      if (isRestrictedUser(authedUser)) return Response.json({ error: "forbidden" }, { status: 403 });
       const body = await req.json().catch(() => ({})) as { sessionId?: string; cwd?: string; title?: string };
       const sid = String(body.sessionId ?? "").trim();
       const cwd = String(body.cwd ?? "").trim();

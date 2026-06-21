@@ -13,12 +13,25 @@ const AUTH_FILE = join(homedir(), ".cc-dashboard", "auth.json");
 type AuthUser = { login: string; hash: string; allowedSessionTitles?: string[] };
 type AuthConfig = { users: AuthUser[]; secret: string };
 
-// CLI флаг: --restrict "title1,title2,..." → создаёт пользователя только с доступом
-// к сессиям из whitelist (по custom-title). Без флага — admin (видит всё).
-function parseRestrictArg(): string[] | null {
-  const idx = process.argv.indexOf("--restrict");
+// CLI флаги для неинтерактивного использования:
+//   --add                       при существующем auth.json добавить юзера (по умолчанию интерактивный prompt)
+//   --reset                     при существующем auth.json сбросить всех (опасно)
+//   --login <login>             логин (без флага — интерактивный prompt)
+//   --password <password>       пароль (без флага — скрытый prompt)
+//   --restrict "title1,title2"  whitelist по custom-title; пусто/нет — admin
+//
+// Если все --login/--password переданы — скрипт работает полностью без TTY.
+function getFlag(name: string): string | null {
+  const idx = process.argv.indexOf(name);
   if (idx < 0) return null;
-  const v = process.argv[idx + 1];
+  return process.argv[idx + 1] ?? "";
+}
+function hasFlag(name: string): boolean {
+  return process.argv.includes(name);
+}
+function parseRestrictArg(): string[] | null {
+  const v = getFlag("--restrict");
+  if (v === null) return null;
   if (!v) return [];
   return v.split(",").map(s => s.trim()).filter(Boolean);
 }
@@ -68,7 +81,10 @@ try { existing = await Bun.file(AUTH_FILE).json(); } catch {}
 
 if (existing) {
   console.log(`Существующий auth.json найден. Текущие пользователи: ${existing.users.map(u => u.login).join(", ")}`);
-  const action = await prompt("Что делаем? (a)dd / (r)eset / (c)ancel: ");
+  let action: string;
+  if (hasFlag("--add")) action = "a";
+  else if (hasFlag("--reset")) action = "r";
+  else action = await prompt("Что делаем? (a)dd / (r)eset / (c)ancel: ");
   if (action === "c" || action === "") { console.log("Отмена."); process.exit(0); }
   if (action === "r") {
     existing = { users: [], secret: randomBytes(32).toString("hex") };
@@ -77,12 +93,16 @@ if (existing) {
   existing = { users: [], secret: randomBytes(32).toString("hex") };
 }
 
-const login = await prompt("Логин: ");
+const loginFlag = getFlag("--login");
+const passwordFlag = getFlag("--password");
+const login = loginFlag !== null ? loginFlag : await prompt("Логин: ");
 if (!login) { console.error("Логин пустой — отмена."); process.exit(1); }
-const password = await prompt("Пароль: ", true);
+const password = passwordFlag !== null ? passwordFlag : await prompt("Пароль: ", true);
 if (password.length < 6) { console.error("Пароль слишком короткий (минимум 6 символов)."); process.exit(1); }
-const confirm = await prompt("Повторите пароль: ", true);
-if (confirm !== password) { console.error("Пароли не совпадают."); process.exit(1); }
+if (passwordFlag === null) {
+  const confirm = await prompt("Повторите пароль: ", true);
+  if (confirm !== password) { console.error("Пароли не совпадают."); process.exit(1); }
+}
 
 const hash = await Bun.password.hash(password, { algorithm: "argon2id" });
 

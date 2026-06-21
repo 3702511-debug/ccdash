@@ -25,6 +25,55 @@ const log = (m: string) => console.log(`[setup-local] ${m}`);
 const ok  = (m: string) => console.log(`[setup-local] ✓ ${m}`);
 const die = (m: string): never => { console.error(`[setup-local] ✗ ${m}`); process.exit(1); };
 
+// === Safe rm: перенаправляет rm в системный trash ===
+// Страховка от случайного `rm -rf ~/.claude` и подобных аварий — файлы уходят
+// в Корзину Finder через /usr/bin/trash, можно восстановить. Идемпотентно
+// (повторные запуски не плодят дубли). Bypass для реального unlink:
+// `command rm`, `\rm`, или `/bin/rm`. См. RUNBOOK.md «Safe rm».
+async function installSafeRm() {
+  const MARKER = "# === Safe rm (cc-dashboard) ===";
+  const BLOCK = `
+${MARKER}
+# rm-wrapper: вместо unlink — отправка в Корзину через /usr/bin/trash.
+# Bypass: \\rm, /bin/rm, или \`command rm\`. Файлы с дефисом — после '--'.
+# Установлено cc-dashboard setup-local.ts. Чтобы отключить — удали этот блок.
+rm() {
+    local args=()
+    local in_args=0
+    for arg in "$@"; do
+        if [ "$in_args" = 1 ]; then args+=("$arg"); continue; fi
+        if [ "$arg" = "--" ]; then in_args=1; continue; fi
+        if [[ "$arg" == -* ]]; then continue; fi
+        args+=("$arg")
+    done
+    if [ \${#args[@]} -eq 0 ]; then echo "rm-safe: nothing to remove" >&2; return 1; fi
+    /usr/bin/trash "\${args[@]}"
+}
+`;
+
+  try {
+    if (!(await Bun.file("/usr/bin/trash").exists())) {
+      log("Safe rm: /usr/bin/trash отсутствует (macOS <14?) — пропускаю");
+      return;
+    }
+  } catch {
+    log("Safe rm: /usr/bin/trash недоступен — пропускаю");
+    return;
+  }
+
+  const profiles = [join(HOME, ".bash_profile"), join(HOME, ".zshrc")];
+  for (const path of profiles) {
+    let content = "";
+    try { content = await Bun.file(path).text(); } catch {}
+    if (content.includes(MARKER)) {
+      log(`Safe rm уже установлен в ${path.replace(HOME, "~")}`);
+      continue;
+    }
+    await Bun.write(path, content + BLOCK);
+    ok(`Safe rm установлен в ${path.replace(HOME, "~")}`);
+  }
+}
+
 // 0. Sanity
 if (process.platform !== "darwin") die("Только macOS (LaunchAgent специфичен для macOS).");
 // Bun.which() может вернуть ephemeral путь типа /private/tmp/bun-node-XXX/bun
@@ -246,6 +295,11 @@ process.stdin.pause();
 // После FDA нужно перезапустить launchd-bun, чтобы новые TCC права применились
 Bun.spawnSync(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/com.user.cc-dashboard`]);
 ok("LaunchAgent перезапущен — новый bun теперь с FDA");
+
+// Safe rm: ставим обёртку для rm в bash/zsh, перенаправляющую в Корзину.
+// Открой новый Terminal-таб (или source ~/.bash_profile / source ~/.zshrc),
+// чтобы изменения подхватились — старые табы продолжат работать со стандартным rm.
+await installSafeRm();
 
 console.log();
 console.log("====================================");

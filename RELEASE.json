@@ -1,10 +1,9 @@
 {
-  "version": "1.0.33",
-  "date": "2026-06-19",
+  "version": "1.0.34",
+  "date": "2026-06-21",
   "notes": [
-    "Per-user session whitelist. У юзера в auth.json появилось опциональное поле allowedSessionTitles. Если задан — он видит и работает только с сессиями этих custom-title, не может создавать новые. Если поле отсутствует или пустое — admin (видит всё, как раньше). Backwards-compatible: существующие юзеры продолжают работать без изменений.",
-    "setup-auth.ts: новый флаг --restrict 'title1,title2' для создания restricted-юзеров. Без флага задаётся интерактивный prompt с пустым значением по умолчанию (= admin).",
-    "Новый эндпоинт /api/me — возвращает { login, isRestricted, allowedSessionTitles }. UI читает его при загрузке и при isRestricted=true автоматически скрывает кнопку «+ Новая сессия» и разделы закрытых/архивных сессий.",
-    "Серверная защита: /api/sessions и /api/stream фильтруют snapshot по whitelist; единый guard перед routing блокирует /api/session/<sid>/* запросы к чужим сессиям (403); /api/session/new для restricted-юзеров возвращает 403."
+    "Per-user whitelist polish: restricted-юзер дополнительно не видит UI обновлений (archive-toggle, update-banner, update-btn) и не может вызвать admin-эндпоинты /api/find-by-name, /api/open-path, /api/check-existing, /api/update-apply, /api/update-info, /api/restore (403). /api/hidden-sessions и /api/archived-sessions возвращают пустой массив для restricted.",
+    "setup-auth.ts: неинтерактивные флаги --add, --reset, --login, --password — позволяют создавать/сбрасывать юзеров без TTY (для скриптов и автодеплоя).",
+    "Safe rm: setup-local.ts устанавливает rm-wrapper в ~/.bash_profile и ~/.zshrc, который отправляет файлы в Корзину Finder через /usr/bin/trash вместо unlink. Защищает от случайных аварий типа `rm -rf ~/.claude` — файлы можно восстановить из Корзины. Идемпотентно. Bypass — `command rm`, `\\rm`, или `/bin/rm`. См. RUNBOOK.md «Safe rm»."
   ]
 }
