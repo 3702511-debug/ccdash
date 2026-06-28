@@ -110,8 +110,8 @@ ok("dependencies");
 mkdirSync(RUNTIME, { recursive: true });
 mkdirSync(join(RUNTIME, "icons"), { recursive: true });
 
-// Copy code + deps + release info
-for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "RELEASE.json"]) {
+// Copy code + deps + release info + watchdog скрипты
+for (const f of ["server.ts", "package.json", "bun.lock", "setup-auth.ts", "RELEASE.json", "server-watchdog.sh", "tunnel-watchdog.sh"]) {
   const src = join(SRC, f);
   if (existsSync(src)) cpSync(src, join(RUNTIME, f));
 }
@@ -208,6 +208,57 @@ if (isInstalled) {
 const ld = Bun.spawnSync(["launchctl", "load", plistPath]);
 if (ld.exitCode === 0) ok(`LaunchAgent: ${plistPath}`);
 else die(`launchctl load упал: ${ld.stderr?.toString()}`);
+
+// 5b. Watchdog'и (server + tunnel) — автоматически реанимируют упавший сервер/туннель.
+// server-watchdog ставится всегда. tunnel-watchdog требует tunnel-config.json
+// (см. README.md «Tunnel watchdog») — без конфига он молча неактивен.
+async function installAgent(name: string, templateFile: string, subs: Record<string, string>) {
+  const tplPath = join(SRC, templateFile);
+  if (!existsSync(tplPath)) { log(`(${templateFile} нет в репо — пропускаю ${name})`); return; }
+  let xml = await Bun.file(tplPath).text();
+  for (const [k, v] of Object.entries(subs)) {
+    xml = xml.split(`{{${k}}}`).join(v);
+  }
+  const agentPath = join(HOME, "Library", "LaunchAgents", `${name}.plist`);
+  const wasInstalled = existsSync(agentPath);
+  await Bun.write(agentPath, xml);
+  if (wasInstalled) Bun.spawnSync(["launchctl", "unload", agentPath]);
+  const r = Bun.spawnSync(["launchctl", "load", agentPath]);
+  if (r.exitCode === 0) ok(`LaunchAgent: ${agentPath}`);
+  else log(`  launchctl load ${name}: ${r.stderr?.toString()?.slice(0, 200)}`);
+}
+
+await installAgent("com.user.cc-server-watchdog", "com.user.cc-server-watchdog.plist.template", {
+  RUNTIME,
+});
+
+// tunnel-watchdog требует ~/.cc-dashboard/tunnel-config.json
+// Формат:
+//   { "publicUrl": "https://<твой-домен>:8443/api/health",
+//     "vpsHost":   "root@<ip>",      // или user@host для kris-tunnel
+//     "tunnelPort": "18787",         // порт, который reverse-forward'ит autossh
+//     "sshKey":    "$HOME/.ssh/id_ed25519",
+//     "tunnelAgent": "$HOME/Library/LaunchAgents/com.user.cc-tunnel.plist" }
+const tunnelConfigPath = join(RUNTIME, "tunnel-config.json");
+if (existsSync(tunnelConfigPath)) {
+  try {
+    const cfg = await Bun.file(tunnelConfigPath).json();
+    const expand = (s: string) => s.replace(/^\$HOME/, HOME).replace(/^~/, HOME);
+    await installAgent("com.user.cc-watchdog", "com.user.cc-watchdog.plist.template", {
+      RUNTIME,
+      HOME,
+      PUBLIC_URL: cfg.publicUrl ?? "",
+      VPS_HOST: cfg.vpsHost ?? "",
+      TUNNEL_PORT: String(cfg.tunnelPort ?? ""),
+      SSH_KEY: expand(cfg.sshKey ?? join(HOME, ".ssh/id_ed25519")),
+      TUNNEL_AGENT: expand(cfg.tunnelAgent ?? join(HOME, "Library/LaunchAgents/com.user.cc-tunnel.plist")),
+    });
+  } catch (e) {
+    log(`  tunnel-config.json есть, но parse упал: ${e}`);
+  }
+} else {
+  log("(tunnel-watchdog: ~/.cc-dashboard/tunnel-config.json не найден — watchdog туннеля неактивен. См. README «Tunnel watchdog».)");
+}
 
 // 6. Создать главную сессию «CC Dash» если её ещё нет
 const mainSessionPath = join(RUNTIME, "main-session.json");

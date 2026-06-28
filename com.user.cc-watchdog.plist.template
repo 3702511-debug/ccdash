@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.cc-server-watchdog</string>
+    <string>com.user.cc-watchdog</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{RUNTIME}}/server-watchdog.sh</string>
+        <string>{{RUNTIME}}/tunnel-watchdog.sh</string>
     </array>
     <key>StartInterval</key>
     <integer>60</integer>
@@ -17,10 +17,22 @@
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PUBLIC_URL</key>
+        <string>{{PUBLIC_URL}}</string>
+        <key>VPS_HOST</key>
+        <string>{{VPS_HOST}}</string>
+        <key>TUNNEL_PORT</key>
+        <string>{{TUNNEL_PORT}}</string>
+        <key>SSH_KEY</key>
+        <string>{{SSH_KEY}}</string>
+        <key>TUNNEL_AGENT</key>
+        <string>{{TUNNEL_AGENT}}</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>{{RUNTIME}}/server-watchdog.out.log</string>
+    <string>{{RUNTIME}}/watchdog.out.log</string>
     <key>StandardErrorPath</key>
-    <string>{{RUNTIME}}/server-watchdog.err.log</string>
+    <string>{{RUNTIME}}/watchdog.err.log</string>
 </dict>
 </plist>
