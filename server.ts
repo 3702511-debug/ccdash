@@ -114,7 +114,7 @@ async function findClaudePids(): Promise<number[]> {
   return out.split("\n").map(s => parseInt(s.trim())).filter(n => Number.isFinite(n));
 }
 
-async function pidInfo(pid: number): Promise<{ cwd: string | null; tty: string | null; ppidComm: string }> {
+async function pidInfo(pid: number): Promise<{ cwd: string | null; tty: string | null; ppidComm: string; resumeSid: string }> {
   const lsofOut = await sh("lsof", ["-p", String(pid), "-Fn", "-a", "-d", "cwd"]);
   const cwd = lsofOut.match(/^n(.+)$/m)?.[1] ?? null;
 
@@ -127,7 +127,12 @@ async function pidInfo(pid: number): Promise<{ cwd: string | null; tty: string |
     const ppid = m[2];
     ppidComm = (await sh("ps", ["-o", "comm=", "-p", ppid])).trim();
   }
-  return { cwd, tty, ppidComm };
+  // `claude --resume <sid>` создаёт новый внутренний sessionId в ~/.claude/sessions/<pid>.json,
+  // но jsonl продолжает писаться под РЕЗЮМЕ-сидом. Без этого fallback'а pid не привязывается к jsonl,
+  // и сессия показывается в дашборде без tty (нельзя слать сообщения).
+  const cmdOut = await sh("ps", ["-o", "command=", "-p", String(pid)]).catch(() => "");
+  const resumeSid = cmdOut.match(/--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1] ?? "";
+  return { cwd, tty, ppidComm, resumeSid };
 }
 
 function relTime(iso: string): string {
@@ -457,6 +462,7 @@ interface PidInfo {
   isDesktop: boolean;
   used: boolean;
   sessionId: string;
+  resumeSid: string;  // sid из `claude --resume <sid>` — обходит баг 2.1.121 где metadata-sessionId ≠ jsonl-sid
   name: string;
   claudeStatus?: string;  // "idle" | "busy" — реальный статус от самого claude (из ~/.claude/sessions/<pid>.json)
   claudeStatusAt?: number;  // unix-ms updatedAt этого статуса
@@ -489,6 +495,7 @@ interface CachedPidInfo {
   tty: string | null;
   isDesktop: boolean;
   sessionId: string;
+  resumeSid: string;
   name: string;
   claudeStatus?: string;
   claudeStatusAt?: number;
@@ -540,7 +547,7 @@ async function gatherPidInfos(): Promise<PidInfo[]> {
       lastBusyAt = now;
     }
     if (cached && now - cached.lastProbedAt < PID_CACHE_TTL_MS) {
-      infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
+      infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, resumeSid: cached.resumeSid, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
       cached.claudeStatus = claudeStatus;
       cached.claudeStatusAt = claudeStatusAt;
       cached.lastBusyAt = lastBusyAt;
@@ -550,15 +557,16 @@ async function gatherPidInfos(): Promise<PidInfo[]> {
     const cwd = info.cwd || liveMeta?.cwd || "";
     if (!cwd) {
       if (cached) {
-        infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
+        infos.push({ pid, cwd: cached.cwd, tty: cached.tty, isDesktop: cached.isDesktop, used: false, sessionId: cached.sessionId, resumeSid: cached.resumeSid, name: cached.name, claudeStatus, claudeStatusAt, lastBusyAt });
       }
       return;
     }
     const isDesktop = /disclaimer/i.test(info.ppidComm) || info.tty === null;
     const sessionId = liveMeta?.sessionId ?? "";
+    const resumeSid = info.resumeSid;
     const name = liveMeta?.name ?? "";
-    pidInfoCache.set(pid, { cwd, tty: info.tty, isDesktop, sessionId, name, claudeStatus, claudeStatusAt, lastBusyAt, lastProbedAt: now });
-    infos.push({ pid, cwd, tty: info.tty, isDesktop, used: false, sessionId, name, claudeStatus, claudeStatusAt, lastBusyAt });
+    pidInfoCache.set(pid, { cwd, tty: info.tty, isDesktop, sessionId, resumeSid, name, claudeStatus, claudeStatusAt, lastBusyAt, lastProbedAt: now });
+    infos.push({ pid, cwd, tty: info.tty, isDesktop, used: false, sessionId, resumeSid, name, claudeStatus, claudeStatusAt, lastBusyAt });
   }));
   return infos;
 }
@@ -573,9 +581,19 @@ function bindPid(jsonlSessionId: string, jsonlCwd: string | null, pidInfos: PidI
       return withTty ?? matches[0];
     }
   }
+  // 1b. resume-sid match. claude --resume <sid> в 2.1.121 пишет в metadata НОВЫЙ sessionId,
+  // но jsonl продолжается под старым sid из --resume. Без этого fallback'а резюмированная сессия
+  // показывается без tty и в неё нельзя слать через дашборд.
+  if (jsonlSessionId) {
+    const matches = pidInfos.filter(p => !p.used && p.resumeSid === jsonlSessionId);
+    if (matches.length > 0) {
+      const withTty = matches.find(p => p.tty);
+      return withTty ?? matches[0];
+    }
+  }
   // 2. cwd fallback — но НЕ привязывать к pid'у, у которого известен другой sessionId.
   if (jsonlCwd) {
-    const matches = pidInfos.filter(p => !p.used && p.cwd === jsonlCwd && (!p.sessionId || p.sessionId === jsonlSessionId));
+    const matches = pidInfos.filter(p => !p.used && p.cwd === jsonlCwd && (!p.sessionId || p.sessionId === jsonlSessionId || p.resumeSid === jsonlSessionId));
     if (matches.length > 0) {
       const withTty = matches.find(p => p.tty);
       return withTty ?? matches[0];
@@ -600,8 +618,9 @@ function bindPidByTitle(
   for (const [tty, tabTitle] of tabTitles) {
     const tt = normalizeTitle(tabTitle);
     if (tt === target || tt.startsWith(target) || target.startsWith(tt)) {
-      // То же условие: не привязывать к pid'у с известным другим sessionId.
-      const pid = pidInfos.find(p => !p.used && p.tty === tty && (!p.sessionId || !jsonlSessionId || p.sessionId === jsonlSessionId));
+      // То же условие: не привязывать к pid'у с известным другим sessionId
+      // (учитываем resumeSid — см. bindPid 1b).
+      const pid = pidInfos.find(p => !p.used && p.tty === tty && (!p.sessionId || !jsonlSessionId || p.sessionId === jsonlSessionId || p.resumeSid === jsonlSessionId));
       if (pid) return pid;
     }
   }
