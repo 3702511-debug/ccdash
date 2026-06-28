@@ -1,10 +1,11 @@
 {
-  "version": "1.0.35",
+  "version": "1.0.36",
   "date": "2026-06-28",
   "notes": [
     "Per-user whitelist polish: restricted-юзер дополнительно не видит UI обновлений (archive-toggle, update-banner, update-btn) и не может вызвать admin-эндпоинты /api/find-by-name, /api/open-path, /api/check-existing, /api/update-apply, /api/update-info, /api/restore (403). /api/hidden-sessions и /api/archived-sessions возвращают пустой массив для restricted.",
     "setup-auth.ts: неинтерактивные флаги --add, --reset, --login, --password — позволяют создавать/сбрасывать юзеров без TTY (для скриптов и автодеплоя).",
     "Safe rm: setup-local.ts устанавливает rm-wrapper в ~/.bash_profile и ~/.zshrc, который отправляет файлы в Корзину Finder через /usr/bin/trash вместо unlink. Защищает от случайных аварий типа `rm -rf ~/.claude` — файлы можно восстановить из Корзины. Идемпотентно. Bypass — `command rm`, `\\rm`, или `/bin/rm`. См. RUNBOOK.md «Safe rm».",
-    "Watchdogs устанавливаются автоматически: setup-local.ts ставит LaunchAgent com.user.cc-server-watchdog (auto-recover упавшего bun) и com.user.cc-watchdog (auto-recover autossh-туннеля). Tunnel watchdog требует ~/.cc-dashboard/tunnel-config.json — пример: { \"publicUrl\": \"https://<домен>:8443/api/health\", \"vpsHost\": \"root@<ip>\", \"tunnelPort\": \"18787\", \"sshKey\": \"$HOME/.ssh/id_ed25519\", \"tunnelAgent\": \"$HOME/Library/LaunchAgents/com.user.cc-tunnel.plist\" }. Без конфига watchdog туннеля молча неактивен. Также plist-templates (server-watchdog + cc-watchdog) теперь используют {{RUNTIME}}/{{HOME}}-подстановку и не привязаны к /Users/ea/."
+    "Watchdogs устанавливаются автоматически: setup-local.ts ставит LaunchAgent com.user.cc-server-watchdog (auto-recover упавшего bun) и com.user.cc-watchdog (auto-recover autossh-туннеля). Tunnel watchdog требует ~/.cc-dashboard/tunnel-config.json — пример: { \"publicUrl\": \"https://<домен>:8443/api/health\", \"vpsHost\": \"root@<ip>\", \"tunnelPort\": \"18787\", \"sshKey\": \"$HOME/.ssh/id_ed25519\", \"tunnelAgent\": \"$HOME/Library/LaunchAgents/com.user.cc-tunnel.plist\" }. Без конфига watchdog туннеля молча неактивен. Также plist-templates (server-watchdog + cc-watchdog) теперь используют {{RUNTIME}}/{{HOME}}-подстановку и не привязаны к /Users/ea/.",
+    "Tunnel watchdog умнее: если публичный URL не отвечает, watchdog дополнительно проверяет туннель через SSH (curl localhost:$TUNNEL_PORT с VPS). Если туннель отдаёт 200 — recovery не делается (это VPN/DNS/firewall на стороне клиента режут outbound к VPS-IP, а сам туннель живой). Раньше watchdog рестартил живой туннель каждые 3 минуты при VPN-блокировке клиента."
   ]
 }

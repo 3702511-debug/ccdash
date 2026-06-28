@@ -26,7 +26,7 @@ FAIL_THRESHOLD=3
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-# health check
+# health check (public URL)
 http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$PUBLIC_URL" 2>/dev/null)
 
 if [ "$http_code" = "200" ]; then
@@ -37,11 +37,30 @@ if [ "$http_code" = "200" ]; then
   exit 0
 fi
 
-# fail
+# Публичный URL не отвечает. Проверим, реально ли туннель сломан, или это
+# клиентская проблема (VPN/DNS на Mac режет outbound к VPS-IP). Делаем SSH на VPS
+# и оттуда curl на локальный туннель-порт — если 200, туннель жив, recovery не нужен.
+tunnel_code=$(ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=no \
+  -i "$SSH_KEY" "$VPS" \
+  "curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://localhost:$TUNNEL_PORT/api/health" \
+  2>/dev/null)
+
+if [ "$tunnel_code" = "200" ]; then
+  # Туннель ЖИВ — Caddy с VPS получает 200 OK через наш autossh-forward.
+  # Значит публичный URL недоступен из-за местной сети (VPN/DNS/firewall),
+  # а не из-за упавшего туннеля. Не делаем recovery, сбрасываем счётчик.
+  if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" != "0" ]; then
+    echo "[$(ts)] публичный URL=$http_code, но туннель жив (SSH-check=200) — местная сеть, recovery не нужно" >> "$LOG"
+  fi
+  echo 0 > "$STATE_FILE"
+  exit 0
+fi
+
+# fail (и публика, и туннель не отвечают, либо SSH к VPS не прошёл)
 fails=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 fails=$((fails + 1))
 echo "$fails" > "$STATE_FILE"
-echo "[$(ts)] fail #$fails (http $http_code)" >> "$LOG"
+echo "[$(ts)] fail #$fails (public=$http_code tunnel=$tunnel_code)" >> "$LOG"
 
 if [ "$fails" -lt "$FAIL_THRESHOLD" ]; then
   exit 0
