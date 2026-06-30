@@ -1622,35 +1622,68 @@ async function getTerminalPid(): Promise<number | null> {
   return null;
 }
 
-// Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
-async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
-  if (!text) return { ok: false, error: "empty text" };
-  const termPid = await getTerminalPid();
-  if (!termPid) return { ok: false, error: "Terminal not found" };
-  const selectScript = `on run argv
-    set targetTty to "/dev/" & (item 1 of argv)
-    tell application "Terminal"
-      repeat with w in windows
+// Шаблон AppleScript для выбора tab по tty + verify-after-select (анти-race).
+// При 30+ окнах Terminal асинхронно переключает selected, и параллельные select'ы могут
+// заглушить друг друга → CGSendText/Key попадает в чужую вкладку. Verify-loop гарантирует
+// что после возврата 'ok' активный таб — именно targetTty. Возможные return values:
+//   "ok"           — таб выбран и активен
+//   "race"         — таб найден, но не удалось удержать активность (параллельный select)
+//   "tty not found" — tty вообще нет в Terminal
+const TERMINAL_SELECT_TAB_SCRIPT = `on run argv
+  set targetTty to "/dev/" & (item 1 of argv)
+  tell application "Terminal"
+    repeat with w in windows
+      try
+        set tabCount to 0
         try
+          set tabCount to count of tabs of w
+        end try
+        if tabCount > 0 then
           repeat with t in tabs of w
             try
               if (tty of t) is targetTty then
                 set selected of t to true
                 set frontmost of w to true
                 set index of w to 1
-                return "ok"
+                set attempts to 0
+                repeat
+                  delay 0.2
+                  set activeTty to ""
+                  try
+                    set activeTty to tty of (selected tab of w)
+                  end try
+                  if activeTty is targetTty then return "ok"
+                  set attempts to attempts + 1
+                  if attempts ≥ 2 then return "race"
+                  set selected of t to true
+                  set frontmost of w to true
+                end repeat
               end if
             end try
           end repeat
-        end try
-      end repeat
-    end tell
-    return "tty not found"
-  end run`;
-  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
-  if (sel.stdout.toString().trim() !== "ok") return { ok: false, error: "tab not found" };
+        end if
+      end try
+    end repeat
+  end tell
+  return "tty not found"
+end run`;
+
+// Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
+async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  if (!text) return { ok: false, error: "empty text" };
+  const termPid = await getTerminalPid();
+  if (!termPid) return { ok: false, error: "Terminal not found" };
+  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let selOut = sel.stdout.toString().trim();
+  if (selOut === "race") {
+    // Auto-retry один раз через 300мс — обычно к этому моменту параллельный select отработал
+    await new Promise(r => setTimeout(r, 300));
+    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    selOut = sel.stdout.toString().trim();
+  }
+  if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
+  if (selOut !== "ok") return { ok: false, error: "tab not found" };
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
-  await new Promise(r => setTimeout(r, 80));
   cgSendText(termPid, text);
   console.log(`[type-text ${tty}] len=${text.length} CG-direct OK pid=${termPid}`);
   return { ok: true };
@@ -1669,33 +1702,18 @@ async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "
   if (!termPid) return { ok: false, error: "Terminal not found" };
 
   // Set tab selected + bring its window to TERMINAL'S front (не системный фронт — Safari остаётся фронт),
-  // чтобы CGEvent шёл именно в этот таб, а не в чужой.
-  const selectScript = `on run argv
-    set targetTty to "/dev/" & (item 1 of argv)
-    tell application "Terminal"
-      repeat with w in windows
-        try
-          repeat with t in tabs of w
-            try
-              if (tty of t) is targetTty then
-                set selected of t to true
-                set frontmost of w to true
-                set index of w to 1
-                return "ok"
-              end if
-            end try
-          end repeat
-        end try
-      end repeat
-    end tell
-    return "tty not found"
-  end run`;
-  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
-  if (sel.stdout.toString().trim() !== "ok") return { ok: false, error: "tab not found" };
+  // чтобы CGEvent шёл именно в этот таб, а не в чужой. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
+  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let selOut = sel.stdout.toString().trim();
+  if (selOut === "race") {
+    await new Promise(r => setTimeout(r, 300));
+    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    selOut = sel.stdout.toString().trim();
+  }
+  if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
+  if (selOut !== "ok") return { ok: false, error: "tab not found" };
 
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
-  // Маленькая задержка чтобы Terminal успел переключить front-tab внутри своего стека
-  await new Promise(r => setTimeout(r, 80));
   cgSendKey(termPid, keyCode);
   console.log(`[send-raw-key ${tty}] key=${key} (code=${keyCode}) CG-direct OK pid=${termPid}`);
   return { ok: true };
@@ -1707,32 +1725,16 @@ async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: st
   const termPid = await getTerminalPid();
   if (!termPid) return { ok: false, error: "Terminal process not found" };
   // Шаг 1: AppleScript — БЕЗ `activate` Terminal'а, только выбираем нужную вкладку внутри Terminal.
-  // Это не переключает system focus.
-  const selectScript = `on run argv
-    set targetTty to "/dev/" & (item 1 of argv)
-    tell application "Terminal"
-      repeat with w in windows
-        try
-          repeat with t in tabs of w
-            try
-              if (tty of t) is targetTty then
-                set selected of t to true
-                set frontmost of w to true
-                set index of w to 1
-                return "ok"
-              end if
-            end try
-          end repeat
-        end try
-      end repeat
-    end tell
-    return "tty not found"
-  end run`;
-  const sel = Bun.spawnSync(["osascript", "-e", selectScript, "--", tty]);
-  const selOut = sel.stdout.toString().trim();
+  // Это не переключает system focus. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
+  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let selOut = sel.stdout.toString().trim();
+  if (selOut === "race") {
+    await new Promise(r => setTimeout(r, 300));
+    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    selOut = sel.stdout.toString().trim();
+  }
+  if (selOut === "race") return { ok: false, error: "race: параллельный ответ другому poll" };
   if (selOut !== "ok") return { ok: false, error: "tab " + tty + " not found in Terminal" };
-  // Маленькая задержка чтобы Terminal успел переключить front-tab
-  await new Promise(r => setTimeout(r, 80));
   // Шаг 2: грузим CG-FFI
   if (!loadCG()) return { ok: false, error: "CGEvent FFI failed to load" };
   // Шаг 3: посылаем клавиши через CGEventPostToPid → Terminal-процесс (без focus)
