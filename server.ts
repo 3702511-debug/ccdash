@@ -1175,6 +1175,13 @@ const APPLESCRIPT_BODY = `on run argv
         end repeat
         repeat with w in windows
           try
+          -- Skip "зомби-окна": если у окна нет tabs или = 0 — пропускаем сразу,
+          -- не пытаемся вычитать tty (это бросает ошибку и тратит iteration time).
+          set tabCount to 0
+          try
+            set tabCount to count of tabs of w
+          end try
+          if tabCount > 0 then
           repeat with t in tabs of w
             try
               if (tty of t) is targetTty then
@@ -1183,10 +1190,28 @@ const APPLESCRIPT_BODY = `on run argv
                   set frontmost of w to true
                   activate
                 else if actionArg is "send" then
-                  -- Make t the current tab inside Terminal (no activate → no OS focus jump),
-                  -- then do script targets it correctly via "in t".
+                  -- Race-condition guard: после set selected Terminal асинхронно переключает
+                  -- активный tab. Если параллельно идёт другой /send в другой tab — наш
+                  -- do script может попасть в чужую вкладку. Подтверждаем что активный
+                  -- tab именно наш ПЕРЕД do script. До 2 ретраев.
                   set selected of t to true
                   set frontmost of w to true
+                  set attempts to 0
+                  repeat
+                    delay 0.2
+                    set activeTty to ""
+                    try
+                      set activeTty to tty of (selected tab of w)
+                    end try
+                    if activeTty is targetTty then exit repeat
+                    set attempts to attempts + 1
+                    if attempts ≥ 2 then
+                      -- Не смогли удержать активность за 2 попытки — отказ (вместо отправки в чужой tab)
+                      return "race"
+                    end if
+                    set selected of t to true
+                    set frontmost of w to true
+                  end repeat
                   do script msgArg in t
                   -- Multi-line paste leaves claude REPL waiting; an extra empty Enter commits it.
                   delay 0.15
@@ -1196,6 +1221,7 @@ const APPLESCRIPT_BODY = `on run argv
               end if
             end try
           end repeat
+          end if
           end try
         end repeat
       end if
@@ -6389,7 +6415,17 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
         if (!enter.ok) return Response.json({ terminal: "Terminal", error: enter.error ?? "enter failed" }, { status: 500 });
         return Response.json({ terminal: "Terminal", pasteHint: true });
       }
-      const { result, stderr } = await controlTerminal(meta.tty, "send", text);
+      // Auto-retry на race: если две /send'а в РАЗНЫЕ tabs летят одновременно,
+      // AppleScript для одного из них может не успеть удержать активность tab'а — возвращает "race".
+      // Один retry с задержкой 300мс обычно достаточен (вторая /send уже отработала).
+      let { result, stderr } = await controlTerminal(meta.tty, "send", text);
+      if (result === "race") {
+        await new Promise(r => setTimeout(r, 300));
+        ({ result, stderr } = await controlTerminal(meta.tty, "send", text));
+      }
+      if (result === "race") {
+        return Response.json({ terminal: "race", error: `Не удалось удержать активность вкладки ttyS${meta.tty.replace(/^.*ttys/, "")} — два сообщения в разные чаты одновременно. Повтори отправку через секунду.` }, { status: 500 });
+      }
       if (result === "none") {
         return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто?` }, { status: 500 });
       }
