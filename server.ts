@@ -6425,9 +6425,12 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       }
       // Auto-retry на race: если две /send'а в РАЗНЫЕ tabs летят одновременно,
       // AppleScript для одного из них может не успеть удержать активность tab'а — возвращает "race".
-      // Один retry с задержкой 300мс обычно достаточен (вторая /send уже отработала).
+      // Один retry с задержкой 300мс обычно достаточен:
+      //  - "race" — параллельный /send удерживает активность tab'а, ждём чтобы отпустил
+      //  - "none" — AppleScript при 30+ окнах иногда не успевает добежать до нужного tty
+      //    и возвращает 'none' хотя tab физически жив. Повтор через 300мс обычно проходит.
       let { result, stderr } = await controlTerminal(meta.tty, "send", text);
-      if (result === "race") {
+      if (result === "race" || result === "none") {
         await new Promise(r => setTimeout(r, 300));
         ({ result, stderr } = await controlTerminal(meta.tty, "send", text));
       }
@@ -6435,7 +6438,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
         return Response.json({ terminal: "race", error: `Не удалось удержать активность вкладки ttyS${meta.tty.replace(/^.*ttys/, "")} — два сообщения в разные чаты одновременно. Повтори отправку через секунду.` }, { status: 500 });
       }
       if (result === "none") {
-        return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто?` }, { status: 500 });
+        return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто? Или у тебя >30 окон Terminal, закрой лишние.` }, { status: 500 });
       }
       if (stderr) {
         return Response.json({ terminal: result, error: stderr }, { status: 500 });
