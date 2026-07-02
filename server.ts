@@ -746,20 +746,26 @@ async function snapshot(): Promise<Session[]> {
   ]);
   // Также включаем jsonl каждого ЖИВОГО claude-процесса даже если файл не «свежий» (за пределами 24ч).
   // Иначе долго бездействующая, но запущенная сессия показывается как pid-XXXXX без истории.
+  // Пробуем ОБА — sessionId (текущий внутренний claude id) и resumeSid (sid из `claude --resume <sid>`,
+  // именно под ним пишется jsonl в 2.1.121). Без resumeSid резюмированные сессии проваливались:
+  // sessionId в metadata был `9df0744b`, а реальный jsonl под `6f8d2122` — файла не находилось.
   const knownPaths = new Set(freshJsonls.map(j => j.path));
   for (const p of pidInfos) {
-    if (!p.sessionId) continue;
+    const sids = [p.resumeSid, p.sessionId].filter(Boolean);
+    if (sids.length === 0) continue;
     try {
       const dirs = await readdir(PROJECTS_DIR);
-      for (const d of dirs) {
-        const candidate = join(PROJECTS_DIR, d, p.sessionId + ".jsonl");
-        if (knownPaths.has(candidate)) continue;
-        try {
-          const s = await stat(candidate);
-          freshJsonls.push({ path: candidate, mtime: s.mtimeMs });
-          knownPaths.add(candidate);
-          break;
-        } catch {}
+      outer: for (const d of dirs) {
+        for (const sid of sids) {
+          const candidate = join(PROJECTS_DIR, d, sid + ".jsonl");
+          if (knownPaths.has(candidate)) continue;
+          try {
+            const s = await stat(candidate);
+            freshJsonls.push({ path: candidate, mtime: s.mtimeMs });
+            knownPaths.add(candidate);
+            break outer;
+          } catch {}
+        }
       }
     } catch {}
   }
