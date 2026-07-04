@@ -2807,10 +2807,21 @@ function renderMd(text) {
     }
     return codeHtml;
   });
-  // 8. Restore markdown link placeholders
+  // 8. Restore markdown link placeholders. Если URL — локальный путь (~/, /Users/, /tmp/),
+  // рядом с кнопкой копирования добавляем «открыть в Finder» — как для inline-code с путём.
+  // Без этого markdown-ссылка вида [файл.pdf](/Users/.../file.pdf) не имеет open-in-Finder.
   text = text.replace(/\\x00ML(\\d+)\\x00/g, (_, i) => {
     const ml = mdLinks[+i];
-    return '<a href="' + ml.url + '" target="_blank" rel="noopener">' + ml.label + '</a><button class="link-copy" data-copy="' + encodeURIComponent(ml.url) + '" title="Скопировать ссылку">' + linkCopyIcon + '</button>';
+    // ml.url может быть URL-encoded (пробелы = %20). Декодируем для проверки и data-path.
+    let decodedUrl = ml.url;
+    try { decodedUrl = decodeURIComponent(ml.url); } catch {}
+    const isLocalPath = /^(~\\/|\\/Users\\/|\\/tmp\\/)/.test(decodedUrl);
+    const linkHtml = '<a href="' + ml.url + '" target="_blank" rel="noopener">' + ml.label + '</a>';
+    const copyBtn = '<button class="link-copy" data-copy="' + encodeURIComponent(ml.url) + '" title="Скопировать ссылку">' + linkCopyIcon + '</button>';
+    if (isLocalPath) {
+      return linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(decodedUrl) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+    }
+    return linkHtml + copyBtn;
   });
   // 4. Headings
   text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
