@@ -1237,16 +1237,16 @@ const APPLESCRIPT_BODY = `on run argv
   return "none"
 end run`;
 
+// cwdArg приходит УЖЕ shell-escaped (\ перед пробелами, кавычками, кириллицей передаётся as-is).
+// AppleScript `quoted form of` ломается на кириллице (macOS bug), поэтому квотирование делаем на Bun-стороне.
 const RESTORE_SCRIPT = `on run argv
-  set cwdArg to item 1 of argv
+  set cwdEscaped to item 1 of argv
   set sidArg to item 2 of argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
-  set cmd to "cd " & quoted form of cwdArg & " && claude --resume " & sidArg
-  -- Без activate — пользователь остаётся в дашборде/браузере, Terminal не вылезает.
+  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg
   tell application "Terminal"
     set newTab to do script cmd
-    -- Если есть title — после старта claude шлём /rename, чтобы сессия в дашборде сразу получила имя
     if titleArg is not "" then
       delay 8
       do script "/rename " & titleArg in newTab
@@ -1254,7 +1254,6 @@ const RESTORE_SCRIPT = `on run argv
       do script "" in newTab
     end if
   end tell
-  -- Скрыть Terminal сразу после запуска, чтобы окно не оставалось перед глазами.
   delay 0.5
   try
     tell application "System Events" to set visible of process "Terminal" to false
@@ -1262,8 +1261,44 @@ const RESTORE_SCRIPT = `on run argv
   return "ok"
 end run`;
 
+// Shell-escape строки для использования в bash (одинарные кавычки + literal escape).
+// Работает с любыми символами включая кириллицу — в отличие от AppleScript `quoted form of`.
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// Найти РЕАЛЬНЫЙ cwd для `claude --resume <sid>` — тот, чей slug совпадает с папкой jsonl.
+// Claude Code 2.1.121 quirk: `claude --resume` работает только из cwd совпадающего со slug jsonl,
+// slug фиксируется по cwd в момент ПЕРВОГО запуска сессии и не меняется при cd.
+// Если запустить из другого cwd — "No conversation found with session ID".
+async function findSlugCwdForSid(sid: string, fallbackCwd: string): Promise<string> {
+  try {
+    const projectsDir = join(homedir(), ".claude", "projects");
+    const dirs = await readdir(projectsDir);
+    for (const d of dirs) {
+      const candidate = join(projectsDir, d, sid + ".jsonl");
+      try {
+        await stat(candidate);
+        // Slug формат: слеши заменены на дефисы, не-ASCII на дефисы.
+        // Если дефисы нет — точное соответствие / . Иначе fallback (нельзя однозначно раскодировать).
+        const parts = d.replace(/^-/, "").split("-");
+        const candidateCwd = "/" + parts.join("/");
+        try {
+          const s = await stat(candidateCwd);
+          if (s.isDirectory()) return candidateCwd;
+        } catch {}
+      } catch {}
+    }
+  } catch {}
+  return fallbackCwd;
+}
+
 async function restoreSession(sessionId: string, cwd: string, title?: string): Promise<{ ok: boolean; error?: string }> {
-  const args = ["osascript", "-e", RESTORE_SCRIPT, "--", cwd, sessionId];
+  // Найти правильный slug-cwd для этого sid (jsonl может лежать не в browser'ном cwd).
+  const slugCwd = await findSlugCwdForSid(sessionId, cwd);
+  // Экранируем в bash (не через AppleScript `quoted form of` — оно ломается на кириллице).
+  const cwdEscaped = shellEscape(slugCwd);
+  const args = ["osascript", "-e", RESTORE_SCRIPT, "--", cwdEscaped, sessionId];
   if (title && title.trim()) args.push(title.trim());
   const proc = Bun.spawn(args, {
     stdout: "pipe",
@@ -1275,7 +1310,7 @@ async function restoreSession(sessionId: string, cwd: string, title?: string): P
   ]);
   await proc.exited;
   const stderr = err.trim();
-  console.log(`[restore sid=${sessionId.slice(0, 8)} cwd=${cwd}] out="${out.trim()}" stderr="${stderr}"`);
+  console.log(`[restore sid=${sessionId.slice(0, 8)} slug-cwd=${slugCwd}] out="${out.trim()}" stderr="${stderr}"`);
   if (stderr) return { ok: false, error: stderr };
   return { ok: true };
 }
@@ -2870,7 +2905,9 @@ function buildCardsHTML(sessions) {
       : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : ''}\${badge}</div>\`;
     const classes = [s.status, s.isSelf ? 'self' : '', panels.has(s.sessionId) ? 'open' : '', isDead ? 'dead' : '', s.hasOpenQuestion ? 'has-question' : ''].filter(Boolean).join(' ');
     const qBadge = s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : '';
-    const resumeBtn = isDead && !s.isMain ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}">▶ Resume</button>\` : '';
+    // Resume-кнопка для мёртвых сессий (в т.ч. главной — раньше исключалась, но если main упала после ребута,
+    // юзер должен её тоже поднять). data-title передаёт название чтобы после resume автоматом /rename.
+    const resumeBtn = isDead ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-title="\${escapeHtml(s.title || '')}">▶ Resume</button>\` : '';
     const hideBtn = s.isMain ? \`<span class="main-pin" title="Главная сессия дашборда — нельзя удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><line x1="12" y1="22" x2="12" y2="8"/><path d="M5 12H2a10 10 0 0 0 20 0h-3"/></svg></span>\` : \`<button class="hide-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-dead="\${isDead ? '1' : '0'}" title="Закрыть/удалить">X</button>\`;
     return \`
       <div class="card \${classes}" data-sid="\${s.sessionId}">
