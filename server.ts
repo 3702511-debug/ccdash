@@ -780,12 +780,12 @@ async function snapshot(): Promise<Session[]> {
       const fileName = j.path.split("/").pop() ?? "";
       const sessionId = fileName.replace(/\.jsonl$/, "");
       // Headless: Claude.app или sidechain. Пропускаем ТОЛЬКО если нет живого
-      // Terminal-`claude --resume` процесса с тем же sessionId — иначе resume через
-      // дашборд бы не работал. Desktop-launched процесс (parent=Claude.app, no tty) НЕ
-      // спасает jsonl от фильтра: такие сессии живут в самом Claude.app, слать в них
-      // через дашборд всё равно нельзя (нет tty), а карточка на дашборде — визуальный шум.
+      // `claude --resume` процесса с тем же sessionId — иначе resume через дашборд бы не работал.
+      // Живой Desktop-launched pid (parent=Claude.app, no tty) тоже «спасает» — так
+      // Claude.app-чат становится видим карточкой в основном списке (с бейджем desktop),
+      // и его можно перевести в Terminal через Resume.
       if (await isHeadlessOrSidechain(j.path)) {
-        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId && !p.isDesktop);
+        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId);
         if (!hasLivePid) continue;
       }
       const st = await readStatus(j.path);
@@ -5959,10 +5959,7 @@ return "ok"`;
       }
       const now = Date.now();
       const livePids = await gatherPidInfos();
-      // Живые Terminal-CLI sids исключаем (они в основном списке). Живые Desktop-launched
-      // (parent=Claude.app) наоборот включаем — их основной список скрывает (fix 785),
-      // а место им здесь, в архиве «Сессии из Claude.app».
-      const liveSids = new Set(livePids.filter(p => !p.isDesktop).map(p => p.sessionId).filter(Boolean));
+      const liveSids = new Set(livePids.map(p => p.sessionId).filter(Boolean));
       const arch: { sid: string; path: string; mtime: number }[] = [];
       try {
         const dirs = await readdir(PROJECTS_DIR);
@@ -5976,13 +5973,18 @@ return "ok"`;
             const filePath = join(projectDir, f);
             try {
               const st = await stat(filePath);
-              // FRESH_MS-фильтр применяем только к Terminal-CLI jsonl'ам: они попадают
-              // в основной список пока свежие. Desktop-стиль (queue-operation в первой
-              // записи) в основном списке не появляется в принципе, поэтому свежие/
-              // живые Desktop-jsonl'ы должны идти в архив без ожидания 24 часов —
-              // иначе только-что закрытый чат в Claude.app вообще негде взять.
-              const isDesktopStyle = await isHeadlessOrSidechain(filePath);
-              if (!isDesktopStyle && now - st.mtimeMs < FRESH_MS) continue;
+              // Считаем queue-operation вхождения — стандартный маркер Claude.app-взаимодействия.
+              // - qo == 0: чистая Terminal-CLI сессия. Применяем FRESH_MS чтобы не дублировать
+              //   основной список.
+              // - qo == 1..2: headless `claude --print` (run.py и подобные). Скрипт-запуск,
+              //   пропускаем — юзеру этот шум не нужен.
+              // - qo >= 3: сессия хоть раз касалась Claude.app (либо чат оттуда, либо peer-
+              //   protocol в Terminal-сессию). Показываем в архиве независимо от возраста.
+              const proc = Bun.spawn(["grep", "-c", '"queue-operation"', filePath], { stdout: "pipe", stderr: "ignore" });
+              const qoText = await new Response(proc.stdout).text();
+              const qo = parseInt(qoText.trim(), 10) || 0;
+              if (qo === 1 || qo === 2) continue;
+              if (qo === 0 && now - st.mtimeMs < FRESH_MS) continue;
               arch.push({ sid, path: filePath, mtime: st.mtimeMs });
             } catch {}
           }
@@ -6034,17 +6036,14 @@ return "ok"`;
           lastActivityRel: relTime(ts),
         };
       }));
-      // Отсекаем headless `claude --print`-запуски по preview: у скриптовых запусков
-      // (run.py и подобные) первое user-сообщение — фиксированный prompt-шаблон.
-      // Claude.app чаты обычно начинаются с произвольного текста пользователя.
-      // Title в jsonl не хранится ни у Desktop-, ни у большинства Terminal-CLI сессий
-      // (custom-title пишется только при явном /rename), так что по title фильтровать нельзя.
-      const looksLikeHeadless = (preview: string) =>
-        /^(Прочитай (изображение|HTML-файл|файл) @\/|Используя инструмент WebFetch|Analyze the image |Open the URL )/.test(preview);
-      const filtered = result.filter(s => s.title || !s.preview || !looksLikeHeadless(s.preview));
-      filtered.sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
-      (globalThis as any).__archCache = { at: Date.now(), data: filtered };
-      return Response.json(filtered);
+      // Сортировка: сначала с title (юзер их знает), потом без — внутри групп по mtime DESC.
+      result.sort((a, b) => {
+        const aN = a.title ? 0 : 1, bN = b.title ? 0 : 1;
+        if (aN !== bN) return aN - bN;
+        return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
+      });
+      (globalThis as any).__archCache = { at: Date.now(), data: result };
+      return Response.json(result);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       // Restricted-юзер не может восстанавливать архивные сессии — это создание процесса.
