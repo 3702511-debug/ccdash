@@ -5959,7 +5959,10 @@ return "ok"`;
       }
       const now = Date.now();
       const livePids = await gatherPidInfos();
-      const liveSids = new Set(livePids.map(p => p.sessionId).filter(Boolean));
+      // Живые Terminal-CLI sids исключаем (они в основном списке). Живые Desktop-launched
+      // (parent=Claude.app) наоборот включаем — их основной список скрывает (fix 785),
+      // а место им здесь, в архиве «Сессии из Claude.app».
+      const liveSids = new Set(livePids.filter(p => !p.isDesktop).map(p => p.sessionId).filter(Boolean));
       const arch: { sid: string; path: string; mtime: number }[] = [];
       try {
         const dirs = await readdir(PROJECTS_DIR);
@@ -5973,7 +5976,13 @@ return "ok"`;
             const filePath = join(projectDir, f);
             try {
               const st = await stat(filePath);
-              if (now - st.mtimeMs < FRESH_MS) continue;  // в основном списке
+              // FRESH_MS-фильтр применяем только к Terminal-CLI jsonl'ам: они попадают
+              // в основной список пока свежие. Desktop-стиль (queue-operation в первой
+              // записи) в основном списке не появляется в принципе, поэтому свежие/
+              // живые Desktop-jsonl'ы должны идти в архив без ожидания 24 часов —
+              // иначе только-что закрытый чат в Claude.app вообще негде взять.
+              const isDesktopStyle = await isHeadlessOrSidechain(filePath);
+              if (!isDesktopStyle && now - st.mtimeMs < FRESH_MS) continue;
               arch.push({ sid, path: filePath, mtime: st.mtimeMs });
             } catch {}
           }
@@ -6025,15 +6034,17 @@ return "ok"`;
           lastActivityRel: relTime(ts),
         };
       }));
-      // Отсекаем headless `claude --print`-запуски: они не имеют title (custom-title
-      // проставляется только людьми / дашбордом при resume). Это отсеивает шум типа
-      // 81 запусков от run.py в 06__Анализ цен, оставляя только реальные Claude.app-
-      // и Terminal-CLI чаты, которые пользователь назвал.
-      const named = result.filter(s => s.title);
-      // Sort: по mtime DESC (title у всех есть).
-      named.sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
-      (globalThis as any).__archCache = { at: Date.now(), data: named };
-      return Response.json(named);
+      // Отсекаем headless `claude --print`-запуски по preview: у скриптовых запусков
+      // (run.py и подобные) первое user-сообщение — фиксированный prompt-шаблон.
+      // Claude.app чаты обычно начинаются с произвольного текста пользователя.
+      // Title в jsonl не хранится ни у Desktop-, ни у большинства Terminal-CLI сессий
+      // (custom-title пишется только при явном /rename), так что по title фильтровать нельзя.
+      const looksLikeHeadless = (preview: string) =>
+        /^(Прочитай (изображение|HTML-файл|файл) @\/|Используя инструмент WebFetch|Analyze the image |Open the URL )/.test(preview);
+      const filtered = result.filter(s => s.title || !s.preview || !looksLikeHeadless(s.preview));
+      filtered.sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
+      (globalThis as any).__archCache = { at: Date.now(), data: filtered };
+      return Response.json(filtered);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       // Restricted-юзер не может восстанавливать архивные сессии — это создание процесса.
