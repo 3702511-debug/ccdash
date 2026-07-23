@@ -5970,6 +5970,10 @@ return "ok"`;
             if (!f.endsWith(".jsonl")) continue;
             const sid = f.replace(/\.jsonl$/, "");
             if (liveSids.has(sid)) continue;
+            // Скрытые пользователем sids не показываем ни в основном списке (см. snapshot),
+            // ни в архиве — иначе они возвращаются каждый раз, когда Claude.app пере-
+            // открывает связанный CLI-инстанс и jsonl становится «свежим» Desktop-стилем.
+            if (hiddenSids.has(sid)) continue;
             const filePath = join(projectDir, f);
             try {
               const st = await stat(filePath);
