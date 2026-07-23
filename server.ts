@@ -780,9 +780,12 @@ async function snapshot(): Promise<Session[]> {
       const fileName = j.path.split("/").pop() ?? "";
       const sessionId = fileName.replace(/\.jsonl$/, "");
       // Headless: Claude.app или sidechain. Пропускаем ТОЛЬКО если нет живого
-      // `claude --resume` процесса с тем же sessionId — иначе resume через дашборд бы не работал.
+      // Terminal-`claude --resume` процесса с тем же sessionId — иначе resume через
+      // дашборд бы не работал. Desktop-launched процесс (parent=Claude.app, no tty) НЕ
+      // спасает jsonl от фильтра: такие сессии живут в самом Claude.app, слать в них
+      // через дашборд всё равно нельзя (нет tty), а карточка на дашборде — визуальный шум.
       if (await isHeadlessOrSidechain(j.path)) {
-        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId);
+        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId && !p.isDesktop);
         if (!hasLivePid) continue;
       }
       const st = await readStatus(j.path);
@@ -6022,14 +6025,15 @@ return "ok"`;
           lastActivityRel: relTime(ts),
         };
       }));
-      // Sort: named first (с непустым title), потом unnamed; внутри групп — по mtime DESC.
-      result.sort((a, b) => {
-        const aN = a.title ? 0 : 1, bN = b.title ? 0 : 1;
-        if (aN !== bN) return aN - bN;
-        return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
-      });
-      (globalThis as any).__archCache = { at: Date.now(), data: result };
-      return Response.json(result);
+      // Отсекаем headless `claude --print`-запуски: они не имеют title (custom-title
+      // проставляется только людьми / дашбордом при resume). Это отсеивает шум типа
+      // 81 запусков от run.py в 06__Анализ цен, оставляя только реальные Claude.app-
+      // и Terminal-CLI чаты, которые пользователь назвал.
+      const named = result.filter(s => s.title);
+      // Sort: по mtime DESC (title у всех есть).
+      named.sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
+      (globalThis as any).__archCache = { at: Date.now(), data: named };
+      return Response.json(named);
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       // Restricted-юзер не может восстанавливать архивные сессии — это создание процесса.
