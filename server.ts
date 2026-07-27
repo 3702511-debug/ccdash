@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v116";
+const CACHE_VERSION = "cc-dashboard-v117";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2397,18 +2397,24 @@ const HTML = `<!doctype html>
   .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
   /* В режиме записи микрофон скрывается, появляется живой эквалайзер из 5 полосок */
   .mic-btn.recording { background: #d73a49; color: #fff; transform: scale(1.8); box-shadow: 0 0 18px rgba(215,58,73,0.7), 0 0 36px rgba(215,58,73,0.4); z-index: 5; }
-  /* В recording state показываем иконку микрофона с opacity-pulse (iOS Safari
-     стабильно рендерит opacity-анимации, в отличие от height-анимации на inline
-     span'ах внутри flex — те иногда не отрисовываются, красный круг оставался пустым). */
-  .mic-btn.recording .mic-icon { animation: mic-pulse 1s ease-in-out infinite alternate; }
-  .mic-btn .rec-waves { display: none; }  /* legacy, оставлено для обратной совместимости DOM */
+  .mic-btn.recording .mic-icon { display: none; }
+  .mic-btn .rec-waves { display: none; gap: 3px; align-items: center; justify-content: center; height: 22px; }
+  .mic-btn.recording .rec-waves { display: flex; }
+  /* Каждая палочка — фиксированной высоты 18px, анимируется через transform: scaleY
+     (не height!). Причина: iOS Safari нестабильно рендерит height-анимации на inline
+     span'ах внутри flex-контейнера (см. v1.0.62 changelog). Transform идёт через
+     GPU-compositor, а не через layout — работает надёжно. Визуально идентично старой
+     анимации (палочки прыгают 4px ↔ 18px). */
+  .mic-btn.recording .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform-origin: center; will-change: transform; animation: mic-eq 0.8s ease-in-out infinite; }
+  .mic-btn.recording .rec-waves span:nth-child(1) { animation-delay: 0s; }
+  .mic-btn.recording .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
+  .mic-btn.recording .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
+  .mic-btn.recording .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
+  .mic-btn.recording .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
+  /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Визуально эквивалент height 4px ↔ 18px. */
   @keyframes mic-eq {
-    0%, 100% { height: 4px; }
-    50% { height: 18px; }
-  }
-  @keyframes mic-pulse {
-    from { opacity: 0.55; transform: scale(0.9); }
-    to { opacity: 1; transform: scale(1.05); }
+    0%, 100% { transform: scaleY(0.22); }
+    50% { transform: scaleY(1); }
   }
   .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
