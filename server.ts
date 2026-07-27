@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v112";
+const CACHE_VERSION = "cc-dashboard-v113";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2436,11 +2436,11 @@ const HTML = `<!doctype html>
     .badge { font-size: 9px; }
 
     /* Active panel takes full viewport on mobile */
-    body { min-height: 100dvh; height: auto; max-height: none; overflow: visible; }
+    body { min-height: var(--vh, 100dvh); height: auto; max-height: none; overflow: visible; }
     #panels { flex-direction: column; gap: 0; min-height: auto; padding: 0; overflow: visible; flex: 1; }
     #panels:empty { padding: 20px; }
     #panels:empty::before { font-size: 12px; padding: 0; text-align: center; }
-    .panel { width: 100%; min-width: 0; max-height: none; height: calc(100dvh - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
+    .panel { width: 100%; min-width: 0; max-height: none; height: calc(var(--vh, 100dvh) - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
     .panel-header { padding: 10px 12px; gap: 6px; }
     .panel-header .title-main { font-size: 13px; }
     .panel-header .cwd-line { font-size: 10px; }
@@ -3453,26 +3453,30 @@ function updateChromeFsClass() {
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
 
-// iOS Safari PWA fix: при первой загрузке (и после возврата из background)
-// safe-area-inset-* и dvh рассчитываются некорректно — виден лишний зазор снизу
-// экрана. iOS пересчитывает только после первого touch/scroll. Триггерим scroll
-// программно — layout встаёт на место без действий пользователя.
-function nudgeViewport() {
-  const y = window.scrollY;
-  window.scrollTo(0, y + 1);
-  requestAnimationFrame(() => window.scrollTo(0, y));
+// iOS PWA classic "vh hack": dvh на iOS в standalone-режиме "застывает" на initial
+// значении при загрузке (например, 793px пока пользователь не сделает свайп; после
+// свайпа window.innerHeight становится 852, но dvh остаётся 793 навсегда). Реальную
+// высоту берём из visualViewport.height (или window.innerHeight fallback) и пишем в
+// --vh, которую CSS использует вместо dvh для body/.panel.
+function setVH() {
+  const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  document.documentElement.style.setProperty("--vh", h + "px");
 }
-window.addEventListener("load", () => setTimeout(nudgeViewport, 100), { once: true });
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) setTimeout(nudgeViewport, 100);
-});
+setVH();
+window.addEventListener("resize", setVH);
+window.addEventListener("orientationchange", setVH);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", setVH);
+  window.visualViewport.addEventListener("scroll", setVH);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) setVH(); });
+window.addEventListener("load", () => setTimeout(setVH, 100), { once: true });
+setInterval(setVH, 1000);  // safety net против iOS-race
 
-// DEBUG: panel показывающая live-размеры viewport и safe-area (для отладки iOS PWA
-// зазора снизу). Активируется через ?debug=vp в URL, localStorage.setItem('vpDebug','1'),
-// или АВТОМАТИЧЕСКИ в PWA-standalone (единственный способ увидеть цифры внутри PWA
-// без DevTools). Убрать после диагностики.
-const __vpDebugAuto = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches;
-if (new URLSearchParams(location.search).get("debug") === "vp" || localStorage.getItem("vpDebug") === "1" || __vpDebugAuto) {
+// DEBUG: panel показывающая live-размеры viewport и safe-area. Активируется только
+// через ?debug=vp в URL или localStorage.setItem('vpDebug','1'). Оставлено как
+// диагностический инструмент на будущее.
+if (new URLSearchParams(location.search).get("debug") === "vp" || localStorage.getItem("vpDebug") === "1") {
   const dbg = document.createElement("div");
   dbg.style.cssText = "position:fixed;top:70px;right:4px;z-index:9999;background:rgba(0,0,0,0.85);color:#0f0;font:10px/1.3 monospace;padding:6px 8px;border-radius:6px;pointer-events:none;text-align:right;";
   document.body.appendChild(dbg);

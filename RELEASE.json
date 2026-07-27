@@ -1,8 +1,8 @@
 {
-  "version": "1.0.58",
+  "version": "1.0.59",
   "date": "2026-07-27",
   "notes": [
-    "DEBUG-панель автоматически активируется в PWA-standalone режиме (временно, для диагностики viewport-зазора снизу iOS PWA). В Safari-браузере — только через ?debug=vp. Убрать после диагностики.",
+    "✅ ФИКС iOS PWA лишнего зазора снизу через JS-vhack. Диагностика через debug-панель показала точную причину: в iOS PWA standalone dvh «застывает» на initial значении при загрузке (793px), а window.innerHeight/visualViewport.height после первого touch/scroll становится 852. Все CSS-размеры считались через 100dvh → застревали на 793. Фикс: JS обновляет CSS-переменную --vh = visualViewport.height на resize, scroll, orientationchange, visibilitychange, и раз в секунду (safety net). Все 100dvh заменены на var(--vh, 100dvh). Auto debug-panel в PWA убрана (осталась активация через ?debug=vp).",
     "DEBUG-панель для отладки iOS PWA viewport-зазора (v1.0.57). Активируется через ?debug=vp в URL или localStorage.setItem('vpDebug','1'). Показывает live: window inner/screen/visualViewport размеры, safe-area-inset-top/bottom значения, dvh, scrollY, PWA-mode. Позволяет увидеть точную причину зазора снизу вместо угадывания.",
     "Мобильный фикс v7 v1.0.56: триггерим scroll программно при загрузке PWA и при возврате из background. Причина: iOS Safari в PWA-standalone не пересчитывает safe-area-inset-* и dvh пока пользователь не сделает первый touch/scroll — до этого виден лишний зазор снизу экрана во ВСЕХ view (главный список, меню, чат). Пользователь сообщал: 'если пальцем провести вниз, всё встаёт на свои места'. Ровно этот жест теперь делается программно через window.scrollTo(0, 1) → 0 на window.load и visibilitychange.",
     "Bump CACHE_VERSION v109 → v110 для доставки JS-фикса.",
