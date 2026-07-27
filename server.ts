@@ -1,7 +1,7 @@
 import { readdir, stat, mkdir, unlink } from "node:fs/promises";
 import { existsSync, unlinkSync, statSync, cpSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { randomBytes, createHmac } from "node:crypto";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
@@ -1274,6 +1274,14 @@ function shellEscape(s: string): string {
 // Claude Code 2.1.121 quirk: `claude --resume` работает только из cwd совпадающего со slug jsonl,
 // slug фиксируется по cwd в момент ПЕРВОГО запуска сессии и не меняется при cd.
 // Если запустить из другого cwd — "No conversation found with session ID".
+// Как Claude Code кодирует cwd → slug директории jsonl'а:
+// любой символ вне [a-zA-Z0-9] заменяется на '-'. Обратное декодирование НЕ однозначно
+// (для путей с кириллицей/подчёркиваниями). Правильный способ — искать cwd, чей
+// encode совпадает со slug, идя от hint-cwd вверх по дереву.
+function encodeSlug(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
 async function findSlugCwdForSid(sid: string, fallbackCwd: string): Promise<string> {
   try {
     const projectsDir = join(homedir(), ".claude", "projects");
@@ -1282,8 +1290,30 @@ async function findSlugCwdForSid(sid: string, fallbackCwd: string): Promise<stri
       const candidate = join(projectsDir, d, sid + ".jsonl");
       try {
         await stat(candidate);
-        // Slug формат: слеши заменены на дефисы, не-ASCII на дефисы.
-        // Если дефисы нет — точное соответствие / . Иначе fallback (нельзя однозначно раскодировать).
+        // 1) Идём от fallbackCwd вверх по parent'ам — ищем совпадение encode == slug.
+        for (let p = fallbackCwd; p && p !== "/"; p = dirname(p)) {
+          if (encodeSlug(p) === d) return p;
+        }
+        if (encodeSlug("/") === d) return "/";
+        // 2) Fallback #1: cwd из первой user-записи jsonl (там правильный cwd
+        //    оригинальной сессии, а не браузерный fallback).
+        try {
+          const head = await readHead(candidate, 32 * 1024);
+          for (const line of head.split("\n")) {
+            if (!line.trim().startsWith("{")) continue;
+            try {
+              const rec = JSON.parse(line);
+              const c = typeof rec.cwd === "string" ? rec.cwd : "";
+              if (c && c.startsWith("/")) {
+                for (let p = c; p && p !== "/"; p = dirname(p)) {
+                  if (encodeSlug(p) === d) return p;
+                }
+              }
+            } catch {}
+          }
+        } catch {}
+        // 3) Fallback #2: старая (сломанная для кириллицы) логика — split('-').
+        //    Оставляем как последнюю линию защиты; для чистых ASCII путей работает.
         const parts = d.replace(/^-/, "").split("-");
         const candidateCwd = "/" + parts.join("/");
         try {
