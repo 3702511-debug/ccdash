@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v110";
+const CACHE_VERSION = "cc-dashboard-v111";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3466,6 +3466,38 @@ window.addEventListener("load", () => setTimeout(nudgeViewport, 100), { once: tr
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) setTimeout(nudgeViewport, 100);
 });
+
+// DEBUG: panel показывающая live-размеры viewport и safe-area (для отладки iOS PWA
+// зазора снизу). Активируется через ?debug=vp в URL или localStorage.setItem('vpDebug','1').
+if (new URLSearchParams(location.search).get("debug") === "vp" || localStorage.getItem("vpDebug") === "1") {
+  const dbg = document.createElement("div");
+  dbg.style.cssText = "position:fixed;top:70px;right:4px;z-index:9999;background:rgba(0,0,0,0.85);color:#0f0;font:10px/1.3 monospace;padding:6px 8px;border-radius:6px;pointer-events:none;text-align:right;";
+  document.body.appendChild(dbg);
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;bottom:0;left:0;width:0;height:0;padding-bottom:env(safe-area-inset-bottom,0);padding-top:env(safe-area-inset-top,0);visibility:hidden;pointer-events:none;";
+  document.body.appendChild(probe);
+  const upd = () => {
+    const cs = getComputedStyle(probe);
+    const sat = parseFloat(cs.paddingTop) || 0;
+    const sab = parseFloat(cs.paddingBottom) || 0;
+    const vv = window.visualViewport;
+    dbg.innerHTML = "wnd " + window.innerWidth + "×" + window.innerHeight +
+      "<br>scr " + screen.width + "×" + screen.height +
+      "<br>vv " + (vv ? Math.round(vv.width) + "×" + Math.round(vv.height) + " oy=" + Math.round(vv.offsetTop) : "n/a") +
+      "<br>saT " + sat + " saB " + sab +
+      "<br>dvh " + document.documentElement.clientHeight +
+      "<br>scrY " + Math.round(window.scrollY) +
+      "<br>PWA " + (window.matchMedia("(display-mode: standalone)").matches ? "yes" : "no");
+  };
+  upd();
+  window.addEventListener("resize", upd);
+  window.addEventListener("scroll", upd);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", upd);
+    window.visualViewport.addEventListener("scroll", upd);
+  }
+  setInterval(upd, 500);
+}
 
 // iOS Safari fix: после закрытия клавиатуры env(safe-area-inset-bottom) обнуляется,
 // composer прижимается к нижнему краю без отступа над home indicator.

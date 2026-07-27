@@ -1,8 +1,9 @@
 {
-  "version": "1.0.56",
+  "version": "1.0.57",
   "date": "2026-07-27",
   "notes": [
-    "Мобильный фикс v7 (iOS PWA лишний зазор снизу): триггерим scroll программно при загрузке PWA и при возврате из background. Причина: iOS Safari в PWA-standalone не пересчитывает safe-area-inset-* и dvh пока пользователь не сделает первый touch/scroll — до этого виден лишний зазор снизу экрана во ВСЕХ view (главный список, меню, чат). Пользователь сообщал: 'если пальцем провести вниз, всё встаёт на свои места'. Ровно этот жест теперь делается программно через window.scrollTo(0, 1) → 0 на window.load и visibilitychange.",
+    "DEBUG-панель для отладки iOS PWA viewport-зазора. Активируется через ?debug=vp в URL или localStorage.setItem('vpDebug','1'). Показывает live: window inner/screen/visualViewport размеры, safe-area-inset-top/bottom значения, dvh, scrollY, PWA-mode. Позволяет увидеть точную причину зазора снизу вместо угадывания.",
+    "Мобильный фикс v7 v1.0.56: триггерим scroll программно при загрузке PWA и при возврате из background. Причина: iOS Safari в PWA-standalone не пересчитывает safe-area-inset-* и dvh пока пользователь не сделает первый touch/scroll — до этого виден лишний зазор снизу экрана во ВСЕХ view (главный список, меню, чат). Пользователь сообщал: 'если пальцем провести вниз, всё встаёт на свои места'. Ровно этот жест теперь делается программно через window.scrollTo(0, 1) → 0 на window.load и visibilitychange.",
     "Bump CACHE_VERSION v109 → v110 для доставки JS-фикса.",
     "Мобильный фикс v6 v1.0.55: задан html { background } — раньше html-элемент имел дефолтный белый фон, и в PWA-standalone режиме под home indicator area (safe-area-inset-bottom) просвечивал этот белый как светлая полоса снизу экрана. Полоса была видна во ВСЕХ view — в чате, в меню, в списке сессий — не только под composer'ом. Теперь html { background: #0d1117 } (тёмная тема) и `html:has(body.theme-light) { background: #f6f8fa }` (светлая) полностью красят viewport в цвет темы, включая площадь под home indicator.",
     "Bump CACHE_VERSION v108 → v109 для доставки нового CSS.",
