@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v118";
+const CACHE_VERSION = "cc-dashboard-v119";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3125,7 +3125,18 @@ async function refreshHiddenList() {
       container.innerHTML = '<div class="hidden-list-empty">Пусто</div>';
     } else {
       container.innerHTML = list.map(item => {
-        const label = item.title ? escapeHtml(item.title) : (item.cwd ? escapeHtml(item.cwd.split("/").pop()) : item.sid.slice(0,12) + '…');
+        // title приоритетнее; если пусто — preview первого user-сообщения (для
+        // безымянных Claude.app-чатов); если и preview нет — cwd basename + sid
+        // (чтобы хоть как-то отличить одну строку от другой).
+        let label;
+        if (item.title) {
+          label = escapeHtml(item.title);
+        } else if (item.preview) {
+          label = '<em style="color:#8b949e">' + escapeHtml(item.preview.slice(0, 50)) + (item.preview.length > 50 ? '…' : '') + '</em>';
+        } else {
+          const cwdBase = item.cwd ? escapeHtml(item.cwd.split("/").pop() || "?") : "?";
+          label = cwdBase + ' · <span style="color:#6e7681">' + item.sid.slice(0,8) + '</span>';
+        }
         return '<div class="hidden-list-item">' +
           '<span class="sid">' + label + '</span>' +
           '<button data-sid="' + item.sid + '" data-cwd="' + escapeHtml(item.cwd || "") + '">Восстановить</button>' +
@@ -5909,7 +5920,42 @@ end tell`;
     if (url.pathname === "/api/hidden-sessions") {
       // Restricted-юзер не видит закрытые/скрытые сессии — у него их быть не может.
       if (isRestrictedUser(authedUser)) return Response.json([]);
-      return Response.json([...hiddenSids].map(([sid, info]) => ({ sid, ...info })));
+      // Обогащаем: если info.title пусто, читаем custom-title из jsonl, плюс
+      // добавляем preview первого user-сообщения — иначе безымянные Claude.app-
+      // сессии в UI сливаются в кучу неотличимых строчек.
+      const enriched = await Promise.all([...hiddenSids].map(async ([sid, info]) => {
+        let title = info.title || "";
+        let preview = "";
+        try {
+          const dirs = await readdir(PROJECTS_DIR);
+          for (const d of dirs) {
+            const path = join(PROJECTS_DIR, d, sid + ".jsonl");
+            try {
+              await stat(path);
+              if (!title) title = (await getTitle(path)) || "";
+              const head = await readHead(path, 16 * 1024);
+              for (const line of head.split("\n")) {
+                if (!line.trim().startsWith("{")) continue;
+                try {
+                  const rec = JSON.parse(line);
+                  if (rec.type === "user") {
+                    const c = rec.message?.content;
+                    let txt = typeof c === "string" ? c : (Array.isArray(c) ? c.filter((x: any) => x?.type === "text").map((x: any) => x.text || "").join("") : "");
+                    txt = txt.trim();
+                    if (txt && !txt.startsWith("<command-") && !txt.startsWith("<system-reminder") && !txt.startsWith("/")) {
+                      preview = txt.replace(/\s+/g, " ").slice(0, 80);
+                      break;
+                    }
+                  }
+                } catch {}
+              }
+              break;
+            } catch {}
+          }
+        } catch {}
+        return { sid, ...info, title, preview };
+      }));
+      return Response.json(enriched);
     }
     if (url.pathname === "/api/check-existing" && req.method === "GET") {
       const cwdRaw = (url.searchParams.get("cwd") || "").trim();
