@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v109";
+const CACHE_VERSION = "cc-dashboard-v110";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3452,6 +3452,20 @@ function updateChromeFsClass() {
 }
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
+
+// iOS Safari PWA fix: при первой загрузке (и после возврата из background)
+// safe-area-inset-* и dvh рассчитываются некорректно — виден лишний зазор снизу
+// экрана. iOS пересчитывает только после первого touch/scroll. Триггерим scroll
+// программно — layout встаёт на место без действий пользователя.
+function nudgeViewport() {
+  const y = window.scrollY;
+  window.scrollTo(0, y + 1);
+  requestAnimationFrame(() => window.scrollTo(0, y));
+}
+window.addEventListener("load", () => setTimeout(nudgeViewport, 100), { once: true });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) setTimeout(nudgeViewport, 100);
+});
 
 // iOS Safari fix: после закрытия клавиатуры env(safe-area-inset-bottom) обнуляется,
 // composer прижимается к нижнему краю без отступа над home indicator.
