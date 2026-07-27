@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v111";
+const CACHE_VERSION = "cc-dashboard-v112";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3468,8 +3468,11 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // DEBUG: panel показывающая live-размеры viewport и safe-area (для отладки iOS PWA
-// зазора снизу). Активируется через ?debug=vp в URL или localStorage.setItem('vpDebug','1').
-if (new URLSearchParams(location.search).get("debug") === "vp" || localStorage.getItem("vpDebug") === "1") {
+// зазора снизу). Активируется через ?debug=vp в URL, localStorage.setItem('vpDebug','1'),
+// или АВТОМАТИЧЕСКИ в PWA-standalone (единственный способ увидеть цифры внутри PWA
+// без DevTools). Убрать после диагностики.
+const __vpDebugAuto = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches;
+if (new URLSearchParams(location.search).get("debug") === "vp" || localStorage.getItem("vpDebug") === "1" || __vpDebugAuto) {
   const dbg = document.createElement("div");
   dbg.style.cssText = "position:fixed;top:70px;right:4px;z-index:9999;background:rgba(0,0,0,0.85);color:#0f0;font:10px/1.3 monospace;padding:6px 8px;border-radius:6px;pointer-events:none;text-align:right;";
   document.body.appendChild(dbg);
