@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v108";
+const CACHE_VERSION = "cc-dashboard-v109";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -1949,6 +1949,10 @@ const HTML = `<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
+  /* html background = такой же как у body. Иначе на iOS PWA под home indicator area
+     (safe-area-inset-bottom) может просвечивать дефолтный белый html-фон — как
+     светлая полоса снизу экрана, видимая во всех view (не только composer). */
+  html { background: #0d1117; }
   body { font: 14px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 16px; height: 100vh; max-height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
   /* Chrome fullscreen on macOS slides a toolbar over the top ~60px when cursor hits the top edge.
      Detection via JS: body.chrome-fs is set when window covers the whole screen.
@@ -2465,6 +2469,7 @@ const HTML = `<!doctype html>
 
   /* === Light theme === */
   body.theme-light { color-scheme: light; background: #f6f8fa; color: #1f2328; }
+  html:has(body.theme-light) { background: #f6f8fa; }
   body.theme-light h1, body.theme-light .drawer-title, body.theme-light .welcome-btn { color: #0d1117; text-shadow: none; }
   body.theme-light h1 .blood { display: none; }
   body.theme-light .menu-btn { background: #eaeef2; color: #1f2328; }
