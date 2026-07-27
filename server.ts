@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v114";
+const CACHE_VERSION = "cc-dashboard-v115";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2436,11 +2436,11 @@ const HTML = `<!doctype html>
     .badge { font-size: 9px; }
 
     /* Active panel takes full viewport on mobile */
-    body { min-height: var(--vh, 100dvh); height: auto; max-height: none; overflow: visible; }
+    body { min-height: 100vh; height: auto; max-height: none; overflow: visible; }
     #panels { flex-direction: column; gap: 0; min-height: auto; padding: 0; overflow: visible; flex: 1; }
     #panels:empty { padding: 20px; }
     #panels:empty::before { font-size: 12px; padding: 0; text-align: center; }
-    .panel { width: 100%; min-width: 0; max-height: none; height: calc(var(--vh, 100dvh) - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
+    .panel { width: 100%; min-width: 0; max-height: none; height: calc(100vh - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
     .panel-header { padding: 10px 12px; gap: 6px; }
     .panel-header .title-main { font-size: 13px; }
     .panel-header .cwd-line { font-size: 10px; }
@@ -3453,25 +3453,9 @@ function updateChromeFsClass() {
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
 
-// iOS PWA classic "vh hack": dvh на iOS в standalone-режиме "застывает" на initial
-// значении при загрузке. Реальную высоту viewport'а берём из window.innerHeight
-// и пишем в --vh, которую CSS использует вместо dvh для body/.panel.
-//
-// ВАЖНО: используем window.innerHeight, а НЕ visualViewport.height, потому что
-// visualViewport.height УМЕНЬШАЕТСЯ при открытой клавиатуре → .panel схлопывается
-// → composer улетает вверх (регрессия из v1.0.49). window.innerHeight к клавиатуре
-// не чувствителен. Слушаем только window.resize (тоже не срабатывает на клавиатуре).
-function setVH() {
-  document.documentElement.style.setProperty("--vh", window.innerHeight + "px");
-}
-setVH();
-window.addEventListener("resize", setVH);
-window.addEventListener("orientationchange", setVH);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) setTimeout(setVH, 100); });
-window.addEventListener("load", () => setTimeout(setVH, 100), { once: true });
-// Пере-замер несколько раз в первые 2 сек — iOS растит innerHeight не мгновенно.
-setTimeout(setVH, 500);
-setTimeout(setVH, 1500);
+// iOS PWA vh: используем 100vh в CSS (в iOS всегда = full screen 852, не зависит
+// от touch). Динамический JS-подсчёт --vh (v1.0.59-60) не сработал: window.resize
+// не срабатывает при iOS-свайпе, --vh замерзал на initial 793.
 
 // DEBUG: panel показывающая live-размеры viewport и safe-area. Активируется только
 // через ?debug=vp в URL или localStorage.setItem('vpDebug','1'). Оставлено как
