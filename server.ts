@@ -2446,15 +2446,23 @@ const HTML = `<!doctype html>
     .feed { padding: 12px; }
     .msg { margin-bottom: 10px; }
     .msg .body { font-size: 13px; }
-    /* padding-bottom: сначала пробуем сохранённое JS'ом значение --safe-bottom
-       (измеряется при загрузке через probe div; iOS не может его сбросить после
-       клавиатуры). Fallback — прямое env() как раньше. */
-    .composer-wrap { padding-bottom: var(--safe-bottom, env(safe-area-inset-bottom, 0)); background: #0d1117; }
+    /* padding-bottom: max() гарантирует минимум 12px даже если iOS обнулит env()
+       после клавиатурного взаимодействия. Плюс сохранённое JS'ом значение
+       --safe-bottom как резерв. На устройствах с home indicator env() вернёт 34px
+       и max возьмёт его; на остальных получим 12px минимум. */
+    .composer-wrap { padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-bottom, 0px), 12px); background: #0d1117; }
     .composer { padding: 6px 8px; gap: 6px; align-items: flex-end; }
     .composer textarea { font-size: 16px; padding: 10px 18px; border-radius: 22px; height: 44px; min-height: 44px; line-height: 1.3; }  /* 16px prevents iOS zoom */
     .composer .send-btn, .attach-btn, .mic-btn { width: 44px; height: 44px; min-width: 44px; min-height: 44px; flex-shrink: 0; }
     .attach-btn svg, .mic-btn svg { width: 20px; height: 20px; }
     .composer .send-btn svg { width: 18px; height: 18px; }
+  }
+
+  /* PWA-standalone на iOS: гарантированный отступ под home indicator, даже
+     если iOS сбросил env(safe-area-inset-bottom). 24px — компромисс между
+     34px (полная площадь home indicator) и 12px базового min. */
+  @media (max-width: 768px) and (display-mode: standalone) {
+    .composer-wrap { padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-bottom, 0px), 24px) !important; }
   }
 
   /* === Tablet (769-1100px): one panel at a time, but with desktop typography === */
