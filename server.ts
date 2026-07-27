@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v113";
+const CACHE_VERSION = "cc-dashboard-v114";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3454,24 +3454,24 @@ window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
 
 // iOS PWA classic "vh hack": dvh на iOS в standalone-режиме "застывает" на initial
-// значении при загрузке (например, 793px пока пользователь не сделает свайп; после
-// свайпа window.innerHeight становится 852, но dvh остаётся 793 навсегда). Реальную
-// высоту берём из visualViewport.height (или window.innerHeight fallback) и пишем в
-// --vh, которую CSS использует вместо dvh для body/.panel.
+// значении при загрузке. Реальную высоту viewport'а берём из window.innerHeight
+// и пишем в --vh, которую CSS использует вместо dvh для body/.panel.
+//
+// ВАЖНО: используем window.innerHeight, а НЕ visualViewport.height, потому что
+// visualViewport.height УМЕНЬШАЕТСЯ при открытой клавиатуре → .panel схлопывается
+// → composer улетает вверх (регрессия из v1.0.49). window.innerHeight к клавиатуре
+// не чувствителен. Слушаем только window.resize (тоже не срабатывает на клавиатуре).
 function setVH() {
-  const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
-  document.documentElement.style.setProperty("--vh", h + "px");
+  document.documentElement.style.setProperty("--vh", window.innerHeight + "px");
 }
 setVH();
 window.addEventListener("resize", setVH);
 window.addEventListener("orientationchange", setVH);
-if (window.visualViewport) {
-  window.visualViewport.addEventListener("resize", setVH);
-  window.visualViewport.addEventListener("scroll", setVH);
-}
-document.addEventListener("visibilitychange", () => { if (!document.hidden) setVH(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) setTimeout(setVH, 100); });
 window.addEventListener("load", () => setTimeout(setVH, 100), { once: true });
-setInterval(setVH, 1000);  // safety net против iOS-race
+// Пере-замер несколько раз в первые 2 сек — iOS растит innerHeight не мгновенно.
+setTimeout(setVH, 500);
+setTimeout(setVH, 1500);
 
 // DEBUG: panel показывающая live-размеры viewport и safe-area. Активируется только
 // через ?debug=vp в URL или localStorage.setItem('vpDebug','1'). Оставлено как
