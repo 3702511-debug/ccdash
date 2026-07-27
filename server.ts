@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v117";
+const CACHE_VERSION = "cc-dashboard-v118";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2181,7 +2181,10 @@ const HTML = `<!doctype html>
   .welcome { display: none; flex: 1 1 0; min-height: 0; flex-direction: column; padding: 32px 24px 80px; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .welcome.show { display: flex; }
   .welcome-inner { width: 100%; margin: 0 auto; padding-bottom: env(safe-area-inset-bottom, 0px); flex-shrink: 0; }
-  .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; align-items: start; }
+  /* align-items: stretch (default для grid) — карточки одного row растягиваются на
+     одинаковую высоту. Раньше был align-items: start, из-за чего New Session кнопка
+     (без строки статуса) оказывалась ниже обычных карточек с 2 строками. */
+  .welcome-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 25vw, 320px), 1fr)); gap: 14px; }
   .welcome-grid .card { padding: 16px; }
   /* Архив сессий — раскрывалка под welcome-grid */
   .archive-block { margin-top: 28px; padding: 0 16px; }
