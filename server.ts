@@ -2446,13 +2446,15 @@ const HTML = `<!doctype html>
     .feed { padding: 12px; }
     .msg { margin-bottom: 10px; }
     .msg .body { font-size: 13px; }
-    .composer-wrap { padding-bottom: env(safe-area-inset-bottom, 0); background: #0d1117; }
+    /* padding-bottom: сначала пробуем сохранённое JS'ом значение --safe-bottom
+       (измеряется при загрузке через probe div; iOS не может его сбросить после
+       клавиатуры). Fallback — прямое env() как раньше. */
+    .composer-wrap { padding-bottom: var(--safe-bottom, env(safe-area-inset-bottom, 0)); background: #0d1117; }
     .composer { padding: 6px 8px; gap: 6px; align-items: flex-end; }
     .composer textarea { font-size: 16px; padding: 10px 18px; border-radius: 22px; height: 44px; min-height: 44px; line-height: 1.3; }  /* 16px prevents iOS zoom */
     .composer .send-btn, .attach-btn, .mic-btn { width: 44px; height: 44px; min-width: 44px; min-height: 44px; flex-shrink: 0; }
     .attach-btn svg, .mic-btn svg { width: 20px; height: 20px; }
     .composer .send-btn svg { width: 18px; height: 18px; }
-    .composer-wrap { padding-bottom: env(safe-area-inset-bottom, 0); }
   }
 
   /* === Tablet (769-1100px): one panel at a time, but with desktop typography === */
@@ -3446,17 +3448,28 @@ function updateChromeFsClass() {
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
 
-// iOS Safari fix: после закрытия клавиатуры composer прижимается к нижнему краю
-// без safe-area-inset-bottom. Причина — iOS не пересчитывает env(safe-area-inset-bottom)
-// когда клавиатура убирается, если scroll-позиция страницы сдвинута с 0.
-// Решение: после blur textarea делаем window.scrollTo(0, 0) — это триггерит iOS
-// пересчитать viewport-константы, не меняя layout визуально.
-document.addEventListener("focusout", (e) => {
-  if (e.target && e.target.tagName === "TEXTAREA") {
-    setTimeout(() => { window.scrollTo(0, 0); }, 100);
-    setTimeout(() => { window.scrollTo(0, 0); }, 400);
-  }
-}, true);
+// iOS Safari fix: после закрытия клавиатуры env(safe-area-inset-bottom) обнуляется,
+// composer прижимается к нижнему краю без отступа над home indicator.
+// Решение: одноразово измерить реальный safe-area-inset-bottom и сохранить в CSS
+// переменную --safe-bottom. Дальше эту переменную использует composer-wrap вместо
+// прямого env() — iOS не может её обнулить, потому что это уже статичное JS-значение.
+function measureSafeBottom() {
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;bottom:0;left:0;height:0;padding-bottom:env(safe-area-inset-bottom,0);visibility:hidden;pointer-events:none;";
+  document.body.appendChild(probe);
+  requestAnimationFrame(() => {
+    const pb = parseFloat(getComputedStyle(probe).paddingBottom) || 0;
+    if (pb > 0) {
+      // Запомнили только если реально что-то намерили. Иначе оставляем fallback env().
+      document.documentElement.style.setProperty("--safe-bottom", pb + "px");
+    }
+    probe.remove();
+  });
+}
+measureSafeBottom();
+// Повторно после первой interaction (иногда safe-area меряется 0 на самом старте
+// когда PWA ещё не полностью настроил viewport).
+window.addEventListener("load", () => setTimeout(measureSafeBottom, 500), { once: true });
 
 
 
