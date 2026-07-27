@@ -2436,11 +2436,7 @@ const HTML = `<!doctype html>
     #panels { flex-direction: column; gap: 0; min-height: auto; padding: 0; overflow: visible; flex: 1; }
     #panels:empty { padding: 20px; }
     #panels:empty::before { font-size: 12px; padding: 0; text-align: center; }
-    /* Высота панели — реальная visualViewport (--visual-vh) когда JS её выставил,
-       fallback на 100dvh. Это лечит iOS Safari баг «после закрытия клавиатуры
-       низ не возвращается»: dvh «застревает» на укоренённой высоте, а --visual-vh
-       обновляется на visualViewport events + после blur textarea. */
-    .panel { width: 100%; min-width: 0; max-height: none; height: calc(var(--visual-vh, 100dvh) - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
+    .panel { width: 100%; min-width: 0; max-height: none; height: calc(100dvh - 56px - env(safe-area-inset-top, 0)); flex: 0 0 auto; border-radius: 0; border: 0; }
     .panel-header { padding: 10px 12px; gap: 6px; }
     .panel-header .title-main { font-size: 13px; }
     .panel-header .cwd-line { font-size: 10px; }
@@ -3450,26 +3446,17 @@ function updateChromeFsClass() {
 window.addEventListener("resize", updateChromeFsClass);
 updateChromeFsClass();
 
-// iOS Safari fix: после закрытия клавиатуры 100dvh не пересчитывается обратно —
-// панель остаётся высотой «клавиатура была открыта», composer прижимается ниже нормы
-// (нет отступа safe-area-inset-bottom). Обновляем --visual-vh на visualViewport events
-// и на blur textarea для гарантированного форс-рефлоу.
-if (window.visualViewport) {
-  const updateVisualVh = () => {
-    document.documentElement.style.setProperty("--visual-vh", window.visualViewport.height + "px");
-  };
-  window.visualViewport.addEventListener("resize", updateVisualVh);
-  window.visualViewport.addEventListener("scroll", updateVisualVh);
-  updateVisualVh();
-  // На blur textarea (клавиатура закрывается) forced-reflow даёт браузеру повод
-  // пересчитать layout ещё раз через 100ms, когда клавиатура точно уехала.
-  document.addEventListener("focusout", (e) => {
-    if (e.target && e.target.tagName === "TEXTAREA") {
-      setTimeout(updateVisualVh, 100);
-      setTimeout(updateVisualVh, 400);
-    }
-  }, true);
-}
+// iOS Safari fix: после закрытия клавиатуры composer прижимается к нижнему краю
+// без safe-area-inset-bottom. Причина — iOS не пересчитывает env(safe-area-inset-bottom)
+// когда клавиатура убирается, если scroll-позиция страницы сдвинута с 0.
+// Решение: после blur textarea делаем window.scrollTo(0, 0) — это триггерит iOS
+// пересчитать viewport-константы, не меняя layout визуально.
+document.addEventListener("focusout", (e) => {
+  if (e.target && e.target.tagName === "TEXTAREA") {
+    setTimeout(() => { window.scrollTo(0, 0); }, 100);
+    setTimeout(() => { window.scrollTo(0, 0); }, 400);
+  }
+}, true);
 
 
 
