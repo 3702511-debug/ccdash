@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v120";
+const CACHE_VERSION = "cc-dashboard-v121";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2399,26 +2399,33 @@ const HTML = `<!doctype html>
   .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
   .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
   /* В режиме записи микрофон скрывается, появляется живой эквалайзер из 5 полосок */
-  .mic-btn.recording { background: #d73a49; color: #fff; transform: scale(1.8); box-shadow: 0 0 18px rgba(215,58,73,0.7), 0 0 36px rgba(215,58,73,0.4); z-index: 5; isolation: isolate; }
+  /* Recording state: убран transform: scale(1.8) — вложенные transform (scale на
+     родителе + scaleY на child span'ах waves) ломают composite-layer на iOS Safari,
+     child'ы не рисуются. Вместо scale используем pulsing box-shadow ring — визуально
+     кнопка «выделяется» и «дышит», физически остаётся 44×44, waves внутри спокойно
+     помещаются без вложенного transform. */
+  .mic-btn.recording { background: #d73a49; color: #fff; z-index: 5; animation: mic-glow 1.2s ease-in-out infinite; }
   .mic-btn.recording .mic-icon { display: none; }
   .mic-btn .rec-waves { display: none; gap: 3px; align-items: center; justify-content: center; height: 22px; }
   .mic-btn.recording .rec-waves { display: flex; }
   /* Каждая палочка — фиксированной высоты 18px, анимируется через transform: scaleY.
-     translate3d(0,0,0) форсирует iOS Safari создать отдельный composite-layer под
-     каждый span — иначе вложенный transform (родитель scale 1.8 + child scaleY)
-     ломается на iOS и spans не рисуются вообще (v1.0.63/65 фикс не помог). */
-  .mic-btn.recording .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform: translate3d(0,0,0) scaleY(1); transform-origin: center; will-change: transform; backface-visibility: hidden; -webkit-backface-visibility: hidden; animation: mic-eq 0.8s ease-in-out infinite; }
+     Родительский .mic-btn.recording больше НЕ имеет transform (см. v1.0.67 changelog) —
+     значит вложенных transform-каскадов нет, iOS Safari рендерит spans стабильно. */
+  .mic-btn.recording .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform-origin: center; will-change: transform; animation: mic-eq 0.8s ease-in-out infinite; }
   .mic-btn.recording .rec-waves span:nth-child(1) { animation-delay: 0s; }
   .mic-btn.recording .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
   .mic-btn.recording .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
   .mic-btn.recording .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
   .mic-btn.recording .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
-  /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Visualsly эквивалент height 4px ↔ 18px.
-     translate3d(0,0,0) сохраняем в каждом keyframe — иначе iOS теряет composite-layer
-     и анимация перестаёт работать. */
+  /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Визуально эквивалент height 4px ↔ 18px. */
   @keyframes mic-eq {
-    0%, 100% { transform: translate3d(0,0,0) scaleY(0.22); }
-    50% { transform: translate3d(0,0,0) scaleY(1); }
+    0%, 100% { transform: scaleY(0.22); }
+    50% { transform: scaleY(1); }
+  }
+  /* Pulsing ring вокруг recording-кнопки — визуально «дышит» и выделяется, без transform на родителе. */
+  @keyframes mic-glow {
+    0%, 100% { box-shadow: 0 0 0 6px rgba(215,58,73,0.28), 0 0 0 14px rgba(215,58,73,0.1), 0 0 20px rgba(215,58,73,0.5); }
+    50% { box-shadow: 0 0 0 10px rgba(215,58,73,0.4), 0 0 0 22px rgba(215,58,73,0.15), 0 0 32px rgba(215,58,73,0.7); }
   }
   .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
@@ -2565,7 +2572,7 @@ const HTML = `<!doctype html>
   body.theme-light .attach-btn:hover, body.theme-light .mic-btn:hover { background: #d0d7de; }
   /* Светлая тема при записи — фон чисто красный (как в тёмной), белые полоски эквалайзера контрастны.
      Specificity-фикс: body.theme-light .mic-btn (0,2,1) перебивает .mic-btn.recording (0,2,0), поэтому нужен явный override. */
-  body.theme-light .mic-btn.recording { background: #d73a49; color: #fff; box-shadow: 0 0 18px rgba(215,58,73,0.7), 0 0 36px rgba(215,58,73,0.4); }
+  body.theme-light .mic-btn.recording { background: #d73a49; color: #fff; }  /* box-shadow задаёт keyframes mic-glow */
   body.theme-light .send-btn { background: #0969da; }
   body.theme-light input { background: #ffffff; border-color: #d0d7de; color: #1f2328; }
   body.theme-light input::placeholder { color: #6e7681; }
