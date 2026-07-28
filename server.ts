@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v122";
+const CACHE_VERSION = "cc-dashboard-v123";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2408,14 +2408,15 @@ const HTML = `<!doctype html>
   .mic-btn.recording .mic-icon { opacity: 0; }
   .mic-btn .rec-waves { position: absolute; inset: 0; display: flex; gap: 3px; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
   .mic-btn.recording .rec-waves { opacity: 1; }
-  /* Каждая палочка — фиксированной высоты 18px, animation работает всегда (не только
-     при recording), а видимость управляется через opacity родителя. */
-  .mic-btn .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform-origin: center; will-change: transform; animation: mic-eq 0.8s ease-in-out infinite; }
-  .mic-btn .rec-waves span:nth-child(1) { animation-delay: 0s; }
-  .mic-btn .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
-  .mic-btn .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
-  .mic-btn .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
-  .mic-btn .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
+  /* DEBUG v1.0.69: убрал animation, span'ы статичные разной высоты (4/10/14/10/4).
+     Проверяем — если waves отображаются, значит iOS не может обработать animation;
+     если пусты — значит проблема в самой отрисовке span'ов и надо переходить на SVG. */
+  .mic-btn .rec-waves span { display: block; width: 4px; background: #fff; border-radius: 2px; box-shadow: 0 0 6px rgba(255,255,255,0.6); flex-shrink: 0; }
+  .mic-btn .rec-waves span:nth-child(1) { height: 6px; }
+  .mic-btn .rec-waves span:nth-child(2) { height: 12px; }
+  .mic-btn .rec-waves span:nth-child(3) { height: 18px; }
+  .mic-btn .rec-waves span:nth-child(4) { height: 12px; }
+  .mic-btn .rec-waves span:nth-child(5) { height: 6px; }
   /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Визуально эквивалент height 4px ↔ 18px. */
   @keyframes mic-eq {
     0%, 100% { transform: scaleY(0.22); }
