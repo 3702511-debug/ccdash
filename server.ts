@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v121";
+const CACHE_VERSION = "cc-dashboard-v122";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2399,24 +2399,23 @@ const HTML = `<!doctype html>
   .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
   .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
   /* В режиме записи микрофон скрывается, появляется живой эквалайзер из 5 полосок */
-  /* Recording state: убран transform: scale(1.8) — вложенные transform (scale на
-     родителе + scaleY на child span'ах waves) ломают composite-layer на iOS Safari,
-     child'ы не рисуются. Вместо scale используем pulsing box-shadow ring — визуально
-     кнопка «выделяется» и «дышит», физически остаётся 44×44, waves внутри спокойно
-     помещаются без вложенного transform. */
+  /* Recording state: pulsing box-shadow ring + waves-overlay. Waves ВСЕГДА в DOM
+     через position:absolute overlay с opacity 0/1 — раньше делали через display:none→flex,
+     iOS Safari терял span'ы при этом переходе (v1.0.62-67 не помогли). Absolute overlay
+     + opacity fade — переход только видимости, DOM элементы стабильны. */
   .mic-btn.recording { background: #d73a49; color: #fff; z-index: 5; animation: mic-glow 1.2s ease-in-out infinite; }
-  .mic-btn.recording .mic-icon { display: none; }
-  .mic-btn .rec-waves { display: none; gap: 3px; align-items: center; justify-content: center; height: 22px; }
-  .mic-btn.recording .rec-waves { display: flex; }
-  /* Каждая палочка — фиксированной высоты 18px, анимируется через transform: scaleY.
-     Родительский .mic-btn.recording больше НЕ имеет transform (см. v1.0.67 changelog) —
-     значит вложенных transform-каскадов нет, iOS Safari рендерит spans стабильно. */
-  .mic-btn.recording .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform-origin: center; will-change: transform; animation: mic-eq 0.8s ease-in-out infinite; }
-  .mic-btn.recording .rec-waves span:nth-child(1) { animation-delay: 0s; }
-  .mic-btn.recording .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
-  .mic-btn.recording .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
-  .mic-btn.recording .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
-  .mic-btn.recording .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
+  .mic-btn .mic-icon { transition: opacity 0.15s; }
+  .mic-btn.recording .mic-icon { opacity: 0; }
+  .mic-btn .rec-waves { position: absolute; inset: 0; display: flex; gap: 3px; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+  .mic-btn.recording .rec-waves { opacity: 1; }
+  /* Каждая палочка — фиксированной высоты 18px, animation работает всегда (не только
+     при recording), а видимость управляется через opacity родителя. */
+  .mic-btn .rec-waves span { display: block; width: 3px; background: #fff; border-radius: 2px; height: 18px; box-shadow: 0 0 6px rgba(255,255,255,0.6); transform-origin: center; will-change: transform; animation: mic-eq 0.8s ease-in-out infinite; }
+  .mic-btn .rec-waves span:nth-child(1) { animation-delay: 0s; }
+  .mic-btn .rec-waves span:nth-child(2) { animation-delay: -0.6s; }
+  .mic-btn .rec-waves span:nth-child(3) { animation-delay: -0.3s; }
+  .mic-btn .rec-waves span:nth-child(4) { animation-delay: -0.5s; }
+  .mic-btn .rec-waves span:nth-child(5) { animation-delay: -0.2s; }
   /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Визуально эквивалент height 4px ↔ 18px. */
   @keyframes mic-eq {
     0%, 100% { transform: scaleY(0.22); }
