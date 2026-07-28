@@ -1874,7 +1874,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v123";
+const CACHE_VERSION = "cc-dashboard-v124";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2396,32 +2396,20 @@ const HTML = `<!doctype html>
   .composer { padding: 8px 10px; display: flex; gap: 8px; align-items: flex-end; }
   .attach-btn, .mic-btn { background: #21262d; border: 0; color: #c9d1d9; padding: 0; border-radius: 50%; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; min-width: 40px; flex-shrink: 0; }
   .attach-btn:hover, .mic-btn:hover { background: #30363d; color: white; }
-  .attach-btn svg, .mic-btn svg { width: 18px; height: 18px; display: block; }
+  .attach-btn svg, .mic-btn > svg.mic-icon { width: 18px; height: 18px; display: block; }
   .mic-btn { position: relative; transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s; transform-origin: center right; }
-  /* В режиме записи микрофон скрывается, появляется живой эквалайзер из 5 полосок */
-  /* Recording state: pulsing box-shadow ring + waves-overlay. Waves ВСЕГДА в DOM
-     через position:absolute overlay с opacity 0/1 — раньше делали через display:none→flex,
-     iOS Safari терял span'ы при этом переходе (v1.0.62-67 не помогли). Absolute overlay
-     + opacity fade — переход только видимости, DOM элементы стабильны. */
+  /* v1.0.70: waves теперь inline-SVG с SMIL <animate> внутри — HTML span'ы внутри
+     <button> на iOS Safari не рендерились ни в flex-layout, ни как absolute-overlay,
+     ни без анимации (проверено v1.0.62-69). SVG rect + SMIL идут через отдельный
+     rendering pipeline и стабильно работают в iOS PWA. */
   .mic-btn.recording { background: #d73a49; color: #fff; z-index: 5; animation: mic-glow 1.2s ease-in-out infinite; }
   .mic-btn .mic-icon { transition: opacity 0.15s; }
   .mic-btn.recording .mic-icon { opacity: 0; }
-  .mic-btn .rec-waves { position: absolute; inset: 0; display: flex; gap: 3px; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
-  .mic-btn.recording .rec-waves { opacity: 1; }
-  /* DEBUG v1.0.69: убрал animation, span'ы статичные разной высоты (4/10/14/10/4).
-     Проверяем — если waves отображаются, значит iOS не может обработать animation;
-     если пусты — значит проблема в самой отрисовке span'ов и надо переходить на SVG. */
-  .mic-btn .rec-waves span { display: block; width: 4px; background: #fff; border-radius: 2px; box-shadow: 0 0 6px rgba(255,255,255,0.6); flex-shrink: 0; }
-  .mic-btn .rec-waves span:nth-child(1) { height: 6px; }
-  .mic-btn .rec-waves span:nth-child(2) { height: 12px; }
-  .mic-btn .rec-waves span:nth-child(3) { height: 18px; }
-  .mic-btn .rec-waves span:nth-child(4) { height: 12px; }
-  .mic-btn .rec-waves span:nth-child(5) { height: 6px; }
-  /* scaleY 0.22 = 18px * 0.22 ≈ 4px; scaleY 1 = 18px. Визуально эквивалент height 4px ↔ 18px. */
-  @keyframes mic-eq {
-    0%, 100% { transform: scaleY(0.22); }
-    50% { transform: scaleY(1); }
-  }
+  .mic-btn svg.rec-waves { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 60%; height: 55%; opacity: 0; pointer-events: none; transition: opacity 0.15s; display: block; overflow: visible; }
+  .mic-btn.recording svg.rec-waves { opacity: 1; }
+  .mic-btn svg.mic-spin { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 55%; height: 55%; opacity: 0; pointer-events: none; transition: opacity 0.15s; display: block; }
+  .mic-btn.transcribing svg.mic-spin { opacity: 1; animation: spin 1s linear infinite; }
+  .mic-btn.transcribing svg.mic-icon { opacity: 0; }
   /* Pulsing ring вокруг recording-кнопки — визуально «дышит» и выделяется, без transform на родителе. */
   @keyframes mic-glow {
     0%, 100% { box-shadow: 0 0 0 6px rgba(215,58,73,0.28), 0 0 0 14px rgba(215,58,73,0.1), 0 0 20px rgba(215,58,73,0.5); }
@@ -2429,7 +2417,7 @@ const HTML = `<!doctype html>
   }
   .mic-btn.transcribing { background: linear-gradient(135deg, #58a6ff, #1f6feb); color: #fff; }
   @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
-  .mic-btn.transcribing svg { animation: spin 1s linear infinite; }
+  .mic-btn.transcribing > svg.mic-icon { animation: spin 1s linear infinite; }
   .composer textarea { flex: 1; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 22px; padding: 10px 16px; font: 13px/1.4 -apple-system, sans-serif; resize: none; height: 40px; min-height: 40px; max-height: 50vh; overflow-y: auto; box-sizing: border-box; }
   .composer textarea:focus { outline: none; border-color: #58a6ff; }
   .composer .send-btn { background: #58a6ff; border: 0; color: white; padding: 0; border-radius: 50%; cursor: pointer; width: 40px; height: 40px; min-width: 40px; display: inline-flex; align-items: center; justify-content: center; }
@@ -2474,7 +2462,7 @@ const HTML = `<!doctype html>
     .composer { padding: 6px 8px; gap: 6px; align-items: flex-end; }
     .composer textarea { font-size: 16px; padding: 10px 18px; border-radius: 22px; height: 44px; min-height: 44px; line-height: 1.3; }  /* 16px prevents iOS zoom */
     .composer .send-btn, .attach-btn, .mic-btn { width: 44px; height: 44px; min-width: 44px; min-height: 44px; flex-shrink: 0; }
-    .attach-btn svg, .mic-btn svg { width: 20px; height: 20px; }
+    .attach-btn svg, .mic-btn > svg.mic-icon { width: 20px; height: 20px; }
     .composer .send-btn svg { width: 18px; height: 18px; }
   }
 
@@ -3853,7 +3841,8 @@ function openPanel(sid) {
         <textarea placeholder="Сообщение" rows="1"></textarea>
         <button class="mic-btn" title="Записать голос → whisper расшифрует в текст">
           <svg class="mic-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 0 0-7 0v5.5A3.5 3.5 0 0 0 12 14z"/><path d="M19 10.5a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.57A7 7 0 0 0 19 10.5z" fill-opacity="0.85"/></svg>
-          <div class="rec-waves" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+          <svg class="mic-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M12 3a9 9 0 1 1-9 9"/></svg>
+          <svg class="rec-waves" viewBox="0 0 27 18" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><rect x="0" y="6" width="3" height="6" rx="1.5" fill="#fff"><animate attributeName="y" values="6;1;6" keyTimes="0;0.5;1" dur="0.9s" begin="0s" repeatCount="indefinite"/><animate attributeName="height" values="6;16;6" keyTimes="0;0.5;1" dur="0.9s" begin="0s" repeatCount="indefinite"/></rect><rect x="6" y="3" width="3" height="12" rx="1.5" fill="#fff"><animate attributeName="y" values="3;0;3" keyTimes="0;0.5;1" dur="0.9s" begin="0.15s" repeatCount="indefinite"/><animate attributeName="height" values="12;18;12" keyTimes="0;0.5;1" dur="0.9s" begin="0.15s" repeatCount="indefinite"/></rect><rect x="12" y="0" width="3" height="18" rx="1.5" fill="#fff"><animate attributeName="y" values="0;3;0" keyTimes="0;0.5;1" dur="0.9s" begin="0.3s" repeatCount="indefinite"/><animate attributeName="height" values="18;12;18" keyTimes="0;0.5;1" dur="0.9s" begin="0.3s" repeatCount="indefinite"/></rect><rect x="18" y="3" width="3" height="12" rx="1.5" fill="#fff"><animate attributeName="y" values="3;0;3" keyTimes="0;0.5;1" dur="0.9s" begin="0.45s" repeatCount="indefinite"/><animate attributeName="height" values="12;18;12" keyTimes="0;0.5;1" dur="0.9s" begin="0.45s" repeatCount="indefinite"/></rect><rect x="24" y="6" width="3" height="6" rx="1.5" fill="#fff"><animate attributeName="y" values="6;1;6" keyTimes="0;0.5;1" dur="0.9s" begin="0.6s" repeatCount="indefinite"/><animate attributeName="height" values="6;16;6" keyTimes="0;0.5;1" dur="0.9s" begin="0.6s" repeatCount="indefinite"/></rect></svg>
         </button>
         <button class="send-btn" style="display:none" title="Отправить">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -4434,8 +4423,9 @@ function openPanel(sid) {
 
   // Voice recording → whisper transcription
   const micBtn = el.querySelector(".mic-btn");
-  const MIC_SVG_IDLE = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-  const MIC_SVG_SPIN = '<svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9" /></svg>';
+  // v1.0.70: state теперь чисто через classList (idle/recording/transcribing) —
+  // innerHTML НЕ трогаем, иначе теряется rec-waves overlay в DOM. Все три иконки
+  // (mic-icon, mic-spin, rec-waves) статично в разметке кнопки, opacity фейдится через CSS.
   let mediaRecorder = null;
   let recordedChunks = [];
   let audioContext = null;
@@ -4487,13 +4477,11 @@ function openPanel(sid) {
         const blob = new Blob(recordedChunks, { type: blobType });
         if (blob.size < 500 || peakLevel < 8) {
           micBtn.classList.remove("recording");
-          micBtn.innerHTML = MIC_SVG_IDLE;
           alert("Запись пустая (peak " + peakLevel.toFixed(0) + "/255).\\nЗахваченное устройство: " + trackInfo + "\\n\\nЕсли тут не «Микрофон MacBook Air» — Chrome зацепился не туда. Проверь chrome://settings/content/microphone.");
           return;
         }
         micBtn.classList.remove("recording");
         micBtn.classList.add("transcribing");
-        micBtn.innerHTML = MIC_SVG_SPIN;
         const fd = new FormData();
         fd.append("audio", blob, "voice." + (mimeType.includes("mp4") ? "mp4" : "webm"));
         try {
@@ -4512,7 +4500,6 @@ function openPanel(sid) {
           alert("Ошибка транскрипции: " + e2);
         } finally {
           micBtn.classList.remove("transcribing");
-          micBtn.innerHTML = MIC_SVG_IDLE;
         }
       };
       // Note: AudioContext + analyser on the same MediaStream can interfere with MediaRecorder
