@@ -146,13 +146,47 @@ if (!existsSync(vapidPath)) {
   ok("VAPID уже есть");
 }
 
-// 4. Whisper.cpp model (опционально, для голосового ввода)
-const whisperModel = join(RUNTIME, "whisper-models", "ggml-base.bin");
-if (!existsSync(whisperModel)) {
-  log("(голосовой ввод): для whisper нужна модель ggml-base.bin. Установи отдельно:");
-  log("  brew install whisper-cpp");
-  log("  mkdir -p ~/.cc-dashboard/whisper-models");
-  log("  curl -L -o ~/.cc-dashboard/whisper-models/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin");
+// 4. Whisper.cpp + ffmpeg + модель — для голосового ввода в composer.
+// Без этого /api/transcribe возвращает ошибку и голосовые кнопки бесполезны.
+// Все три шага идемпотентны и без sudo (brew ставится в /opt/homebrew с правами юзера).
+const brewBin = Bun.which("brew") ?? "/opt/homebrew/bin/brew";
+const haveBrew = existsSync(brewBin);
+if (!haveBrew) {
+  log("(голосовой ввод): brew не найден — пропускаю автоустановку whisper. Поставь brew и запусти setup-local.ts повторно.");
+} else {
+  // whisper-cli (from whisper-cpp formula)
+  if (!Bun.which("whisper-cli")) {
+    log("Устанавливаю whisper-cpp (для голосового ввода)…");
+    const r = Bun.spawnSync([brewBin, "install", "whisper-cpp"], { stdout: "inherit", stderr: "inherit" });
+    if (r.exitCode === 0) ok("whisper-cpp установлен"); else log("  brew install whisper-cpp вернул non-zero — /transcribe может не работать");
+  } else {
+    ok("whisper-cli уже в PATH");
+  }
+  // ffmpeg (нужен для webm/opus → wav 16kHz mono конверсии)
+  if (!Bun.which("ffmpeg")) {
+    log("Устанавливаю ffmpeg (нужен для webm→wav конверсии перед whisper)…");
+    const r = Bun.spawnSync([brewBin, "install", "ffmpeg"], { stdout: "inherit", stderr: "inherit" });
+    if (r.exitCode === 0) ok("ffmpeg установлен"); else log("  brew install ffmpeg вернул non-zero — /transcribe может не работать");
+  } else {
+    ok("ffmpeg уже в PATH");
+  }
+  // Модель ggml-base.bin — минимальный дефолт (~140 MB, RU-качество приемлемое).
+  // Юзер может позже вручную положить в whisper-models/ более крупные модели
+  // (ggml-large-v3-turbo.bin, ggml-medium.bin, ggml-small.bin) — server.ts возьмёт лучшую доступную.
+  const whisperModel = join(RUNTIME, "whisper-models", "ggml-base.bin");
+  if (!existsSync(whisperModel)) {
+    log("Качаю модель ggml-base.bin (~140 MB) в ~/.cc-dashboard/whisper-models/…");
+    mkdirSync(join(RUNTIME, "whisper-models"), { recursive: true });
+    const r = Bun.spawnSync(
+      ["curl", "-fL", "--retry", "3", "-o", whisperModel,
+       "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"],
+      { stdout: "inherit", stderr: "inherit" }
+    );
+    if (r.exitCode === 0 && existsSync(whisperModel)) ok("модель ggml-base.bin скачана");
+    else log("  curl упал — скачай вручную: curl -fL -o ~/.cc-dashboard/whisper-models/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin");
+  } else {
+    ok("whisper-модель уже есть");
+  }
 }
 
 // 4.5. Claude Code: auto-permission mode. Без этого Claude Code на каждой bash-команде
