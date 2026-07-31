@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v130";
+const CACHE_VERSION = "cc-dashboard-v131";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6982,6 +6982,19 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
 
 console.log(`Dashboard: http://localhost:${PORT}`);
 
+// Отправка сообщения в main-сессию (CC Dash) — рапорт о ходе миграции.
+// Использует APPLESCRIPT_BODY (двойной, работает и с Terminal.app, и с iTerm2).
+// Игнорирует ошибки — рапорт best-effort, миграция должна продолжаться даже если
+// CC Dash недоступна.
+async function notifyMainSession(msg: string): Promise<void> {
+  if (!mainSessionSid) return;
+  const meta = sessionMeta.get(mainSessionSid);
+  if (!meta?.tty) return;
+  try { await controlTerminal(meta.tty, "send", msg); } catch {}
+  // Дать TUI 200мс переварить перед следующим сообщением
+  await new Promise(r => setTimeout(r, 200));
+}
+
 // Автомиграция non-main сессий из Terminal.app в iTerm2 при первом старте после
 // переключения preferredTerm=iTerm2. Запускается ОДИН раз (флаг ~/.cc-dashboard/
 // migrated-to-iterm2.flag), только если: (a) preferredTerm=iTerm2, (b) iTerm2
@@ -6990,6 +7003,8 @@ console.log(`Dashboard: http://localhost:${PORT}`);
 // Main-сессия НЕ трогается — её пусть юзер сам через кнопку «Реанимировать
 // CC Dash» в меню (сама себя убить и restart-ить она не может, это же
 // работающий AI-агент, который запросил миграцию).
+// Каждый шаг рапортует в CC Dash через notifyMainSession — юзер видит процесс
+// как разговор с ассистентом, а не молчаливый background.
 async function autoMigrateToIterm2() {
   if (preferredTerm() !== "iTerm2") return;
   const flagPath = join(homedir(), ".cc-dashboard", "migrated-to-iterm2.flag");
@@ -7023,6 +7038,12 @@ return out`;
     try { await Bun.write(flagPath, String(Date.now())); } catch {}
     return;
   }
+  await notifyMainSession(
+    "🔄 [АВТОМИГРАЦИЯ v1.0.77] Получил обновление дашборда — перехожу с Terminal.app на iTerm2. " +
+    "Сейчас по одной закрою наши сессии в Terminal.app и открою заново в iTerm2. " +
+    "Твоя сессия (CC Dash) останется последней — сама себя закрыть не могу, потом попрошу тебя сделать это вручную. " +
+    "Расскажу когда дойду до этого момента. Начинаю."
+  );
   // Найти все sid+cwd+pid для этих tty (кроме mainSessionSid)
   const targets: { sid: string; tty: string; cwd: string; pid: number; title?: string }[] = [];
   for (const [sid, meta] of sessionMeta) {
@@ -7033,12 +7054,21 @@ return out`;
   }
   if (targets.length === 0) {
     console.log("[auto-migrate] нет non-main сессий в Terminal.app для миграции");
+    await notifyMainSession(
+      "Нашёл только твою сессию в Terminal.app — non-main сессий для миграции нет. " +
+      "Закрой мой Terminal-таб (Cmd+W → Terminate) и жми в меню дашборда «Настройки → Реанимировать CC Dash» — оживу в iTerm2."
+    );
     try { await Bun.write(flagPath, String(Date.now())); } catch {}
     return;
   }
   console.log(`[auto-migrate] нашёл ${targets.length} non-main сессий в Terminal.app, начинаю миграцию`);
+  await notifyMainSession(`Всего сессий к переносу: ${targets.length}. Начинаю по одной.`);
+  let done = 0;
   for (const t of targets) {
-    console.log(`[auto-migrate] → ${t.title || "?"} (sid=${t.sid.slice(0,8)}, tty=${t.tty}, pid=${t.pid})`);
+    done++;
+    const label = t.title || t.cwd || t.sid.slice(0,8);
+    console.log(`[auto-migrate] → ${label} (sid=${t.sid.slice(0,8)}, tty=${t.tty}, pid=${t.pid})`);
+    await notifyMainSession(`[${done}/${targets.length}] Переношу «${label}» — закрываю в Terminal.app…`);
     // 1. Kill claude pid
     try { process.kill(t.pid, "SIGTERM"); } catch {}
     await new Promise(r => setTimeout(r, 400));
@@ -7066,12 +7096,22 @@ end tell`;
     const r = await restoreSession(t.sid, t.cwd, t.title);
     if (!r.ok) {
       console.error(`[auto-migrate] restoreSession failed for ${t.sid.slice(0,8)}: ${r.error}`);
-      // Не прерываем цикл — пробуем следующую
+      await notifyMainSession(`[${done}/${targets.length}] ⚠ Не смог восстановить «${label}» в iTerm2: ${r.error}. Пробуй вручную через Resume-кнопку карточки в дашборде. Продолжаю с остальными.`);
+    } else {
+      await notifyMainSession(`[${done}/${targets.length}] ✓ «${label}» открыта в iTerm2. Жду 10с чтобы claude поднялся.`);
     }
     // 4. Wait для стабилизации iTerm2 (claude грузится ~8с)
     await new Promise(r => setTimeout(r, 10000));
   }
   console.log(`[auto-migrate] завершено (${targets.length} сессий); main-сессия остаётся в Terminal.app до ручной кнопки «Реанимировать CC Dash»`);
+  await notifyMainSession(
+    `✅ Миграция non-main сессий завершена (${targets.length} шт). ` +
+    "Теперь последний шаг — я сама. Сама себя закрыть/перезапустить не могу (я же сейчас работаю в Terminal.app-табе), это делаешь ты:\n" +
+    "1) Найди в Terminal.app мой таб (называется «CC Dash»)\n" +
+    "2) Закрой его: Cmd+W → в диалоге «процесс запущен» жми Terminate\n" +
+    "3) В дашборде открой ☰ Menu → Настройки → нажми «Реанимировать CC Dash»\n" +
+    "4) Через ~8 сек я снова буду с тобой, но уже в iTerm2. При первой команде macOS может спросить разрешение iTerm2 на управление приложениями — жми Allow."
+  );
   try { await Bun.write(flagPath, String(Date.now())); } catch {}
 }
 setTimeout(() => { autoMigrateToIterm2().catch(e => console.error("[auto-migrate] fatal:", e)); }, 12000);
@@ -7088,10 +7128,17 @@ setTimeout(async () => {
   try { unlinkSync(flagPath); } catch {}
   const setupPath = join(homedir(), ".cc-dashboard", "setup-local.ts");
   if (!existsSync(setupPath)) { console.error("[post-restart] setup-local.ts не найден"); return; }
+  await notifyMainSession(
+    "🔧 [ОБНОВЛЕНИЕ v1.0.77] Получил новый апдейт дашборда. Сейчас запущу setup-local.ts — он поставит iTerm2 через brew (3-5 мин) и включит его как основной терминал. Дождусь и потом перевезу все сессии из Terminal.app в iTerm2. Продолжай работать, я буду рапортовать."
+  );
   const bunBin = Bun.which("bun") || "/opt/homebrew/bin/bun";
   const proc = Bun.spawn([bunBin, "run", setupPath], {
     stdout: "inherit", stderr: "inherit",
     env: { ...process.env, CC_DASH_POST_RESTART: "1" },
   });
-  proc.exited.then(code => console.log(`[post-restart] setup-local.ts finished code=${code}`));
+  proc.exited.then(async code => {
+    console.log(`[post-restart] setup-local.ts finished code=${code}`);
+    if (code === 0) await notifyMainSession("✓ setup-local.ts отработал. Через несколько секунд запущу автомиграцию сессий.");
+    else await notifyMainSession(`⚠ setup-local.ts вернул код ${code}. Смотри логи ~/.cc-dashboard/err.log. Автомиграция всё равно попробует запуститься.`);
+  });
 }, 5000);
