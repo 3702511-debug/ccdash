@@ -1830,6 +1830,11 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
                         if (tty of s) is targetTty then
                           tell s to select
                           tell w to select
+                          -- activate iTerm-приложение на фронт системы.
+                          -- Без этого CGEventPostToPid(iTerm) для клавиш (Enter, Esc,
+                          -- стрелки) молча теряется — iTerm получает событие только
+                          -- когда его окно во фронте. Terminal.app требовал того же.
+                          activate
                           set attempts to 0
                           repeat
                             delay 0.2
@@ -2029,7 +2034,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v138";
+const CACHE_VERSION = "cc-dashboard-v139";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
