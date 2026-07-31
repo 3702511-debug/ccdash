@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v135";
+const CACHE_VERSION = "cc-dashboard-v136";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -7178,17 +7178,27 @@ setTimeout(async () => {
     return;
   }
   console.log(`[post-restart] запускаю ${setupPath}`);
-  await notifyMainSession(
-    "🔧 [ОБНОВЛЕНИЕ v1.0.77] Получил новый апдейт дашборда. Сейчас запущу setup-local.ts — он поставит iTerm2 через brew (3-5 мин) и включит его как основной терминал. Дождусь и потом перевезу все сессии из Terminal.app в iTerm2. Продолжай работать, я буду рапортовать."
-  );
+  // Не спамить рапортами при повторных апдейтах, когда всё давно установлено.
+  // Считаем "первый апдейт" = нет флага migrated-to-iterm2.flag ИЛИ iTerm ещё
+  // не установлен. Иначе — короткое тихое сообщение (или ничего).
+  const migrateFlag = existsSync(join(homedir(), ".cc-dashboard", "migrated-to-iterm2.flag"));
+  const itermInstalled = existsSync("/Applications/iTerm.app")
+    || existsSync(join(homedir(), "Applications", "iTerm.app"));
+  const isFirstMajorUpdate = !migrateFlag || !itermInstalled;
+  if (isFirstMajorUpdate) {
+    await notifyMainSession(
+      "🔧 [ОБНОВЛЕНИЕ] Получил новый апдейт дашборда. Сейчас запущу setup-local.ts — он поставит iTerm через brew (3-5 мин) и включит его как основной терминал. Дождусь и потом перевезу все сессии из Terminal.app в iTerm. Продолжай работать, я буду рапортовать."
+    );
+  }
   const bunBin = Bun.which("bun") || "/opt/homebrew/bin/bun";
   const proc = Bun.spawn([bunBin, "run", setupPath], {
-    cwd: dirname(setupPath),  // критично: SRC определяется через import.meta.dir, cwd не влияет, но пусть будет
+    cwd: dirname(setupPath),
     stdout: "inherit", stderr: "inherit",
     env: { ...process.env, CC_DASH_POST_RESTART: "1" },
   });
   proc.exited.then(async code => {
     console.log(`[post-restart] setup-local.ts finished code=${code}`);
+    if (!isFirstMajorUpdate) return;  // не спамить рутинный успех
     if (code === 0) await notifyMainSession("✓ setup-local.ts отработал. Через несколько секунд запущу автомиграцию сессий.");
     else await notifyMainSession(`⚠ setup-local.ts вернул код ${code}. Смотри логи ~/.cc-dashboard/err.log. Автомиграция всё равно попробует запуститься.`);
   });
