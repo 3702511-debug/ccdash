@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v136";
+const CACHE_VERSION = "cc-dashboard-v137";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -4672,7 +4672,9 @@ function openPanel(sid) {
       const tracks = stream.getAudioTracks();
       const trackInfo = tracks.map(t => t.label + " (muted=" + t.muted + ", enabled=" + t.enabled + ")").join("; ");
       console.log("[mic] active tracks:", trackInfo);
-      micBtn.title = "Захвачено: " + trackInfo;
+      // Не пишем в micBtn.title — при наведении курсором выскакивала бесячая
+      // подсказка «Захвачено: MacBook Air Microphone (muted=false, enabled=true)».
+      // trackInfo остаётся в console.log для отладки, если понадобится.
       const mimeType = pickMimeType();
       const blobType = mimeType.split(";")[0] || "audio/webm";
       mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
