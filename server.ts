@@ -2018,7 +2018,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v126";
+const CACHE_VERSION = "cc-dashboard-v127";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2857,6 +2857,10 @@ const HTML = `<!doctype html>
         <span>Обновления<span class="drawer-dot" id="updates-dot" style="display:none"></span></span>
         <span class="drawer-item-state" id="updates-state">…</span>
       </div>
+      <div class="drawer-item" id="settings-revive-main" style="display:none">
+        <span>Реанимировать CC Dash</span>
+        <span class="drawer-item-state" id="revive-state">…</span>
+      </div>
     </div>
   </div>
 </div>
@@ -3202,6 +3206,7 @@ const isMobile = () => window.matchMedia("(max-width: 768px)").matches;
 function openDrawer() {
   document.getElementById("drawer").classList.add("open");
   document.getElementById("drawer-backdrop").classList.add("open");
+  refreshReviveMain();
 }
 function closeDrawer() {
   document.getElementById("drawer").classList.remove("open");
@@ -3251,6 +3256,51 @@ document.getElementById("settings-notifications").addEventListener("click", () =
 });
 document.getElementById("settings-updates").addEventListener("click", () => {
   document.getElementById("update-btn").click();
+});
+
+// Реанимировать CC Dash — эквивалент .command-файла на Desktop, но через дашборд.
+// Показываем пункт только если backend знает про mainSessionSid; текст статуса
+// (жива/не жива/каким терминалом) — обновляется при каждом открытии drawer.
+async function refreshReviveMain() {
+  const item = document.getElementById("settings-revive-main");
+  const state = document.getElementById("revive-state");
+  if (!item || !state) return;
+  try {
+    const r = await fetch("/api/main-session/revive");
+    if (r.status === 404) { item.style.display = "none"; return; }
+    const data = await r.json();
+    if (!data.ok) { item.style.display = "none"; return; }
+    item.style.display = "";
+    state.textContent = data.alive ? "жива (" + (data.term || "?") + ")" : "мертва → нажми";
+    state.style.color = data.alive ? "#3fb950" : "#d29922";
+  } catch { item.style.display = "none"; }
+}
+document.getElementById("settings-revive-main").addEventListener("click", async () => {
+  const state = document.getElementById("revive-state");
+  state.textContent = "запускаю…";
+  state.style.color = "#58a6ff";
+  try {
+    const r = await fetch("/api/main-session/revive", { method: "POST" });
+    const data = await r.json();
+    if (r.status === 409) {
+      state.textContent = "уже жива";
+      state.style.color = "#3fb950";
+      return;
+    }
+    if (!r.ok || data.error) {
+      state.textContent = "ошибка";
+      state.style.color = "#f85149";
+      alert("Не получилось реанимировать CC Dash:\n" + (data.error || data.message || r.status));
+      return;
+    }
+    state.textContent = "запущена ✓";
+    state.style.color = "#3fb950";
+    // Через 10 сек обновим статус — к этому моменту процесс должен появиться в pgrep
+    setTimeout(refreshReviveMain, 10000);
+  } catch (e) {
+    state.textContent = "ошибка сети";
+    state.style.color = "#f85149";
+  }
 });
 
 // Скрытые сессии
@@ -6395,6 +6445,28 @@ return "ok"`;
       });
       (globalThis as any).__archCache = { at: Date.now(), data: result };
       return Response.json(result);
+    }
+    // Реанимация главной CC Dash-сессии. Аналог .command-файла на Desktop,
+    // но через дашборд — если он живой, лучше воспользоваться этим (файл — крайний fallback).
+    // Читает mainSessionSid из ~/.cc-dashboard/main-session.json и запускает claude --resume
+    // в preferred-терминале. GET — вернуть статус (можно/нельзя). POST — реально запустить.
+    if (url.pathname === "/api/main-session/revive") {
+      if (isRestrictedUser(authedUser)) return Response.json({ error: "forbidden" }, { status: 403 });
+      if (!mainSessionSid) return Response.json({ ok: false, error: "no-main", message: "Главная сессия не назначена. Добавь в ~/.cc-dashboard/main-session.json." }, { status: 404 });
+      // Проверить не жив ли уже — иначе получим дубль процесса
+      const livePids = await gatherPidInfos();
+      const alive = livePids.some(p => p.sessionId === mainSessionSid);
+      if (req.method === "GET") {
+        return Response.json({ ok: true, sid: mainSessionSid, alive, term: preferredTerm() });
+      }
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      if (alive) return Response.json({ error: "already-alive", message: "CC Dash уже запущена — реанимация не нужна." }, { status: 409 });
+      // Найти правильный cwd для sid (обычно /Users/<user> или папка проекта)
+      const cwd = await findSlugCwdForSid(mainSessionSid, homedir());
+      console.log(`[revive-main] sid=${mainSessionSid.slice(0,8)} cwd=${cwd} term=${preferredTerm()}`);
+      const r = await restoreSession(mainSessionSid, cwd, "CC Dash");
+      if (!r.ok) return Response.json({ error: r.error }, { status: 500 });
+      return Response.json({ ok: true, sid: mainSessionSid, term: preferredTerm() });
     }
     if (url.pathname === "/api/restore" && req.method === "POST") {
       // Restricted-юзер не может восстанавливать архивные сессии — это создание процесса.
