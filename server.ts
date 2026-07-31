@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v131";
+const CACHE_VERSION = "cc-dashboard-v132";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -7126,13 +7126,28 @@ setTimeout(async () => {
   if (!existsSync(flagPath)) return;
   console.log("[post-restart] pending-setup.flag найден → запускаю setup-local.ts в фоне");
   try { unlinkSync(flagPath); } catch {}
-  const setupPath = join(homedir(), ".cc-dashboard", "setup-local.ts");
-  if (!existsSync(setupPath)) { console.error("[post-restart] setup-local.ts не найден"); return; }
+  // ВАЖНО: setup-local.ts надо запускать из SRC-репо (клон), НЕ из RUNTIME.
+  // SRC определяется через import.meta.dir внутри скрипта → если запустить из
+  // RUNTIME, SRC===RUNTIME и `cpSync(server.ts из SRC в RUNTIME)` копирует
+  // файл сам в себя → ENOENT. Путь к репо лежит в ~/.cc-dashboard/repo-path.txt.
+  let setupPath = "";
+  try {
+    const repoPath = (await Bun.file(join(homedir(), ".cc-dashboard", "repo-path.txt")).text()).trim();
+    const candidate = join(repoPath, "setup-local.ts");
+    if (existsSync(candidate)) setupPath = candidate;
+  } catch {}
+  if (!setupPath) {
+    console.error("[post-restart] setup-local.ts в репо не найден (repo-path.txt пуст?)");
+    await notifyMainSession("⚠ setup-local.ts в репо не найден — pending-setup пропущен. Юзер должен запустить вручную: `bun run <путь-к-репо>/setup-local.ts`");
+    return;
+  }
+  console.log(`[post-restart] запускаю ${setupPath}`);
   await notifyMainSession(
     "🔧 [ОБНОВЛЕНИЕ v1.0.77] Получил новый апдейт дашборда. Сейчас запущу setup-local.ts — он поставит iTerm2 через brew (3-5 мин) и включит его как основной терминал. Дождусь и потом перевезу все сессии из Terminal.app в iTerm2. Продолжай работать, я буду рапортовать."
   );
   const bunBin = Bun.which("bun") || "/opt/homebrew/bin/bun";
   const proc = Bun.spawn([bunBin, "run", setupPath], {
+    cwd: dirname(setupPath),  // критично: SRC определяется через import.meta.dir, cwd не влияет, но пусть будет
     stdout: "inherit", stderr: "inherit",
     env: { ...process.env, CC_DASH_POST_RESTART: "1" },
   });

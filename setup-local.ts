@@ -262,12 +262,20 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 
 const isInstalled = existsSync(plistPath);
 await Bun.write(plistPath, plist);
-if (isInstalled) {
-  Bun.spawnSync(["launchctl", "unload", plistPath]);
+// В POST_RESTART режиме пропускаем launchctl unload/load — plist не менялся
+// (это тот же setup-local просто копирует свои же файлы), а unload убьёт
+// текущий bun-сервер, который нас же запустил. KeepAlive его реставнет,
+// но дочерний setup-local процесс тоже помрёт по SIGHUP.
+if (process.env.CC_DASH_POST_RESTART === "1") {
+  log("(post-restart mode: пропускаю launchctl unload/load главного plist)");
+} else {
+  if (isInstalled) {
+    Bun.spawnSync(["launchctl", "unload", plistPath]);
+  }
+  const ld = Bun.spawnSync(["launchctl", "load", plistPath]);
+  if (ld.exitCode === 0) ok(`LaunchAgent: ${plistPath}`);
+  else die(`launchctl load упал: ${ld.stderr?.toString()}`);
 }
-const ld = Bun.spawnSync(["launchctl", "load", plistPath]);
-if (ld.exitCode === 0) ok(`LaunchAgent: ${plistPath}`);
-else die(`launchctl load упал: ${ld.stderr?.toString()}`);
 
 // 5b. Watchdog'и (server + tunnel) — автоматически реанимируют упавший сервер/туннель.
 // server-watchdog ставится всегда. tunnel-watchdog требует tunnel-config.json
@@ -282,6 +290,11 @@ async function installAgent(name: string, templateFile: string, subs: Record<str
   const agentPath = join(HOME, "Library", "LaunchAgents", `${name}.plist`);
   const wasInstalled = existsSync(agentPath);
   await Bun.write(agentPath, xml);
+  // POST_RESTART: skip unload/load (plist не менялся, watchdogs уже работают)
+  if (process.env.CC_DASH_POST_RESTART === "1" && wasInstalled) {
+    log(`(post-restart: ${name} plist обновлён, но unload/load пропущен)`);
+    return;
+  }
   if (wasInstalled) Bun.spawnSync(["launchctl", "unload", agentPath]);
   const r = Bun.spawnSync(["launchctl", "load", agentPath]);
   if (r.exitCode === 0) ok(`LaunchAgent: ${agentPath}`);
