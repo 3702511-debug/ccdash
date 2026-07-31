@@ -2018,7 +2018,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v127";
+const CACHE_VERSION = "cc-dashboard-v128";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3275,8 +3275,11 @@ async function refreshReviveMain() {
     state.style.color = data.alive ? "#3fb950" : "#d29922";
   } catch { item.style.display = "none"; }
 }
-document.getElementById("settings-revive-main").addEventListener("click", async () => {
+// Защита от null: если старый HTML из SW-кэша ещё не обновился, элемента может не быть.
+// Без ?. и проверки — TypeError валит весь скрипт и всё UI перестаёт работать.
+document.getElementById("settings-revive-main")?.addEventListener("click", async () => {
   const state = document.getElementById("revive-state");
+  if (!state) return;
   state.textContent = "запускаю…";
   state.style.color = "#58a6ff";
   try {
@@ -3290,7 +3293,7 @@ document.getElementById("settings-revive-main").addEventListener("click", async 
     if (!r.ok || data.error) {
       state.textContent = "ошибка";
       state.style.color = "#f85149";
-      alert("Не получилось реанимировать CC Dash:\n" + (data.error || data.message || r.status));
+      alert("Не получилось реанимировать CC Dash: " + (data.error || data.message || r.status));
       return;
     }
     state.textContent = "запущена ✓";
