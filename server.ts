@@ -1830,11 +1830,6 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
                         if (tty of s) is targetTty then
                           tell s to select
                           tell w to select
-                          -- activate iTerm-приложение на фронт системы.
-                          -- Без этого CGEventPostToPid(iTerm) для клавиш (Enter, Esc,
-                          -- стрелки) молча теряется — iTerm получает событие только
-                          -- когда его окно во фронте. Terminal.app требовал того же.
-                          activate
                           set attempts to 0
                           repeat
                             delay 0.2
@@ -1947,15 +1942,70 @@ async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; 
   return { ok: true };
 }
 
-// Универсальная отправка raw-клавиш в TUI-вкладку через CGEventPostToPid.
-// Используется для multi-tab навигации (left/right arrows), Submit (enter на нужной вкладке), Esc (отмена модала).
+// Отправка raw-последовательности символов в iTerm-session по tty через AppleScript
+// `write text ... newline no`. Работает БЕЗ активации окна (в отличие от
+// CGEventPostToPid, которое молча теряется если iTerm не в фронте).
+// sequence — сырая строка со всеми escape-кодами (например Down = ESC+[+B).
+// Возвращает true если tty найден в iTerm и write text отработал.
+async function sendKeysToItermByTty(tty: string, sequence: string): Promise<boolean> {
+  const script = `on run argv
+  set targetTty to "/dev/" & (item 1 of argv)
+  set seq to item 2 of argv
+  try
+    tell application "iTerm"
+      if it is running then
+        repeat with w in windows
+          try
+            repeat with t in tabs of w
+              try
+                repeat with s in sessions of t
+                  try
+                    if (tty of s) is targetTty then
+                      tell s to write text seq newline no
+                      return "ok"
+                    end if
+                  end try
+                end repeat
+              end try
+            end repeat
+          end try
+        end repeat
+      end if
+    end tell
+  end try
+  return "not-found"
+end run`;
+  const proc = Bun.spawnSync(["osascript", "-e", script, "--", tty, sequence]);
+  return proc.stdout.toString().trim() === "ok";
+}
+
+// Escape-последовательности для клавиш при отправке через write text
+// (iTerm/Terminal шлют их как стрелки/Enter/Escape в TUI-приложение).
+const KEY_SEQ: Record<string, string> = {
+  left:   "\x1b[D",
+  right:  "\x1b[C",
+  up:     "\x1b[A",
+  down:   "\x1b[B",
+  enter:  "\r",
+  escape: "\x1b",
+};
+
+// Универсальная отправка raw-клавиш в TUI-вкладку.
+// Для iTerm — через AppleScript write text (не требует фокуса, окно не прыгает).
+// Для Terminal.app — через CGEventPostToPid (там write text для клавиш не работает).
 async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "enter" | "escape"): Promise<{ ok: boolean; error?: string }> {
+  const seq = KEY_SEQ[key];
+  if (!seq) return { ok: false, error: "invalid key" };
+  // Попытка 1: iTerm через write text (без фокуса)
+  if (await sendKeysToItermByTty(tty, seq)) {
+    console.log(`[send-raw-key ${tty}] key=${key} via write-text (iTerm) OK`);
+    return { ok: true };
+  }
+  // Попытка 2: Terminal.app через CGEvent
   const keyMap: Record<string, number> = {
     left: 123, right: 124, down: 125, up: 126, enter: 36, escape: 53,
   };
   const keyCode = keyMap[key];
-  if (keyCode === undefined) return { ok: false, error: "invalid key" };
-  // selectTabForCGEvent автоматически найдёт tty в Terminal или iTerm2 и вернёт pid нужного приложения.
   const sel = await selectTabForCGEvent(tty);
   if (!sel.ok) return { ok: false, error: sel.error };
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
@@ -1967,11 +2017,18 @@ async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "
 async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: string): Promise<{ ok: boolean; error?: string }> {
   if (optionIndex < 1 || optionIndex > 9) return { ok: false, error: "optionIndex out of range 1-9" };
   const downs = optionIndex - 1;
+  // Попытка 1: iTerm через write text — собрать всю последовательность одним AppleScript-вызовом
+  // (одна команда → меньше AppleScript overhead + меньше шанс race).
+  const seq = KEY_SEQ.down.repeat(downs) + (freeText || "") + KEY_SEQ.enter;
+  if (await sendKeysToItermByTty(tty, seq)) {
+    console.log(`[answer-question ${tty} idx=${optionIndex} freeText=${freeText ? "yes(" + freeText.length + ")" : "no"}] write-text (iTerm) OK`);
+    return { ok: true };
+  }
+  // Попытка 2: Terminal.app через CGEvent (как раньше)
   const sel = await selectTabForCGEvent(tty);
   if (!sel.ok) return { ok: false, error: sel.error };
   const termPid = sel.pid!;
   if (!loadCG()) return { ok: false, error: "CGEvent FFI failed to load" };
-  // Шаг 3: посылаем клавиши через CGEventPostToPid → правильный процесс терминала (без focus)
   try {
     for (let i = 0; i < downs; i++) {
       cgSendKey(termPid, 125);  // Down arrow
@@ -2034,7 +2091,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v139";
+const CACHE_VERSION = "cc-dashboard-v140";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2445,6 +2502,10 @@ const HTML = `<!doctype html>
   .q-card.submitting { background: rgba(63,185,80,0.10); border-color: rgba(63,185,80,0.55); border-left-color: #3fb950; }
   .q-header { font-size: 11px; color: #79c0ff; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-weight: 700; }
   .msg.question.answered .q-header { color: #3fb950; }
+  .q-step { display: inline-block; background: #58a6ff; color: #0d1117; padding: 1px 8px; border-radius: 10px; font-weight: 700; margin-right: 2px; }
+  .msg.question.answered .q-step { background: #3fb950; }
+  body.theme-light .q-step { background: #0969da; color: #ffffff; }
+  body.theme-light .msg.question.answered .q-step { background: #1f883d; }
   .q-question { font-size: 15px; color: #f0f6fc; font-weight: 600; margin-bottom: 10px; line-height: 1.4; }
   .q-opts { display: flex; flex-direction: column; gap: 6px; }
   .q-opt { display: block; width: 100%; text-align: left; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; color: #c9d1d9; font: inherit; cursor: default; transition: all 0.15s; position: relative; }
@@ -3945,7 +4006,18 @@ async function refreshFeedPanel(sid) {
           // Опции кликабельные и в single-tab, и в multi-tab — выбор применяется к текущей вкладке.
           return \`<button class="q-opt active \${isFree?"free-text":""}" data-idx="\${tuiNum}" \${isFree?"data-free-text=\\"1\\"":""}><span class=q-num>\${tuiNum}</span><span class=q-label>\${labelHtml}</span>\${desc?\`<div class=q-desc>\${desc}</div>\`:""}\${freeInputHtml}</button>\`;
         }).join("");
-        const headerHtml = q.header ? \`<div class=q-header>\${q.header.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</div>\` : "";
+        // Multi-step счётчик "N из M" — считаем checkbox-иконки в header.
+        // ☐/▢ — pending, ☑/✓/✔/▣ — done. Текущий шаг = done + 1 (сам вопрос ещё не отвечен).
+        let stepBadge = "";
+        if (q.header) {
+          const total = (q.header.match(/[☐☑✓✔▢▣]/g) || []).length;
+          const done = (q.header.match(/[☑✓✔▣]/g) || []).length;
+          if (total > 1) {
+            const current = Math.min(done + 1, total);
+            stepBadge = \`<span class=q-step>\${current} из \${total}</span> · \`;
+          }
+        }
+        const headerHtml = q.header ? \`<div class=q-header>\${stepBadge}\${q.header.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</div>\` : "";
         // Если ответ — free-text, но в options нет isFreeText-опции (старые jsonl-вопросы без TUI-обогащения),
         // дорисуем синтетическую «Свой вариант» в конец, с пользовательским текстом
         const hasFreeTextOpt = q.options.some(o => o.isFreeText);
