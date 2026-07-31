@@ -1163,8 +1163,13 @@ const APPLESCRIPT_BODY = `on run argv
                     tell w to select
                     activate
                   else if actionArg is "send" then
-                    -- write text delivers to the session's stdin without focus jump
+                    -- write text шлёт текст+newline в stdin. Claude Code TUI 2.x
+                    -- после multi-line paste остаётся в edit-mode — второй пустой
+                    -- write text даёт финальный Enter для submit (как do script "" in t
+                    -- в Terminal-блоке ниже).
                     tell s to write text msgArg
+                    delay 0.15
+                    tell s to write text ""
                   end if
                   return "iTerm"
                 end if
@@ -1250,7 +1255,7 @@ const RESTORE_SCRIPT_TERMINAL = `on run argv
   set sidArg to item 2 of argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
-  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg
+  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg & " --permission-mode auto"
   tell application "Terminal"
     set newTab to do script cmd
     if titleArg is not "" then
@@ -1276,7 +1281,7 @@ const RESTORE_SCRIPT_ITERM = `on run argv
   set sidArg to item 2 of argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
-  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg
+  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg & " --permission-mode auto"
   tell application "iTerm2"
     if (count of windows) = 0 then
       set newWindow to create window with default profile
@@ -2024,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v129";
+const CACHE_VERSION = "cc-dashboard-v130";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5494,8 +5499,11 @@ async function applyUpdate(): Promise<{ ok: boolean; error?: string }> {
     // 4. Persist state для нового процесса
     await Bun.write(UPDATE_STATUS_FILE, JSON.stringify({ phase: "restart", percent: 95, startedAt }));
     updateState = { phase: "restart", percent: 95, startedAt };
+    // 4.5. Флаг для нового процесса: после restart запустить setup-local.ts
+    // (иначе новые pieces типа iTerm2/whisper-cpp/автопрофилей не установятся).
+    try { await Bun.write(join(RUNTIME, "pending-setup.flag"), String(Date.now())); } catch {}
     // 5. process.exit — KeepAlive=true рестартит
-    console.log("[update] exit for restart by launchd");
+    console.log("[update] exit for restart by launchd (pending-setup.flag written)");
     setTimeout(() => process.exit(0), 600);
     return { ok: true };
   } catch (e: any) {
@@ -6113,8 +6121,12 @@ end tell`;
       }
       const info = { cwd: meta?.cwd, title: meta?.title };
       if (mode === "delete") {
+        // Удаляем jsonl и НЕ добавляем в hiddenSids — иначе карточка
+        // остаётся висеть в «Закрытых сессиях» с кнопкой Восстановить,
+        // но восстанавливать уже нечего (jsonl нет). Заодно чистим
+        // старую запись hidden если пользователь удаляет уже скрытую сессию.
         if (jsonlPath) { try { await unlink(jsonlPath); } catch {} }
-        hiddenSids.set(sid, info);
+        hiddenSids.delete(sid);
       } else {
         hiddenSids.set(sid, info);
       }
@@ -6144,12 +6156,14 @@ end tell`;
       const enriched = await Promise.all([...hiddenSids].map(async ([sid, info]) => {
         let title = info.title || "";
         let preview = "";
+        let hasJsonl = false;
         try {
           const dirs = await readdir(PROJECTS_DIR);
           for (const d of dirs) {
             const path = join(PROJECTS_DIR, d, sid + ".jsonl");
             try {
               await stat(path);
+              hasJsonl = true;
               if (!title) title = (await getTitle(path)) || "";
               const head = await readHead(path, 16 * 1024);
               for (const line of head.split("\n")) {
@@ -6171,9 +6185,19 @@ end tell`;
             } catch {}
           }
         } catch {}
-        return { sid, ...info, title, preview };
+        return { sid, ...info, title, preview, hasJsonl };
       }));
-      return Response.json(enriched);
+      // Автоочистка stale-записей: если jsonl нет (сессия удалена насовсем через
+      // старый багованный delete в v<1.0.77, или jsonl вручную удалён), убираем sid
+      // из hiddenSids и не показываем в UI. Иначе там висят Восстановить-кнопки,
+      // которые ведут к ошибке "нет jsonl".
+      const stale = enriched.filter(e => !e.hasJsonl);
+      if (stale.length > 0) {
+        for (const s of stale) hiddenSids.delete(s.sid);
+        await saveHiddenSids();
+        console.log(`[hidden-sessions] cleaned ${stale.length} stale entries (no jsonl)`);
+      }
+      return Response.json(enriched.filter(e => e.hasJsonl).map(({ hasJsonl, ...rest }) => rest));
     }
     if (url.pathname === "/api/check-existing" && req.method === "GET") {
       const cwdRaw = (url.searchParams.get("cwd") || "").trim();
@@ -6282,7 +6306,11 @@ end tell`;
       // AppleScript: открыть preferred-терминал, запустить claude (или claude --resume), /rename, /remote-control, скрыть.
       const nameEsc = name.replace(/"/g, '\\"');
       const cwdEsc = cwd.replace(/"/g, '\\"');
-      const claudeCmd = resumeSid ? `claude --resume ${resumeSid}` : "claude";
+      // --permission-mode auto — новые/resume-сессии из дашборда сразу в auto-mode
+      // (как /rename и /remote-control прилетают автоматом первыми командами).
+      const claudeCmd = resumeSid
+        ? `claude --resume ${resumeSid} --permission-mode auto`
+        : "claude --permission-mode auto";
       const term = preferredTerm();
       let script: string;
       if (term === "iTerm2") {
@@ -6953,3 +6981,117 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
 });
 
 console.log(`Dashboard: http://localhost:${PORT}`);
+
+// Автомиграция non-main сессий из Terminal.app в iTerm2 при первом старте после
+// переключения preferredTerm=iTerm2. Запускается ОДИН раз (флаг ~/.cc-dashboard/
+// migrated-to-iterm2.flag), только если: (a) preferredTerm=iTerm2, (b) iTerm2
+// запущен, (c) в Terminal.app остались живые sessions. Каждую (кроме main):
+// SIGTERM claude → close Terminal-tab → restoreSession в iTerm2 → wait 8с.
+// Main-сессия НЕ трогается — её пусть юзер сам через кнопку «Реанимировать
+// CC Dash» в меню (сама себя убить и restart-ить она не может, это же
+// работающий AI-агент, который запросил миграцию).
+async function autoMigrateToIterm2() {
+  if (preferredTerm() !== "iTerm2") return;
+  const flagPath = join(homedir(), ".cc-dashboard", "migrated-to-iterm2.flag");
+  if (existsSync(flagPath)) return;  // уже мигрировали
+  // Ждём чтобы snapshot() успел заполнить sessionMeta (обычно через 3-5с после старта)
+  await new Promise(r => setTimeout(r, 8000));
+  // Собираем список tty в Terminal.app
+  const termTabsScript = `set out to ""
+try
+  tell application "Terminal"
+    if it is running then
+      repeat with w in windows
+        try
+          repeat with t in tabs of w
+            try
+              set out to out & (tty of t) & linefeed
+            end try
+          end repeat
+        end try
+      end repeat
+    end if
+  end tell
+end try
+return out`;
+  const proc = Bun.spawnSync(["osascript", "-e", termTabsScript]);
+  const termTtys = new Set(
+    proc.stdout.toString().split("\n").map(s => s.trim().replace(/^\/dev\//, "")).filter(Boolean)
+  );
+  if (termTtys.size === 0) {
+    console.log("[auto-migrate] Terminal.app пуст — нечего мигрировать, ставлю флаг и выхожу");
+    try { await Bun.write(flagPath, String(Date.now())); } catch {}
+    return;
+  }
+  // Найти все sid+cwd+pid для этих tty (кроме mainSessionSid)
+  const targets: { sid: string; tty: string; cwd: string; pid: number; title?: string }[] = [];
+  for (const [sid, meta] of sessionMeta) {
+    if (!meta.tty || !meta.cwd || !meta.pid || meta.pid <= 0) continue;
+    if (!termTtys.has(meta.tty)) continue;
+    if (sid === mainSessionSid) continue;  // main — пусть юзер сам
+    targets.push({ sid, tty: meta.tty, cwd: meta.cwd, pid: meta.pid, title: meta.title });
+  }
+  if (targets.length === 0) {
+    console.log("[auto-migrate] нет non-main сессий в Terminal.app для миграции");
+    try { await Bun.write(flagPath, String(Date.now())); } catch {}
+    return;
+  }
+  console.log(`[auto-migrate] нашёл ${targets.length} non-main сессий в Terminal.app, начинаю миграцию`);
+  for (const t of targets) {
+    console.log(`[auto-migrate] → ${t.title || "?"} (sid=${t.sid.slice(0,8)}, tty=${t.tty}, pid=${t.pid})`);
+    // 1. Kill claude pid
+    try { process.kill(t.pid, "SIGTERM"); } catch {}
+    await new Promise(r => setTimeout(r, 400));
+    try { process.kill(t.pid, 0); try { process.kill(t.pid, "SIGKILL"); } catch {} } catch {}
+    // 2. Close Terminal.app tab (exit + close)
+    const closeScript = `tell application "Terminal"
+  repeat with w in windows
+    try
+      repeat with t in tabs of w
+        try
+          if (tty of t) is "/dev/${t.tty}" then
+            do script "exit" in t
+            delay 0.3
+            close t saving no
+            return "ok"
+          end if
+        end try
+      end repeat
+    end try
+  end repeat
+end tell`;
+    Bun.spawnSync(["osascript", "-e", closeScript]);
+    await new Promise(r => setTimeout(r, 1500));
+    // 3. Restore в iTerm2 (preferredTerm=iTerm2 → restoreScript() возвращает iTerm-версию)
+    const r = await restoreSession(t.sid, t.cwd, t.title);
+    if (!r.ok) {
+      console.error(`[auto-migrate] restoreSession failed for ${t.sid.slice(0,8)}: ${r.error}`);
+      // Не прерываем цикл — пробуем следующую
+    }
+    // 4. Wait для стабилизации iTerm2 (claude грузится ~8с)
+    await new Promise(r => setTimeout(r, 10000));
+  }
+  console.log(`[auto-migrate] завершено (${targets.length} сессий); main-сессия остаётся в Terminal.app до ручной кнопки «Реанимировать CC Dash»`);
+  try { await Bun.write(flagPath, String(Date.now())); } catch {}
+}
+setTimeout(() => { autoMigrateToIterm2().catch(e => console.error("[auto-migrate] fatal:", e)); }, 12000);
+
+// Post-restart hook: если update-apply оставил флаг pending-setup.flag, запустить
+// setup-local.ts в фоне (5 сек задержка чтобы сервер точно поднялся). Это нужно
+// чтобы новые обязательные компоненты (iTerm2, whisper-cpp, ffmpeg) установились
+// у клиентов после auto-update — сам update-apply копирует файлы, но не выполняет
+// setup-local, потому что оно должно происходить после restart.
+setTimeout(async () => {
+  const flagPath = join(homedir(), ".cc-dashboard", "pending-setup.flag");
+  if (!existsSync(flagPath)) return;
+  console.log("[post-restart] pending-setup.flag найден → запускаю setup-local.ts в фоне");
+  try { unlinkSync(flagPath); } catch {}
+  const setupPath = join(homedir(), ".cc-dashboard", "setup-local.ts");
+  if (!existsSync(setupPath)) { console.error("[post-restart] setup-local.ts не найден"); return; }
+  const bunBin = Bun.which("bun") || "/opt/homebrew/bin/bun";
+  const proc = Bun.spawn([bunBin, "run", setupPath], {
+    stdout: "inherit", stderr: "inherit",
+    env: { ...process.env, CC_DASH_POST_RESTART: "1" },
+  });
+  proc.exited.then(code => console.log(`[post-restart] setup-local.ts finished code=${code}`));
+}, 5000);

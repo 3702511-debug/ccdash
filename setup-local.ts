@@ -189,6 +189,32 @@ if (!haveBrew) {
   }
 }
 
+// 4.4. iTerm2 — host-терминал для claude-сессий (вместо Terminal.app).
+// Ставим через brew --cask (в /Applications, без sudo), затем создаём
+// ~/.cc-dashboard/terminal.json = {"app":"iTerm2"} — дашборд после этого
+// открывает все новые/восстановленные сессии в iTerm2. Терминальные окна
+// собираются в одном приложении (визуально удобнее чем россыпь Terminal-окон).
+if (!haveBrew) {
+  log("(iTerm2): brew не найден — пропускаю. Поставь brew и запусти setup-local.ts повторно.");
+} else {
+  const itermInstalled = existsSync("/Applications/iTerm.app") || existsSync(join(HOME, "Applications", "iTerm.app"));
+  if (!itermInstalled) {
+    log("Устанавливаю iTerm2 (host-терминал для claude-сессий)…");
+    const r = Bun.spawnSync([brewBin, "install", "--cask", "iterm2"], { stdout: "inherit", stderr: "inherit" });
+    if (r.exitCode === 0) ok("iTerm2 установлен"); else log("  brew install --cask iterm2 вернул non-zero — поставь вручную");
+  } else {
+    ok("iTerm2 уже установлен");
+  }
+  // terminal.json создаём только если файла нет — не перезаписываем осознанный выбор юзера
+  const terminalJsonPath = join(RUNTIME, "terminal.json");
+  if (!existsSync(terminalJsonPath)) {
+    await Bun.write(terminalJsonPath, JSON.stringify({ app: "iTerm2" }, null, 2));
+    ok("~/.cc-dashboard/terminal.json создан (preferred = iTerm2)");
+  } else {
+    log("(~/.cc-dashboard/terminal.json уже есть — не трогаю)");
+  }
+}
+
 // 4.5. Claude Code: auto-permission mode. Без этого Claude Code на каждой bash-команде
 // показывает «Do you want to proceed?» — для пользователя дашборда это сильно мешает.
 // Создаём ТОЛЬКО если settings.json ещё нет (не трогаем существующие настройки).
@@ -317,7 +343,7 @@ if (!existsSync(mainSessionPath)) {
     end tell
     set newSession to current session of current tab of current window
   end if
-  tell newSession to write text "cd \\"${cwdEsc}\\" && claude"
+  tell newSession to write text "cd \\"${cwdEsc}\\" && claude --permission-mode auto"
   delay 8
   tell newSession to write text "/rename CC Dash"
   delay 0.2
@@ -329,7 +355,7 @@ return "ok"` : `tell application "System Events"
 end tell
 tell application "Terminal"
   activate
-  set newTab to do script "cd \\"${cwdEsc}\\" && claude"
+  set newTab to do script "cd \\"${cwdEsc}\\" && claude --permission-mode auto"
   delay 8
   do script "/rename CC Dash" in newTab
   delay 0.2
@@ -377,39 +403,41 @@ try {
 //    не сможет читать ~/.claude/projects/ и дашборд покажет 0 сессий.
 //    Программно дать FDA нельзя (политика macOS), но открываем нужную панель System Settings
 //    и инструктируем пользователя добавить bun.
-console.log();
-console.log("════════════════════════════════════════════════════════════");
-console.log("⚠  ВАЖНО: дай bun полный доступ к диску (Full Disk Access)");
-console.log("════════════════════════════════════════════════════════════");
-console.log();
-console.log("Без этого launchd-bun не увидит сессии Claude Code, и дашборд");
-console.log("будет показывать 0 чатов даже когда они активны в Terminal.");
-console.log();
-console.log("Сейчас откроется панель Системных настроек. Что сделать:");
-console.log(`  1. Нажми «+» в списке`);
-console.log(`  2. В диалоге Finder: Shift+Cmd+G → введи путь к bun (см. ниже)`);
-console.log(`     bun: ${bunPath}`);
-console.log(`  3. Выбери файл bun и нажми «Открыть»`);
-console.log(`  4. Включи слайдер напротив bun`);
-console.log(`  5. Вернись в этот терминал и нажми Enter, чтобы продолжить`);
-console.log();
-// Открываем панель Privacy & Security → Full Disk Access напрямую через URL scheme
-Bun.spawnSync(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]);
-process.stdout.write("Жму Enter после того как добавил bun в Full Disk Access... ");
-// читаем одну строку из stdin для ожидания подтверждения
-await new Promise<void>(resolve => {
-  process.stdin.once("data", () => resolve());
-  process.stdin.resume();
-});
-process.stdin.pause();
-// После FDA нужно перезапустить launchd-bun, чтобы новые TCC права применились
-Bun.spawnSync(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/com.user.cc-dashboard`]);
-ok("LaunchAgent перезапущен — новый bun теперь с FDA");
+// При post-restart вызове (через флаг pending-setup.flag) — пропускаем FDA + kickstart,
+// потому что: (a) stdin не TTY, `once("data")` зависнет; (b) FDA уже настроен при
+// первой установке; (c) kickstart перезапустит сервер который нас же запустил.
+if (process.env.CC_DASH_POST_RESTART === "1") {
+  log("(post-restart mode: пропускаю FDA-инструкцию и kickstart)");
+} else {
+  console.log();
+  console.log("════════════════════════════════════════════════════════════");
+  console.log("⚠  ВАЖНО: дай bun полный доступ к диску (Full Disk Access)");
+  console.log("════════════════════════════════════════════════════════════");
+  console.log();
+  console.log("Без этого launchd-bun не увидит сессии Claude Code, и дашборд");
+  console.log("будет показывать 0 чатов даже когда они активны в Terminal.");
+  console.log();
+  console.log("Сейчас откроется панель Системных настроек. Что сделать:");
+  console.log(`  1. Нажми «+» в списке`);
+  console.log(`  2. В диалоге Finder: Shift+Cmd+G → введи путь к bun (см. ниже)`);
+  console.log(`     bun: ${bunPath}`);
+  console.log(`  3. Выбери файл bun и нажми «Открыть»`);
+  console.log(`  4. Включи слайдер напротив bun`);
+  console.log(`  5. Вернись в этот терминал и нажми Enter, чтобы продолжить`);
+  console.log();
+  Bun.spawnSync(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]);
+  process.stdout.write("Жму Enter после того как добавил bun в Full Disk Access... ");
+  await new Promise<void>(resolve => {
+    process.stdin.once("data", () => resolve());
+    process.stdin.resume();
+  });
+  process.stdin.pause();
+  Bun.spawnSync(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/com.user.cc-dashboard`]);
+  ok("LaunchAgent перезапущен — новый bun теперь с FDA");
 
-// Safe rm: ставим обёртку для rm в bash/zsh, перенаправляющую в Корзину.
-// Открой новый Terminal-таб (или source ~/.bash_profile / source ~/.zshrc),
-// чтобы изменения подхватились — старые табы продолжат работать со стандартным rm.
-await installSafeRm();
+  // Safe rm: обёртка для rm в bash/zsh, перенаправляющая в Корзину.
+  await installSafeRm();
+}
 
 console.log();
 console.log("====================================");
