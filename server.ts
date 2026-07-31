@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v137";
+const CACHE_VERSION = "cc-dashboard-v138";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2753,11 +2753,11 @@ const HTML = `<!doctype html>
   </div>
 </div>
 <div class="topbar">
-  <button id="menu-btn" class="menu-btn" title="Меню">
+  <button id="menu-btn" class="menu-btn">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
     <span class="menu-dot" id="menu-dot" style="display:none"></span>
   </button>
-  <h1><span id="logo-home" class="logo-text" title="На главный экран">CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></span></h1>
+  <h1><span id="logo-home" class="logo-text">CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></span></h1>
   <div class="topbar-spacer"></div>
   <button id="push-btn" style="display:none"></button>
   <button id="update-btn" style="display:none"></button>
@@ -2790,7 +2790,7 @@ const HTML = `<!doctype html>
     <h2 class="ns-title">New Session</h2>
     <div class="ns-input-with-action">
       <input id="ns-cwd" type="text" class="ns-input" placeholder="Рабочая папка (по умолчанию ~/)" autocomplete="off" autocapitalize="off" autocorrect="off" />
-      <button id="ns-folder-btn" class="ns-folder-btn" title="Выбрать из недавних">
+      <button id="ns-folder-btn" class="ns-folder-btn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
       </button>
       <div id="ns-folder-list" class="ns-folder-list" style="display:none"></div>
@@ -3020,7 +3020,7 @@ function renderMd(text) {
   text = text.replace(/(^|[\\s(])\\*([^*\\n]+)\\*(?=[\\s.,!?)]|$)/g, '$1<i>$2</i>');
   // 6. Auto-link bare URLs (http/https). After bold, URLs inside <b> are preceded by '>' which we match.
   text = text.replace(/(^|[\\s>(])(https?:\\/\\/[^\\s<>"')]+)/g, (_, prefix, url) => {
-    return prefix + '<a href="' + url + '" target="_blank" rel="noopener">' + url + '</a><button class="link-copy" data-copy="' + encodeURIComponent(url) + '" title="Скопировать ссылку">' + linkCopyIcon + '</button>';
+    return prefix + '<a href="' + url + '" target="_blank" rel="noopener">' + url + '</a><button class="link-copy" data-copy="' + encodeURIComponent(url) + '">' + linkCopyIcon + '</button>';
   });
   // 6a. Auto-link uploaded files. Без target (открывается в том же окне PWA — cookie передаётся
   // и iOS сам предложит preview/share через Quick Look).
@@ -3039,10 +3039,10 @@ function renderMd(text) {
     const isBareFile = !isPath && /^[\\p{L}\\p{N}_.\\-]+\\.(zip|tar|gz|bz2|7z|rar|bat|cmd|sh|py|ts|tsx|js|jsx|json|yaml|yml|toml|txt|md|csv|xlsx|xls|docx|doc|pdf|png|jpg|jpeg|gif|webp|webm|mp4|mp3|wav|app|dmg|pkg|exe|html|css)$/iu.test(code);
     const codeHtml = '<code class="inline-code">' + escapeHtml(code) + '</code>';
     if (isPath) {
-      return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+      return codeHtml + '<button class="folder-open-btn" data-path="' + encodeURIComponent(code) + '">' + folderBtnIcon + '</button>';
     }
     if (isBareFile) {
-      return codeHtml + '<button class="folder-open-btn find" data-find="' + encodeURIComponent(code) + '" title="Найти файл на диске и открыть в Finder">' + folderBtnIcon + '</button>';
+      return codeHtml + '<button class="folder-open-btn find" data-find="' + encodeURIComponent(code) + '">' + folderBtnIcon + '</button>';
     }
     return codeHtml;
   });
@@ -3056,9 +3056,9 @@ function renderMd(text) {
     try { decodedUrl = decodeURIComponent(ml.url); } catch {}
     const isLocalPath = /^(~\\/|\\/Users\\/|\\/tmp\\/)/.test(decodedUrl);
     const linkHtml = '<a href="' + ml.url + '" target="_blank" rel="noopener">' + ml.label + '</a>';
-    const copyBtn = '<button class="link-copy" data-copy="' + encodeURIComponent(ml.url) + '" title="Скопировать ссылку">' + linkCopyIcon + '</button>';
+    const copyBtn = '<button class="link-copy" data-copy="' + encodeURIComponent(ml.url) + '">' + linkCopyIcon + '</button>';
     if (isLocalPath) {
-      return linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(decodedUrl) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>';
+      return linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(decodedUrl) + '">' + folderBtnIcon + '</button>';
     }
     return linkHtml + copyBtn;
   });
@@ -3091,8 +3091,8 @@ function renderMd(text) {
     const trimmed = code.trim();
     const isSingleLinePath = !trimmed.includes("\\n") && /^(~\\/|\\/Users\\/|\\/tmp\\/)[^'"]+$/.test(trimmed);
     const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
-    const folderBtn = isSingleLinePath ? '<button class="folder-open-btn" data-path="' + encodeURIComponent(trimmed) + '" title="Открыть в Finder">' + folderBtnIcon + '</button>' : '';
-    return '<div class="' + wrapClass + '">' + actionLabel + '<button class="copy-btn" data-copy="' + enc + '" title="Скопировать">' + copyIcon + '</button>' + folderBtn + '<pre class="' + blockClass + '"><code>' + escaped + '</code></pre></div>';
+    const folderBtn = isSingleLinePath ? '<button class="folder-open-btn" data-path="' + encodeURIComponent(trimmed) + '">' + folderBtnIcon + '</button>' : '';
+    return '<div class="' + wrapClass + '">' + actionLabel + '<button class="copy-btn" data-copy="' + enc + '">' + copyIcon + '</button>' + folderBtn + '<pre class="' + blockClass + '"><code>' + escaped + '</code></pre></div>';
   });
   return text;
 }
@@ -3105,14 +3105,14 @@ function buildCardsHTML(sessions) {
     const badge = isDead ? '<span class="badge">закрыто</span>' : (s.isDesktop ? '<span class="badge">desktop</span>' : '');
     const pidLabel = '';
     const head = s.title
-      ? \`<div class="title">\${escapeHtml(s.title)}\${s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : ''}</div>\${badge ? \`<div class="cwd">\${badge}</div>\` : ''}\`
-      : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : ''}\${badge}</div>\`;
+      ? \`<div class="title">\${escapeHtml(s.title)}\${s.hasOpenQuestion ? '<span class="q-badge">?</span>' : ''}</div>\${badge ? \`<div class="cwd">\${badge}</div>\` : ''}\`
+      : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${s.hasOpenQuestion ? '<span class="q-badge">?</span>' : ''}\${badge}</div>\`;
     const classes = [s.status, s.isSelf ? 'self' : '', panels.has(s.sessionId) ? 'open' : '', isDead ? 'dead' : '', s.hasOpenQuestion ? 'has-question' : ''].filter(Boolean).join(' ');
-    const qBadge = s.hasOpenQuestion ? '<span class="q-badge" title="Ждёт твой выбор">?</span>' : '';
+    const qBadge = s.hasOpenQuestion ? '<span class="q-badge">?</span>' : '';
     // Resume-кнопка для мёртвых сессий (в т.ч. главной — раньше исключалась, но если main упала после ребута,
     // юзер должен её тоже поднять). data-title передаёт название чтобы после resume автоматом /rename.
     const resumeBtn = isDead ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-title="\${escapeHtml(s.title || '')}">▶ Resume</button>\` : '';
-    const hideBtn = s.isMain ? \`<span class="main-pin" title="Главная сессия дашборда — нельзя удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><line x1="12" y1="22" x2="12" y2="8"/><path d="M5 12H2a10 10 0 0 0 20 0h-3"/></svg></span>\` : \`<button class="hide-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-dead="\${isDead ? '1' : '0'}" title="Закрыть/удалить">X</button>\`;
+    const hideBtn = s.isMain ? \`<span class="main-pin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><line x1="12" y1="22" x2="12" y2="8"/><path d="M5 12H2a10 10 0 0 0 20 0h-3"/></svg></span>\` : \`<button class="hide-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-dead="\${isDead ? '1' : '0'}">X</button>\`;
     return \`
       <div class="card \${classes}" data-sid="\${s.sessionId}">
         \${head}
@@ -4029,8 +4029,8 @@ function openPanel(sid) {
       <button class="focus-btn" title="Поднять окно терминала">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
       </button>
-      <button class="interrupt-btn" title="Прервать текущий процесс claude (Esc)">Stop</button>
-      <button class="close-btn" title="Закрыть панель">
+      <button class="interrupt-btn">Stop</button>
+      <button class="close-btn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></svg>
       </button>
     </div>
@@ -4043,16 +4043,16 @@ function openPanel(sid) {
       <div class="attachments" style="display:none"></div>
       <div class="composer">
         <input type="file" class="file-input" style="display:none" multiple>
-        <button class="attach-btn" title="Прикрепить файл (или drag-drop в панель)">
+        <button class="attach-btn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
         </button>
         <textarea placeholder="Сообщение" rows="1"></textarea>
-        <button class="mic-btn" title="Записать голос → whisper расшифрует в текст">
+        <button class="mic-btn">
           <svg class="mic-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 0 0-7 0v5.5A3.5 3.5 0 0 0 12 14z"/><path d="M19 10.5a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.57A7 7 0 0 0 19 10.5z" fill-opacity="0.85"/></svg>
           <svg class="mic-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M12 3a9 9 0 1 1-9 9"/></svg>
           <svg class="rec-waves" viewBox="0 0 27 18" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><rect x="0" y="6" width="3" height="6" rx="1.5" fill="#fff"><animate attributeName="y" values="6;1;6" keyTimes="0;0.5;1" dur="0.9s" begin="0s" repeatCount="indefinite"/><animate attributeName="height" values="6;16;6" keyTimes="0;0.5;1" dur="0.9s" begin="0s" repeatCount="indefinite"/></rect><rect x="6" y="3" width="3" height="12" rx="1.5" fill="#fff"><animate attributeName="y" values="3;0;3" keyTimes="0;0.5;1" dur="0.9s" begin="0.15s" repeatCount="indefinite"/><animate attributeName="height" values="12;18;12" keyTimes="0;0.5;1" dur="0.9s" begin="0.15s" repeatCount="indefinite"/></rect><rect x="12" y="0" width="3" height="18" rx="1.5" fill="#fff"><animate attributeName="y" values="0;3;0" keyTimes="0;0.5;1" dur="0.9s" begin="0.3s" repeatCount="indefinite"/><animate attributeName="height" values="18;12;18" keyTimes="0;0.5;1" dur="0.9s" begin="0.3s" repeatCount="indefinite"/></rect><rect x="18" y="3" width="3" height="12" rx="1.5" fill="#fff"><animate attributeName="y" values="3;0;3" keyTimes="0;0.5;1" dur="0.9s" begin="0.45s" repeatCount="indefinite"/><animate attributeName="height" values="12;18;12" keyTimes="0;0.5;1" dur="0.9s" begin="0.45s" repeatCount="indefinite"/></rect><rect x="24" y="6" width="3" height="6" rx="1.5" fill="#fff"><animate attributeName="y" values="6;1;6" keyTimes="0;0.5;1" dur="0.9s" begin="0.6s" repeatCount="indefinite"/><animate attributeName="height" values="6;16;6" keyTimes="0;0.5;1" dur="0.9s" begin="0.6s" repeatCount="indefinite"/></rect></svg>
         </button>
-        <button class="send-btn" style="display:none" title="Отправить">
+        <button class="send-btn" style="display:none">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
       </div>
@@ -5168,7 +5168,7 @@ async function checkUpdate() {
     if (updState) {
       const ver = info.local || "?";
       updState.innerHTML = info.available
-        ? "v" + ver + ' <span class="green-dot" title="доступно обновление до v' + info.remote + '"></span>'
+        ? "v" + ver + ' <span class="green-dot"></span>'
         : "v" + ver;
     }
     const dots = ["menu-dot", "settings-dot", "updates-dot"];
