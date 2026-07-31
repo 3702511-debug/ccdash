@@ -1778,133 +1778,156 @@ function preferredTerm(): TerminalApp {
   return app;
 }
 
-// pid запущенного терминала (используется CGEventPostToPid для отправки клавиш).
-// Кэш 60с. Возвращает pid preferred-терминала.
-let terminalPidCache: { pid: number; app: TerminalApp; at: number } | null = null;
-async function getTerminalPid(): Promise<number | null> {
-  const wantApp = preferredTerm();
-  if (terminalPidCache && terminalPidCache.app === wantApp && Date.now() - terminalPidCache.at < 60000) {
-    return terminalPidCache.pid;
-  }
-  // pgrep -x: Terminal.app — process name "Terminal"; iTerm2.app — process name "iTerm2".
-  const proc = Bun.spawnSync(["pgrep", "-x", wantApp]);
-  const out = proc.stdout.toString().trim();
-  const pid = parseInt(out.split("\n")[0], 10);
+// getTerminalPid() удалён — CGEvent-функции теперь ходят через selectTabForCGEvent(),
+// который сам решает какой процесс (Terminal или iTerm2) содержит нужный tty и
+// возвращает соответствующий pid. Preferred-app влияет только на порядок обхода
+// (сначала preferred, потом второй).
+
+// SELECT_TAB — см. UNIFIED_SELECT_TAB_SCRIPT ниже. Раньше было две константы
+// (TERMINAL_SELECT_TAB_SCRIPT, ITERM_SELECT_TAB_SCRIPT), одна из которых
+// выбиралась по preferredTerm(). Сейчас единый скрипт пробует ОБА и возвращает
+// нашедшее приложение — это нужно чтобы CGEvent работал корректно когда часть
+// сессий в Terminal.app, а часть в iTerm2.
+
+// Универсальный SELECT_TAB — пробует ОБА терминала (по preferred сначала, потом второй).
+// Нужно чтобы отправка CGEvent-клавиш работала правильно и когда юзер частично
+// мигрировал: часть сессий в Terminal.app, часть в iTerm2. Возвращает:
+//   "ok:Terminal" / "ok:iTerm2"  — вкладка выбрана в указанном приложении
+//   "race:Terminal" / "race:iTerm2" — параллельный select, надо retry
+//   "tty not found"              — ни там, ни там нет
+const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
+  set targetTty to "/dev/" & (item 1 of argv)
+  set firstApp to item 2 of argv
+  -- Порядок обхода: сначала firstApp, потом второй.
+  if firstApp is "iTerm2" then
+    set apps to {"iTerm2", "Terminal"}
+  else
+    set apps to {"Terminal", "iTerm2"}
+  end if
+  repeat with appName in apps
+    set an to appName as string
+    if an is "iTerm2" then
+      try
+        tell application "iTerm2"
+          if it is running then
+            repeat with w in windows
+              try
+                repeat with t in tabs of w
+                  try
+                    repeat with s in sessions of t
+                      try
+                        if (tty of s) is targetTty then
+                          tell s to select
+                          tell w to set frontmost to true
+                          set attempts to 0
+                          repeat
+                            delay 0.2
+                            set activeTty to ""
+                            try
+                              set activeTty to tty of (current session of current tab of w)
+                            end try
+                            if activeTty is targetTty then return "ok:iTerm2"
+                            set attempts to attempts + 1
+                            if attempts ≥ 2 then return "race:iTerm2"
+                            tell s to select
+                            tell w to set frontmost to true
+                          end repeat
+                        end if
+                      end try
+                    end repeat
+                  end try
+                end repeat
+              end try
+            end repeat
+          end if
+        end tell
+      end try
+    else
+      try
+        tell application "Terminal"
+          if it is running then
+            repeat with w in windows
+              try
+                set tabCount to 0
+                try
+                  set tabCount to count of tabs of w
+                end try
+                if tabCount > 0 then
+                  repeat with t in tabs of w
+                    try
+                      if (tty of t) is targetTty then
+                        set selected of t to true
+                        set frontmost of w to true
+                        set index of w to 1
+                        set attempts to 0
+                        repeat
+                          delay 0.2
+                          set activeTty to ""
+                          try
+                            set activeTty to tty of (selected tab of w)
+                          end try
+                          if activeTty is targetTty then return "ok:Terminal"
+                          set attempts to attempts + 1
+                          if attempts ≥ 2 then return "race:Terminal"
+                          set selected of t to true
+                          set frontmost of w to true
+                        end repeat
+                      end if
+                    end try
+                  end repeat
+                end if
+              end try
+            end repeat
+          end if
+        end tell
+      end try
+    end if
+  end repeat
+  return "tty not found"
+end run`;
+
+// Кэш pid по имени приложения (для CGEventPostToPid после успешного select).
+const termPidByApp = new Map<TerminalApp, { pid: number; at: number }>();
+async function getPidForApp(app: TerminalApp): Promise<number | null> {
+  const cached = termPidByApp.get(app);
+  if (cached && Date.now() - cached.at < 60000) return cached.pid;
+  const proc = Bun.spawnSync(["pgrep", "-x", app]);
+  const pid = parseInt(proc.stdout.toString().trim().split("\n")[0], 10);
   if (Number.isInteger(pid) && pid > 0) {
-    terminalPidCache = { pid, app: wantApp, at: Date.now() };
+    termPidByApp.set(app, { pid, at: Date.now() });
     return pid;
   }
   return null;
 }
 
-// Шаблон AppleScript для выбора tab по tty + verify-after-select (анти-race).
-// При 30+ окнах Terminal асинхронно переключает selected, и параллельные select'ы могут
-// заглушить друг друга → CGSendText/Key попадает в чужую вкладку. Verify-loop гарантирует
-// что после возврата 'ok' активный таб — именно targetTty. Возможные return values:
-//   "ok"           — таб выбран и активен
-//   "race"         — таб найден, но не удалось удержать активность (параллельный select)
-//   "tty not found" — tty вообще нет в Terminal
-const TERMINAL_SELECT_TAB_SCRIPT = `on run argv
-  set targetTty to "/dev/" & (item 1 of argv)
-  tell application "Terminal"
-    repeat with w in windows
-      try
-        set tabCount to 0
-        try
-          set tabCount to count of tabs of w
-        end try
-        if tabCount > 0 then
-          repeat with t in tabs of w
-            try
-              if (tty of t) is targetTty then
-                set selected of t to true
-                set frontmost of w to true
-                set index of w to 1
-                set attempts to 0
-                repeat
-                  delay 0.2
-                  set activeTty to ""
-                  try
-                    set activeTty to tty of (selected tab of w)
-                  end try
-                  if activeTty is targetTty then return "ok"
-                  set attempts to attempts + 1
-                  if attempts ≥ 2 then return "race"
-                  set selected of t to true
-                  set frontmost of w to true
-                end repeat
-              end if
-            end try
-          end repeat
-        end if
-      end try
-    end repeat
-  end tell
-  return "tty not found"
-end run`;
-
-// iTerm2-версия SELECT_TAB. У iTerm session сама сфокусирована через `select`
-// (session — это split-pane внутри tab; tab select'ится косвенно через select session).
-// tty у iTerm живёт на уровне session, не tab. Race-guard делается через
-// current session of current tab of current window == target.
-const ITERM_SELECT_TAB_SCRIPT = `on run argv
-  set targetTty to "/dev/" & (item 1 of argv)
-  tell application "iTerm2"
-    repeat with w in windows
-      try
-        repeat with t in tabs of w
-          try
-            repeat with s in sessions of t
-              try
-                if (tty of s) is targetTty then
-                  tell s to select
-                  tell w to set frontmost to true
-                  set attempts to 0
-                  repeat
-                    delay 0.2
-                    set activeTty to ""
-                    try
-                      set activeTty to tty of (current session of current tab of w)
-                    end try
-                    if activeTty is targetTty then return "ok"
-                    set attempts to attempts + 1
-                    if attempts ≥ 2 then return "race"
-                    tell s to select
-                    tell w to set frontmost to true
-                  end repeat
-                end if
-              end try
-            end repeat
-          end try
-        end repeat
-      end try
-    end repeat
-  end tell
-  return "tty not found"
-end run`;
-
-function selectTabScript(): string {
-  return preferredTerm() === "iTerm2" ? ITERM_SELECT_TAB_SCRIPT : TERMINAL_SELECT_TAB_SCRIPT;
+// Выбирает tab в правильном терминале и возвращает { ok, app, pid, error } —
+// pid нужен вызывающему коду чтобы отправить CGEvent именно в этот процесс.
+async function selectTabForCGEvent(tty: string): Promise<{ ok: boolean; app?: TerminalApp; pid?: number; error?: string; race?: boolean }> {
+  const first = preferredTerm();
+  let sel = Bun.spawnSync(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
+  let out = sel.stdout.toString().trim();
+  if (out.startsWith("race:")) {
+    await new Promise(r => setTimeout(r, 300));
+    sel = Bun.spawnSync(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
+    out = sel.stdout.toString().trim();
+  }
+  if (out.startsWith("race:")) return { ok: false, race: true, error: "race: параллельная отправка в другую вкладку" };
+  if (out === "tty not found") return { ok: false, error: "tab not found" };
+  if (!out.startsWith("ok:")) return { ok: false, error: "unexpected: " + out };
+  const app = out.slice(3) as TerminalApp;
+  const pid = await getPidForApp(app);
+  if (!pid) return { ok: false, error: app + " not running" };
+  return { ok: true, app, pid };
 }
 
 // Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
 async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
   if (!text) return { ok: false, error: "empty text" };
-  const termPid = await getTerminalPid();
-  if (!termPid) return { ok: false, error: "Terminal not found" };
-  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-  let selOut = sel.stdout.toString().trim();
-  if (selOut === "race") {
-    // Auto-retry один раз через 300мс — обычно к этому моменту параллельный select отработал
-    await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-    selOut = sel.stdout.toString().trim();
-  }
-  if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
-  if (selOut !== "ok") return { ok: false, error: "tab not found" };
+  const sel = await selectTabForCGEvent(tty);
+  if (!sel.ok) return { ok: false, error: sel.error };
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
-  cgSendText(termPid, text);
-  console.log(`[type-text ${tty}] len=${text.length} CG-direct OK pid=${termPid}`);
+  cgSendText(sel.pid!, text);
+  console.log(`[type-text ${tty}] len=${text.length} CG-direct OK pid=${sel.pid} app=${sel.app}`);
   return { ok: true };
 }
 
@@ -1916,47 +1939,23 @@ async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "
   };
   const keyCode = keyMap[key];
   if (keyCode === undefined) return { ok: false, error: "invalid key" };
-
-  const termPid = await getTerminalPid();
-  if (!termPid) return { ok: false, error: "Terminal not found" };
-
-  // Set tab selected + bring its window to TERMINAL'S front (не системный фронт — Safari остаётся фронт),
-  // чтобы CGEvent шёл именно в этот таб, а не в чужой. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
-  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-  let selOut = sel.stdout.toString().trim();
-  if (selOut === "race") {
-    await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-    selOut = sel.stdout.toString().trim();
-  }
-  if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
-  if (selOut !== "ok") return { ok: false, error: "tab not found" };
-
+  // selectTabForCGEvent автоматически найдёт tty в Terminal или iTerm2 и вернёт pid нужного приложения.
+  const sel = await selectTabForCGEvent(tty);
+  if (!sel.ok) return { ok: false, error: sel.error };
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
-  cgSendKey(termPid, keyCode);
-  console.log(`[send-raw-key ${tty}] key=${key} (code=${keyCode}) CG-direct OK pid=${termPid}`);
+  cgSendKey(sel.pid!, keyCode);
+  console.log(`[send-raw-key ${tty}] key=${key} (code=${keyCode}) CG-direct OK pid=${sel.pid} app=${sel.app}`);
   return { ok: true };
 }
 
 async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: string): Promise<{ ok: boolean; error?: string }> {
   if (optionIndex < 1 || optionIndex > 9) return { ok: false, error: "optionIndex out of range 1-9" };
   const downs = optionIndex - 1;
-  const termPid = await getTerminalPid();
-  if (!termPid) return { ok: false, error: "Terminal process not found" };
-  // Шаг 1: AppleScript — БЕЗ `activate` Terminal'а, только выбираем нужную вкладку внутри Terminal.
-  // Это не переключает system focus. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
-  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-  let selOut = sel.stdout.toString().trim();
-  if (selOut === "race") {
-    await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
-    selOut = sel.stdout.toString().trim();
-  }
-  if (selOut === "race") return { ok: false, error: "race: параллельный ответ другому poll" };
-  if (selOut !== "ok") return { ok: false, error: "tab " + tty + " not found in Terminal" };
-  // Шаг 2: грузим CG-FFI
+  const sel = await selectTabForCGEvent(tty);
+  if (!sel.ok) return { ok: false, error: sel.error };
+  const termPid = sel.pid!;
   if (!loadCG()) return { ok: false, error: "CGEvent FFI failed to load" };
-  // Шаг 3: посылаем клавиши через CGEventPostToPid → Terminal-процесс (без focus)
+  // Шаг 3: посылаем клавиши через CGEventPostToPid → правильный процесс терминала (без focus)
   try {
     for (let i = 0; i < downs; i++) {
       cgSendKey(termPid, 125);  // Down arrow
@@ -2019,7 +2018,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v125";
+const CACHE_VERSION = "cc-dashboard-v126";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6217,7 +6216,7 @@ end tell`;
       if (resumeSid) {
         const livePids = await gatherPidInfos();
         if (livePids.some(p => p.sessionId === resumeSid)) {
-          return Response.json({ error: "Эта сессия уже открыта в Terminal — нельзя дублировать. Открой её карточку в дашборде." }, { status: 409 });
+          return Response.json({ error: "Эта сессия уже открыта в терминале — нельзя дублировать. Открой её карточку в дашборде." }, { status: 409 });
         }
       }
       console.log(`[new-session] cwd=${cwd} resume=${resumeSid || "(new)"} rc=${rc}`);
@@ -6831,11 +6830,11 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       // Поэтому печатаем через CGEventKeyboardSetUnicodeString (живой набор), потом Enter отдельно.
       if (text.trimStart().startsWith("!")) {
         const typed = await sendTextToTui(meta.tty, text);
-        if (!typed.ok) return Response.json({ terminal: "Terminal", error: typed.error ?? "type-text failed" }, { status: 500 });
+        if (!typed.ok) return Response.json({ terminal: preferredTerm(), error: typed.error ?? "type-text failed" }, { status: 500 });
         await new Promise(r => setTimeout(r, 120));
         const enter = await sendRawKey(meta.tty, "enter");
-        if (!enter.ok) return Response.json({ terminal: "Terminal", error: enter.error ?? "enter failed" }, { status: 500 });
-        return Response.json({ terminal: "Terminal", pasteHint: true });
+        if (!enter.ok) return Response.json({ terminal: preferredTerm(), error: enter.error ?? "enter failed" }, { status: 500 });
+        return Response.json({ terminal: preferredTerm(), pasteHint: true });
       }
       // Auto-retry на race: если две /send'а в РАЗНЫЕ tabs летят одновременно,
       // AppleScript для одного из них может не успеть удержать активность tab'а — возвращает "race".
@@ -6852,7 +6851,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
         return Response.json({ terminal: "race", error: `Не удалось удержать активность вкладки ttyS${meta.tty.replace(/^.*ttys/, "")} — два сообщения в разные чаты одновременно. Повтори отправку через секунду.` }, { status: 500 });
       }
       if (result === "none") {
-        return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден в Terminal/iTerm — окно закрыто? Или у тебя >30 окон Terminal, закрой лишние.` }, { status: 500 });
+        return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден ни в Terminal, ни в iTerm2 — окно закрыто? Или у тебя >30 окон терминала, закрой лишние.` }, { status: 500 });
       }
       if (stderr) {
         return Response.json({ terminal: result, error: stderr }, { status: 500 });
