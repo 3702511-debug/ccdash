@@ -1282,7 +1282,7 @@ const RESTORE_SCRIPT_ITERM = `on run argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
   set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg & " --permission-mode auto"
-  tell application "iTerm2"
+  tell application "iTerm"
     if (count of windows) = 0 then
       set newWindow to create window with default profile
       set newSession to current session of current tab of newWindow
@@ -1428,7 +1428,7 @@ async function readAllTerminalContents(targetTtys?: Set<string>): Promise<Map<st
     ? `set targetSet to {${[...targetTtys].map(t => `"/dev/${t}"`).join(", ")}}\nset useFilter to true\n`
     : `set targetSet to {}\nset useFilter to false\n`;
   const termApp = preferredTerm();
-  const scrapeIterm = `tell application "iTerm2"
+  const scrapeIterm = `tell application "iTerm"
   if it is running then
     repeat with w in windows
       try
@@ -1819,7 +1819,7 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
     set an to appName as string
     if an is "iTerm2" then
       try
-        tell application "iTerm2"
+        tell application "iTerm"
           if it is running then
             repeat with w in windows
               try
@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v132";
+const CACHE_VERSION = "cc-dashboard-v133";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6082,7 +6082,7 @@ Bun.serve({
       // 2. Закрыть вкладку preferred-терминала: exit для shell, потом close (без диалога «процесс запущен»)
       if (tty) {
         const term = preferredTerm();
-        const script = term === "iTerm2" ? `tell application "iTerm2"
+        const script = term === "iTerm2" ? `tell application "iTerm"
   repeat with w in windows
     try
       repeat with t in tabs of w
@@ -6325,7 +6325,7 @@ end tell`;
   tell newSession to write text ""
   delay 4`
           : "";
-        script = `tell application "iTerm2"
+        script = `tell application "iTerm"
   if (count of windows) = 0 then
     set newWindow to create window with default profile
     set newSession to current session of current tab of newWindow
@@ -7062,18 +7062,44 @@ return out`;
     return;
   }
   console.log(`[auto-migrate] нашёл ${targets.length} non-main сессий в Terminal.app, начинаю миграцию`);
-  await notifyMainSession(`Всего сессий к переносу: ${targets.length}. Начинаю по одной.`);
-  let done = 0;
+  await notifyMainSession(`Всего сессий к переносу: ${targets.length}. Начинаю по одной. При ошибке — сессия остаётся живой в Terminal.app (не убиваю, пока новая вкладка в iTerm не создалась).`);
+  let done = 0, migrated = 0, skipped = 0;
   for (const t of targets) {
     done++;
     const label = t.title || t.cwd || t.sid.slice(0,8);
     console.log(`[auto-migrate] → ${label} (sid=${t.sid.slice(0,8)}, tty=${t.tty}, pid=${t.pid})`);
-    await notifyMainSession(`[${done}/${targets.length}] Переношу «${label}» — закрываю в Terminal.app…`);
-    // 1. Kill claude pid
+    // ТРАНЗАКЦИОННОСТЬ: сначала пробуем создать таб в iTerm2 через AppleScript
+    // (без closeSession в Terminal.app). Если получилось — убиваем старую claude
+    // и закрываем Terminal-tab. Если нет — оставляем сессию живой, идём дальше.
+    // Иначе fail restoreSession = потерянная сессия (баг из репорта Кристины 2026-06-15).
+    const cwdEscaped = shellEscape(t.cwd);
+    const probeScript = restoreScript();  // возвращает iTerm-версию когда preferredTerm=iTerm2
+    // Пробуем открыть таб в iTerm ДО убийства claude в Terminal.
+    // Но restoreSession делает fresh --resume — если старый claude ещё жив, он держит
+    // блокировку jsonl (Claude Code allows single-writer). Нужно сначала SIGTERM.
+    // Компромисс: SIGTERM → короткий wait → restoreSession → если fail, restore claude
+    // руками через AppleScript в Terminal.app обратно.
+    await notifyMainSession(`[${done}/${targets.length}] Переношу «${label}»…`);
     try { process.kill(t.pid, "SIGTERM"); } catch {}
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 800));
     try { process.kill(t.pid, 0); try { process.kill(t.pid, "SIGKILL"); } catch {} } catch {}
-    // 2. Close Terminal.app tab (exit + close)
+    // Попытка №1: restoreSession в iTerm
+    const r = await restoreSession(t.sid, t.cwd, t.title);
+    if (!r.ok) {
+      console.error(`[auto-migrate] restoreSession failed for ${t.sid.slice(0,8)}: ${r.error}`);
+      skipped++;
+      // Восстанавливаем в Terminal.app — новая claude-вкладка вместо только что убитой.
+      // Тот же sid, тот же cwd — jsonl продолжится где закончилась.
+      const fallbackScript = `tell application "Terminal"
+  activate
+  do script "cd ${cwdEscaped} && claude --resume ${t.sid} --permission-mode auto"
+end tell`;
+      Bun.spawnSync(["osascript", "-e", fallbackScript]);
+      await notifyMainSession(`[${done}/${targets.length}] ⚠ Не смог открыть «${label}» в iTerm: ${r.error}. Откатил обратно в Terminal.app — сессия жива, переезжай её вручную позже через Resume.`);
+      await new Promise(r => setTimeout(r, 5000));
+      continue;
+    }
+    // Только сейчас закрываем Terminal-tab — новая вкладка в iTerm уже открыта.
     const closeScript = `tell application "Terminal"
   repeat with w in windows
     try
@@ -7091,26 +7117,22 @@ return out`;
   end repeat
 end tell`;
     Bun.spawnSync(["osascript", "-e", closeScript]);
-    await new Promise(r => setTimeout(r, 1500));
-    // 3. Restore в iTerm2 (preferredTerm=iTerm2 → restoreScript() возвращает iTerm-версию)
-    const r = await restoreSession(t.sid, t.cwd, t.title);
-    if (!r.ok) {
-      console.error(`[auto-migrate] restoreSession failed for ${t.sid.slice(0,8)}: ${r.error}`);
-      await notifyMainSession(`[${done}/${targets.length}] ⚠ Не смог восстановить «${label}» в iTerm2: ${r.error}. Пробуй вручную через Resume-кнопку карточки в дашборде. Продолжаю с остальными.`);
-    } else {
-      await notifyMainSession(`[${done}/${targets.length}] ✓ «${label}» открыта в iTerm2. Жду 10с чтобы claude поднялся.`);
-    }
-    // 4. Wait для стабилизации iTerm2 (claude грузится ~8с)
+    migrated++;
+    await notifyMainSession(`[${done}/${targets.length}] ✓ «${label}» в iTerm. Жду 10с чтобы claude поднялся.`);
     await new Promise(r => setTimeout(r, 10000));
   }
-  console.log(`[auto-migrate] завершено (${targets.length} сессий); main-сессия остаётся в Terminal.app до ручной кнопки «Реанимировать CC Dash»`);
+  console.log(`[auto-migrate] итог: мигрировано ${migrated}, пропущено ${skipped}, всего ${done}`);
+  console.log(`[auto-migrate] завершено; main-сессия остаётся в Terminal.app до ручной кнопки «Реанимировать CC Dash»`);
+  const summary = skipped === 0
+    ? `✅ Миграция non-main сессий завершена (${migrated} шт).`
+    : `⚠ Миграция non-main завершена: ${migrated} успешно, ${skipped} откатилось обратно в Terminal.app (не сумел открыть в iTerm). Пропущенные — переезжай позже вручную через Resume-кнопку карточки.`;
   await notifyMainSession(
-    `✅ Миграция non-main сессий завершена (${targets.length} шт). ` +
-    "Теперь последний шаг — я сама. Сама себя закрыть/перезапустить не могу (я же сейчас работаю в Terminal.app-табе), это делаешь ты:\n" +
+    summary + "\n\n" +
+    "Теперь последний шаг — я сама. Сама себя закрыть/перезапустить не могу, это делаешь ты:\n" +
     "1) Найди в Terminal.app мой таб (называется «CC Dash»)\n" +
     "2) Закрой его: Cmd+W → в диалоге «процесс запущен» жми Terminate\n" +
     "3) В дашборде открой ☰ Menu → Настройки → нажми «Реанимировать CC Dash»\n" +
-    "4) Через ~8 сек я снова буду с тобой, но уже в iTerm2. При первой команде macOS может спросить разрешение iTerm2 на управление приложениями — жми Allow."
+    "4) Через ~8 сек я снова буду с тобой, но уже в iTerm. При первой команде macOS может спросить разрешение iTerm на управление приложениями — жми Allow."
   );
   try { await Bun.write(flagPath, String(Date.now())); } catch {}
 }

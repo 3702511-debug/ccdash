@@ -345,7 +345,7 @@ if (!existsSync(mainSessionPath)) {
   } catch {}
   log(`Создаю главную сессию «CC Dash» в ${preferredApp}…`);
   const cwdEsc = SRC.replace(/"/g, '\\"');
-  const script = preferredApp === "iTerm2" ? `tell application "iTerm2"
+  const script = preferredApp === "iTerm2" ? `tell application "iTerm"
   activate
   if (count of windows) = 0 then
     set newWindow to create window with default profile
