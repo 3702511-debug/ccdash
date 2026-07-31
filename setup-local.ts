@@ -309,14 +309,15 @@ if (!existsSync(mainSessionPath)) {
   const script = preferredApp === "iTerm2" ? `tell application "iTerm2"
   activate
   if (count of windows) = 0 then
-    set newWindow to create window with default profile command "cd \\"${cwdEsc}\\" && claude"
+    set newWindow to create window with default profile
     set newSession to current session of current tab of newWindow
   else
     tell current window
-      set newTab to create tab with default profile command "cd \\"${cwdEsc}\\" && claude"
+      create tab with default profile
     end tell
     set newSession to current session of current tab of current window
   end if
+  tell newSession to write text "cd \\"${cwdEsc}\\" && claude"
   delay 8
   tell newSession to write text "/rename CC Dash"
   delay 0.2

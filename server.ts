@@ -1156,8 +1156,11 @@ const APPLESCRIPT_BODY = `on run argv
               try
                 if (tty of s) is targetTty then
                   if actionArg is "focus" then
-                    select t
-                    tell w to set frontmost to true
+                    -- iTerm2: select у session переключает tab, select у window
+                    -- поднимает окно. set frontmost для window бросает AppleEvent
+                    -- handler failure (в отличие от Terminal.app).
+                    tell s to select
+                    tell w to select
                     activate
                   else if actionArg is "send" then
                     -- write text delivers to the session's stdin without focus jump
@@ -1264,7 +1267,9 @@ const RESTORE_SCRIPT_TERMINAL = `on run argv
   return "ok"
 end run`;
 
-// iTerm2 версия: create tab with default profile command "..." автоматически исполняет команду.
+// iTerm2 версия: ВАЖНО — `create tab with default profile command "..."` вешает AppleScript
+// с -1712 (AppleEvent timeout). Двухшаговый подход (create tab БЕЗ command, потом write text)
+// работает моментально.
 // /rename шлём через write text — iTerm2 не имеет `do script in newTab`, но write text — эквивалент stdin.
 const RESTORE_SCRIPT_ITERM = `on run argv
   set cwdEscaped to item 1 of argv
@@ -1274,14 +1279,15 @@ const RESTORE_SCRIPT_ITERM = `on run argv
   set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg
   tell application "iTerm2"
     if (count of windows) = 0 then
-      set newWindow to create window with default profile command cmd
+      set newWindow to create window with default profile
       set newSession to current session of current tab of newWindow
     else
       tell current window
-        set newTab to create tab with default profile command cmd
+        create tab with default profile
       end tell
       set newSession to current session of current tab of current window
     end if
+    tell newSession to write text cmd
     if titleArg is not "" then
       delay 8
       tell newSession to write text "/rename " & titleArg
@@ -1818,7 +1824,7 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
                       try
                         if (tty of s) is targetTty then
                           tell s to select
-                          tell w to set frontmost to true
+                          tell w to select
                           set attempts to 0
                           repeat
                             delay 0.2
@@ -1830,7 +1836,7 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
                             set attempts to attempts + 1
                             if attempts ≥ 2 then return "race:iTerm2"
                             tell s to select
-                            tell w to set frontmost to true
+                            tell w to select
                           end repeat
                         end if
                       end try
@@ -2018,7 +2024,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v128";
+const CACHE_VERSION = "cc-dashboard-v129";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6293,14 +6299,15 @@ end tell`;
           : "";
         script = `tell application "iTerm2"
   if (count of windows) = 0 then
-    set newWindow to create window with default profile command "cd \\"${cwdEsc}\\" && ${claudeCmd}"
+    set newWindow to create window with default profile
     set newSession to current session of current tab of newWindow
   else
     tell current window
-      set newTab to create tab with default profile command "cd \\"${cwdEsc}\\" && ${claudeCmd}"
+      create tab with default profile
     end tell
     set newSession to current session of current tab of current window
   end if
+  tell newSession to write text "cd \\"${cwdEsc}\\" && ${claudeCmd}"
   ${renameBlock}
   ${rcBlock}
   delay 0.5
