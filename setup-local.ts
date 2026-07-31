@@ -189,29 +189,38 @@ if (!haveBrew) {
   }
 }
 
-// 4.4. iTerm2 — host-терминал для claude-сессий (вместо Terminal.app).
+// 4.4. iTerm — host-терминал для claude-сессий (вместо Terminal.app).
 // Ставим через brew --cask (в /Applications, без sudo), затем создаём
 // ~/.cc-dashboard/terminal.json = {"app":"iTerm2"} — дашборд после этого
-// открывает все новые/восстановленные сессии в iTerm2. Терминальные окна
+// открывает все новые/восстановленные сессии в iTerm. Терминальные окна
 // собираются в одном приложении (визуально удобнее чем россыпь Terminal-окон).
+// ВАЖНО: terminal.json создаём только если iTerm ФАКТИЧЕСКИ установлен —
+// иначе блок 6 (создание CC Dash) попытается открыть в несуществующем iTerm
+// и AppleScript упадёт, CC Dash не создастся.
+function iterm2Installed(): boolean {
+  return existsSync("/Applications/iTerm.app") || existsSync(join(HOME, "Applications", "iTerm.app"));
+}
 if (!haveBrew) {
   log("(iTerm2): brew не найден — пропускаю. Поставь brew и запусти setup-local.ts повторно.");
 } else {
-  const itermInstalled = existsSync("/Applications/iTerm.app") || existsSync(join(HOME, "Applications", "iTerm.app"));
-  if (!itermInstalled) {
+  if (!iterm2Installed()) {
     log("Устанавливаю iTerm2 (host-терминал для claude-сессий)…");
     const r = Bun.spawnSync([brewBin, "install", "--cask", "iterm2"], { stdout: "inherit", stderr: "inherit" });
-    if (r.exitCode === 0) ok("iTerm2 установлен"); else log("  brew install --cask iterm2 вернул non-zero — поставь вручную");
+    if (r.exitCode === 0) ok("iTerm2 установлен"); else log("  brew install --cask iterm2 вернул non-zero — поставь вручную (brew install --cask iterm2)");
   } else {
     ok("iTerm2 уже установлен");
   }
-  // terminal.json создаём только если файла нет — не перезаписываем осознанный выбор юзера
+  // Повторная проверка ПОСЛЕ brew — только тогда пишем terminal.json.
   const terminalJsonPath = join(RUNTIME, "terminal.json");
-  if (!existsSync(terminalJsonPath)) {
-    await Bun.write(terminalJsonPath, JSON.stringify({ app: "iTerm2" }, null, 2));
-    ok("~/.cc-dashboard/terminal.json создан (preferred = iTerm2)");
+  if (iterm2Installed()) {
+    if (!existsSync(terminalJsonPath)) {
+      await Bun.write(terminalJsonPath, JSON.stringify({ app: "iTerm2" }, null, 2));
+      ok("~/.cc-dashboard/terminal.json создан (preferred = iTerm2)");
+    } else {
+      log("(~/.cc-dashboard/terminal.json уже есть — не трогаю)");
+    }
   } else {
-    log("(~/.cc-dashboard/terminal.json уже есть — не трогаю)");
+    log("(iTerm2 не установлен → terminal.json НЕ создаю, CC Dash пойдёт в Terminal.app)");
   }
 }
 
@@ -343,6 +352,13 @@ if (!existsSync(mainSessionPath)) {
     const parsed = JSON.parse(raw);
     if (parsed?.app === "iTerm2") preferredApp = "iTerm2";
   } catch {}
+  // Safety fallback: если terminal.json = iTerm2, но приложение не установлено
+  // (например, brew install --cask iterm2 упал) — downgrade в Terminal.app,
+  // иначе AppleScript упадёт и CC Dash не создастся.
+  if (preferredApp === "iTerm2" && !iterm2Installed()) {
+    log("(⚠ terminal.json указывает iTerm2, но приложение не установлено — CC Dash откроется в Terminal.app как fallback)");
+    preferredApp = "Terminal";
+  }
   log(`Создаю главную сессию «CC Dash» в ${preferredApp}…`);
   const cwdEsc = SRC.replace(/"/g, '\\"');
   const script = preferredApp === "iTerm2" ? `tell application "iTerm"
