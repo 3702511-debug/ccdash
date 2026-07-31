@@ -2029,7 +2029,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v134";
+const CACHE_VERSION = "cc-dashboard-v135";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5625,10 +5625,13 @@ async function checkSessionAccess(u: AuthUser | null, sid: string): Promise<bool
   if (!s || !s.title) return false;
   return u!.allowedSessionTitles!.includes(s.title);
 }
-function cookieHeader(token: string | null): string {
+function cookieHeader(token: string | null, remember = false): string {
   if (!token) return `cc_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
-  // НЕТ Max-Age/Expires — это session cookie. Полное закрытие браузера/PWA → cookie исчезает → форс ре-логин.
-  return `cc_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`;
+  // Без Max-Age = session cookie (пропадает при закрытии браузера/PWA).
+  // С Max-Age = persistent cookie (переживает закрытие) — если юзер поставил «Запомнить меня».
+  // 90 дней = 7776000 сек — стандартный «остаться залогиненным» интервал.
+  const maxAge = remember ? "; Max-Age=7776000" : "";
+  return `cc_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${maxAge}`;
 }
 function isPublicAsset(pathname: string): boolean {
   return pathname === "/manifest.json"
@@ -5693,6 +5696,9 @@ const LOGIN_HTML = `<!doctype html>
   button:active { transform: scale(0.98); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .err { color: #f85149; font-size: 13px; min-height: 18px; text-align: center; }
+  .remember-row { display: flex; align-items: center; gap: 8px; color: #8b949e; font-size: 13px; cursor: pointer; user-select: none; padding: 2px 0; }
+  .remember-row input { width: 16px; height: 16px; accent-color: #58a6ff; cursor: pointer; margin: 0; }
+  body.theme-light .remember-row { color: #57606a; }
 </style>
 </head><body>
 <div class="login-box">
@@ -5700,6 +5706,7 @@ const LOGIN_HTML = `<!doctype html>
   <form id="f" autocomplete="on">
     <input id="login" name="login" type="text" placeholder="Логин" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required />
     <input id="password" name="password" type="password" placeholder="Пароль" autocomplete="current-password" required />
+    <label class="remember-row"><input id="remember" type="checkbox" /> <span>Запомнить меня</span></label>
     <button type="submit" id="submit">Войти</button>
     <div class="err" id="err"></div>
   </form>
@@ -5708,10 +5715,15 @@ const LOGIN_HTML = `<!doctype html>
 const f = document.getElementById("f");
 const err = document.getElementById("err");
 const btn = document.getElementById("submit");
+const rememberEl = document.getElementById("remember");
+// Восстанавливаем прошлый выбор — если юзер один раз поставил, при следующем логине галка уже стоит
+try { if (localStorage.getItem("cc_remember") === "1") rememberEl.checked = true; } catch {}
 f.addEventListener("submit", async (e) => {
   e.preventDefault();
   err.textContent = "";
   btn.disabled = true;
+  const remember = rememberEl.checked;
+  try { localStorage.setItem("cc_remember", remember ? "1" : "0"); } catch {}
   try {
     const res = await fetch("/api/login", {
       method: "POST",
@@ -5719,6 +5731,7 @@ f.addEventListener("submit", async (e) => {
       body: JSON.stringify({
         login: document.getElementById("login").value,
         password: document.getElementById("password").value,
+        remember,
       }),
     });
     if (res.ok) {
@@ -5753,7 +5766,7 @@ Bun.serve({
       return new Response(LOGIN_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
     if (url.pathname === "/api/login" && req.method === "POST") {
-      const body = await req.json().catch(() => null) as { login?: string; password?: string } | null;
+      const body = await req.json().catch(() => null) as { login?: string; password?: string; remember?: boolean } | null;
       if (!body || typeof body.login !== "string" || typeof body.password !== "string") {
         return Response.json({ error: "Неверный запрос" }, { status: 400 });
       }
@@ -5763,11 +5776,12 @@ Bun.serve({
         console.log(`[/api/login] FAIL login="${body.login}" user_found=${!!user}`);
         return Response.json({ error: "Неверный логин или пароль" }, { status: 401 });
       }
-      console.log(`[/api/login] OK login="${body.login}"`);
+      const remember = body.remember === true;
+      console.log(`[/api/login] OK login="${body.login}" remember=${remember}`);
       const token = makeToken(user!.login, authConfig.secret);
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
-        headers: { "content-type": "application/json", "set-cookie": cookieHeader(token) },
+        headers: { "content-type": "application/json", "set-cookie": cookieHeader(token, remember) },
       });
     }
     if (url.pathname === "/api/logout") {
