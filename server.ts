@@ -1,5 +1,5 @@
 import { readdir, stat, mkdir, unlink } from "node:fs/promises";
-import { existsSync, unlinkSync, statSync, cpSync } from "node:fs";
+import { existsSync, unlinkSync, statSync, cpSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomBytes, createHmac } from "node:crypto";
@@ -1242,7 +1242,7 @@ end run`;
 
 // cwdArg приходит УЖЕ shell-escaped (\ перед пробелами, кавычками, кириллицей передаётся as-is).
 // AppleScript `quoted form of` ломается на кириллице (macOS bug), поэтому квотирование делаем на Bun-стороне.
-const RESTORE_SCRIPT = `on run argv
+const RESTORE_SCRIPT_TERMINAL = `on run argv
   set cwdEscaped to item 1 of argv
   set sidArg to item 2 of argv
   set titleArg to ""
@@ -1263,6 +1263,42 @@ const RESTORE_SCRIPT = `on run argv
   end try
   return "ok"
 end run`;
+
+// iTerm2 версия: create tab with default profile command "..." автоматически исполняет команду.
+// /rename шлём через write text — iTerm2 не имеет `do script in newTab`, но write text — эквивалент stdin.
+const RESTORE_SCRIPT_ITERM = `on run argv
+  set cwdEscaped to item 1 of argv
+  set sidArg to item 2 of argv
+  set titleArg to ""
+  if (count of argv) >= 3 then set titleArg to item 3 of argv
+  set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg
+  tell application "iTerm2"
+    if (count of windows) = 0 then
+      set newWindow to create window with default profile command cmd
+      set newSession to current session of current tab of newWindow
+    else
+      tell current window
+        set newTab to create tab with default profile command cmd
+      end tell
+      set newSession to current session of current tab of current window
+    end if
+    if titleArg is not "" then
+      delay 8
+      tell newSession to write text "/rename " & titleArg
+      delay 0.2
+      tell newSession to write text ""
+    end if
+  end tell
+  delay 0.5
+  try
+    tell application "System Events" to set visible of process "iTerm2" to false
+  end try
+  return "ok"
+end run`;
+
+function restoreScript(): string {
+  return preferredTerm() === "iTerm2" ? RESTORE_SCRIPT_ITERM : RESTORE_SCRIPT_TERMINAL;
+}
 
 // Shell-escape строки для использования в bash (одинарные кавычки + literal escape).
 // Работает с любыми символами включая кириллицу — в отличие от AppleScript `quoted form of`.
@@ -1331,7 +1367,7 @@ async function restoreSession(sessionId: string, cwd: string, title?: string): P
   const slugCwd = await findSlugCwdForSid(sessionId, cwd);
   // Экранируем в bash (не через AppleScript `quoted form of` — оно ломается на кириллице).
   const cwdEscaped = shellEscape(slugCwd);
-  const args = ["osascript", "-e", RESTORE_SCRIPT, "--", cwdEscaped, sessionId];
+  const args = ["osascript", "-e", restoreScript(), "--", cwdEscaped, sessionId];
   if (title && title.trim()) args.push(title.trim());
   const proc = Bun.spawn(args, {
     stdout: "pipe",
@@ -1380,12 +1416,45 @@ async function readAllTerminalContents(targetTtys?: Set<string>): Promise<Map<st
   const ttyFilterScript = targetTtys && targetTtys.size > 0
     ? `set targetSet to {${[...targetTtys].map(t => `"/dev/${t}"`).join(", ")}}\nset useFilter to true\n`
     : `set targetSet to {}\nset useFilter to false\n`;
-  const script = `set sepStart to "|||TTYSTART|||"
-set sepEnd to "|||TTYEND|||"
-set acc to ""
-${ttyFilterScript}
-with timeout of 60 seconds
-tell application "Terminal"
+  const termApp = preferredTerm();
+  const scrapeIterm = `tell application "iTerm2"
+  if it is running then
+    repeat with w in windows
+      try
+        repeat with t in tabs of w
+          try
+            with timeout of 8 seconds
+              repeat with s in sessions of t
+                try
+                  set ttyStr to tty of s
+                  set shouldRead to true
+                  if useFilter then
+                    set shouldRead to false
+                    repeat with target in targetSet
+                      if ttyStr is (target as string) then
+                        set shouldRead to true
+                        exit repeat
+                      end if
+                    end repeat
+                  end if
+                  if shouldRead then
+                    set cont to contents of s
+                    set contLen to length of cont
+                    if contLen > 6000 then
+                      set cont to text (contLen - 5999) thru contLen of cont
+                    end if
+                    set acc to acc & sepStart & ttyStr & "|||CONTENT|||" & cont & sepEnd
+                  end if
+                end try
+              end repeat
+            end timeout
+          end try
+        end repeat
+      end try
+    end repeat
+  end if
+end tell`;
+  const scrapeTerminal = `tell application "Terminal"
   if it is running then
     repeat with w in windows
       try
@@ -1420,7 +1489,13 @@ tell application "Terminal"
       end try
     end repeat
   end if
-end tell
+end tell`;
+  const script = `set sepStart to "|||TTYSTART|||"
+set sepEnd to "|||TTYEND|||"
+set acc to ""
+${ttyFilterScript}
+with timeout of 60 seconds
+${termApp === "iTerm2" ? scrapeIterm : scrapeTerminal}
 end timeout
 return acc`;
   const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
@@ -1683,14 +1758,40 @@ function cgSendText(pid: number, text: string) {
   }
 }
 
-let terminalPidCache: { pid: number; at: number } | null = null;
+// Preferred terminal app: "Terminal" (default) или "iTerm2".
+// Управляется через ~/.cc-dashboard/terminal.json = {"app":"iTerm2"}.
+// Отсутствие файла или невалидное значение → "Terminal" (безопасный дефолт).
+// APPLESCRIPT_BODY (send/focus по tty) и TAB_TITLES_SCRIPT читают ОБА терминала
+// через try-fallback — они не зависят от preferredTerm(). preferredTerm() влияет
+// только на CREATE-операции (открыть новую сессию, resume в новом окне, закрытие).
+type TerminalApp = "Terminal" | "iTerm2";
+let preferredTermCache: { app: TerminalApp; at: number } | null = null;
+function preferredTerm(): TerminalApp {
+  if (preferredTermCache && Date.now() - preferredTermCache.at < 5000) return preferredTermCache.app;
+  let app: TerminalApp = "Terminal";
+  try {
+    const raw = readFileSync(join(homedir(), ".cc-dashboard", "terminal.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.app === "iTerm2") app = "iTerm2";
+  } catch {}
+  preferredTermCache = { app, at: Date.now() };
+  return app;
+}
+
+// pid запущенного терминала (используется CGEventPostToPid для отправки клавиш).
+// Кэш 60с. Возвращает pid preferred-терминала.
+let terminalPidCache: { pid: number; app: TerminalApp; at: number } | null = null;
 async function getTerminalPid(): Promise<number | null> {
-  if (terminalPidCache && Date.now() - terminalPidCache.at < 60000) return terminalPidCache.pid;
-  const proc = Bun.spawnSync(["pgrep", "-x", "Terminal"]);
+  const wantApp = preferredTerm();
+  if (terminalPidCache && terminalPidCache.app === wantApp && Date.now() - terminalPidCache.at < 60000) {
+    return terminalPidCache.pid;
+  }
+  // pgrep -x: Terminal.app — process name "Terminal"; iTerm2.app — process name "iTerm2".
+  const proc = Bun.spawnSync(["pgrep", "-x", wantApp]);
   const out = proc.stdout.toString().trim();
   const pid = parseInt(out.split("\n")[0], 10);
   if (Number.isInteger(pid) && pid > 0) {
-    terminalPidCache = { pid, at: Date.now() };
+    terminalPidCache = { pid, app: wantApp, at: Date.now() };
     return pid;
   }
   return null;
@@ -1742,17 +1843,61 @@ const TERMINAL_SELECT_TAB_SCRIPT = `on run argv
   return "tty not found"
 end run`;
 
+// iTerm2-версия SELECT_TAB. У iTerm session сама сфокусирована через `select`
+// (session — это split-pane внутри tab; tab select'ится косвенно через select session).
+// tty у iTerm живёт на уровне session, не tab. Race-guard делается через
+// current session of current tab of current window == target.
+const ITERM_SELECT_TAB_SCRIPT = `on run argv
+  set targetTty to "/dev/" & (item 1 of argv)
+  tell application "iTerm2"
+    repeat with w in windows
+      try
+        repeat with t in tabs of w
+          try
+            repeat with s in sessions of t
+              try
+                if (tty of s) is targetTty then
+                  tell s to select
+                  tell w to set frontmost to true
+                  set attempts to 0
+                  repeat
+                    delay 0.2
+                    set activeTty to ""
+                    try
+                      set activeTty to tty of (current session of current tab of w)
+                    end try
+                    if activeTty is targetTty then return "ok"
+                    set attempts to attempts + 1
+                    if attempts ≥ 2 then return "race"
+                    tell s to select
+                    tell w to set frontmost to true
+                  end repeat
+                end if
+              end try
+            end repeat
+          end try
+        end repeat
+      end try
+    end repeat
+  end tell
+  return "tty not found"
+end run`;
+
+function selectTabScript(): string {
+  return preferredTerm() === "iTerm2" ? ITERM_SELECT_TAB_SCRIPT : TERMINAL_SELECT_TAB_SCRIPT;
+}
+
 // Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
 async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
   if (!text) return { ok: false, error: "empty text" };
   const termPid = await getTerminalPid();
   if (!termPid) return { ok: false, error: "Terminal not found" };
-  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
   let selOut = sel.stdout.toString().trim();
   if (selOut === "race") {
     // Auto-retry один раз через 300мс — обычно к этому моменту параллельный select отработал
     await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
     selOut = sel.stdout.toString().trim();
   }
   if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
@@ -1777,11 +1922,11 @@ async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "
 
   // Set tab selected + bring its window to TERMINAL'S front (не системный фронт — Safari остаётся фронт),
   // чтобы CGEvent шёл именно в этот таб, а не в чужой. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
-  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
   let selOut = sel.stdout.toString().trim();
   if (selOut === "race") {
     await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
     selOut = sel.stdout.toString().trim();
   }
   if (selOut === "race") return { ok: false, error: "race: параллельная отправка в другую вкладку" };
@@ -1800,11 +1945,11 @@ async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: st
   if (!termPid) return { ok: false, error: "Terminal process not found" };
   // Шаг 1: AppleScript — БЕЗ `activate` Terminal'а, только выбираем нужную вкладку внутри Terminal.
   // Это не переключает system focus. Verify-after-select встроен в TERMINAL_SELECT_TAB_SCRIPT.
-  let sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+  let sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
   let selOut = sel.stdout.toString().trim();
   if (selOut === "race") {
     await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", TERMINAL_SELECT_TAB_SCRIPT, "--", tty]);
+    sel = Bun.spawnSync(["osascript", "-e", selectTabScript(), "--", tty]);
     selOut = sel.stdout.toString().trim();
   }
   if (selOut === "race") return { ok: false, error: "race: параллельный ответ другому poll" };
@@ -1874,7 +2019,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v124";
+const CACHE_VERSION = "cc-dashboard-v125";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -5868,9 +6013,29 @@ Bun.serve({
         // Если не отвалился — SIGKILL
         try { process.kill(pid, 0); /* check alive */ try { process.kill(pid, "SIGKILL"); } catch {} } catch {}
       }
-      // 2. Закрыть Terminal-вкладку: сначала отправляем exit для shell, потом close (без диалога «процесс запущен»)
+      // 2. Закрыть вкладку preferred-терминала: exit для shell, потом close (без диалога «процесс запущен»)
       if (tty) {
-        const script = `tell application "Terminal"
+        const term = preferredTerm();
+        const script = term === "iTerm2" ? `tell application "iTerm2"
+  repeat with w in windows
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              if (tty of s) is "/dev/${tty}" then
+                tell s to write text "exit"
+                delay 0.4
+                tell s to close
+                return "ok"
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end try
+  end repeat
+end tell` : `tell application "Terminal"
   repeat with w in windows
     try
       repeat with t in tabs of w
@@ -6056,14 +6221,49 @@ end tell`;
         }
       }
       console.log(`[new-session] cwd=${cwd} resume=${resumeSid || "(new)"} rc=${rc}`);
-      // AppleScript: открыть Terminal, запустить claude (или claude --resume), /rename, /remote-control, скрыть.
+      // AppleScript: открыть preferred-терминал, запустить claude (или claude --resume), /rename, /remote-control, скрыть.
       const nameEsc = name.replace(/"/g, '\\"');
       const cwdEsc = cwd.replace(/"/g, '\\"');
       const claudeCmd = resumeSid ? `claude --resume ${resumeSid}` : "claude";
-      const rcBlock = rc
-        ? `do script "/remote-control" in newTab\n  delay 0.2\n  do script "" in newTab\n  delay 4`
-        : "";
-      const script = `tell application "System Events"
+      const term = preferredTerm();
+      let script: string;
+      if (term === "iTerm2") {
+        const renameBlock = resumeSid ? "" : `delay 8
+  tell newSession to write text "/rename ${nameEsc}"
+  delay 0.2
+  tell newSession to write text ""
+  delay 3`;
+        const rcBlock = rc
+          ? `tell newSession to write text "/remote-control"
+  delay 0.2
+  tell newSession to write text ""
+  delay 4`
+          : "";
+        script = `tell application "iTerm2"
+  if (count of windows) = 0 then
+    set newWindow to create window with default profile command "cd \\"${cwdEsc}\\" && ${claudeCmd}"
+    set newSession to current session of current tab of newWindow
+  else
+    tell current window
+      set newTab to create tab with default profile command "cd \\"${cwdEsc}\\" && ${claudeCmd}"
+    end tell
+    set newSession to current session of current tab of current window
+  end if
+  ${renameBlock}
+  ${rcBlock}
+  delay 0.5
+end tell
+tell application "System Events"
+  try
+    set visible of process "iTerm2" to false
+  end try
+end tell
+return "ok"`;
+      } else {
+        const rcBlock = rc
+          ? `do script "/remote-control" in newTab\n  delay 0.2\n  do script "" in newTab\n  delay 4`
+          : "";
+        script = `tell application "System Events"
   set prevApp to name of first process whose frontmost is true
 end tell
 -- Без activate — Terminal не вылезает в фронт. do script откроет новое окно/вкладку, но мы сразу его спрячем.
@@ -6084,6 +6284,7 @@ tell application "System Events"
   end try
 end tell
 return "ok"`;
+      }
       const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
       const [out, err] = await Promise.all([
         new Response(proc.stdout).text(),

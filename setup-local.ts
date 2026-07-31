@@ -294,12 +294,36 @@ if (existsSync(tunnelConfigPath)) {
   log("(tunnel-watchdog: ~/.cc-dashboard/tunnel-config.json не найден — watchdog туннеля неактивен. См. README «Tunnel watchdog».)");
 }
 
-// 6. Создать главную сессию «CC Dash» если её ещё нет
+// 6. Создать главную сессию «CC Dash» если её ещё нет.
+// Выбирает preferred-терминал из ~/.cc-dashboard/terminal.json (Terminal по умолчанию, iTerm2 если задано).
 const mainSessionPath = join(RUNTIME, "main-session.json");
 if (!existsSync(mainSessionPath)) {
-  log("Создаю главную сессию «CC Dash» в Terminal…");
+  let preferredApp: "Terminal" | "iTerm2" = "Terminal";
+  try {
+    const raw = await Bun.file(join(RUNTIME, "terminal.json")).text();
+    const parsed = JSON.parse(raw);
+    if (parsed?.app === "iTerm2") preferredApp = "iTerm2";
+  } catch {}
+  log(`Создаю главную сессию «CC Dash» в ${preferredApp}…`);
   const cwdEsc = SRC.replace(/"/g, '\\"');
-  const script = `tell application "System Events"
+  const script = preferredApp === "iTerm2" ? `tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then
+    set newWindow to create window with default profile command "cd \\"${cwdEsc}\\" && claude"
+    set newSession to current session of current tab of newWindow
+  else
+    tell current window
+      set newTab to create tab with default profile command "cd \\"${cwdEsc}\\" && claude"
+    end tell
+    set newSession to current session of current tab of current window
+  end if
+  delay 8
+  tell newSession to write text "/rename CC Dash"
+  delay 0.2
+  tell newSession to write text ""
+  delay 2
+end tell
+return "ok"` : `tell application "System Events"
   set prevApp to name of first process whose frontmost is true
 end tell
 tell application "Terminal"
