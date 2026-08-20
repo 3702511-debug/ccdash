@@ -1931,9 +1931,17 @@ async function selectTabForCGEvent(tty: string): Promise<{ ok: boolean; app?: Te
   return { ok: true, app, pid };
 }
 
-// Отправка произвольного текста в TUI через CGEventKeyboardSetUnicodeString (для multi-tab Type something).
+// Отправка произвольного текста в TUI. Для iTerm — через AppleScript write text
+// (не требует фокуса, окно не прыгает, нет race в verify-loop). Для Terminal.app —
+// через CGEventKeyboardSetUnicodeString (там AppleScript-write text для клавиш bang/! не работает).
 async function sendTextToTui(tty: string, text: string): Promise<{ ok: boolean; error?: string }> {
   if (!text) return { ok: false, error: "empty text" };
+  // Попытка 1: iTerm через write text (без фокуса, без race)
+  if (await sendKeysToItermByTty(tty, text)) {
+    console.log(`[type-text ${tty}] len=${text.length} via write-text (iTerm) OK`);
+    return { ok: true };
+  }
+  // Попытка 2: Terminal.app через CGEvent (как раньше)
   const sel = await selectTabForCGEvent(tty);
   if (!sel.ok) return { ok: false, error: sel.error };
   if (!loadCG()) return { ok: false, error: "CG FFI failed" };
@@ -2091,7 +2099,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v140";
+const CACHE_VERSION = "cc-dashboard-v141";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -3084,6 +3092,8 @@ function renderMd(text) {
   // 5. Bold, italic FIRST (so URL inside **...** gets unwrapped to <b>URL</b> before auto-link)
   text = text.replace(/\\*\\*([^*\\n]+)\\*\\*/g, '<b>$1</b>');
   text = text.replace(/(^|[\\s(])\\*([^*\\n]+)\\*(?=[\\s.,!?)]|$)/g, '$1<i>$2</i>');
+  // folderBtnIcon используется и в 6b (auto-link computer:///), и в 7 (inline code), и в 8 (md-link).
+  const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
   // 6. Auto-link bare URLs (http/https). After bold, URLs inside <b> are preceded by '>' which we match.
   text = text.replace(/(^|[\\s>(])(https?:\\/\\/[^\\s<>"')]+)/g, (_, prefix, url) => {
     return prefix + '<a href="' + url + '" target="_blank" rel="noopener">' + url + '</a><button class="link-copy" data-copy="' + encodeURIComponent(url) + '">' + linkCopyIcon + '</button>';
@@ -3094,9 +3104,26 @@ function renderMd(text) {
     const fname = fullPath.split("/").pop();
     return '<a href="/api/file/' + encodeURIComponent(fname) + '" class="file-link">📎 ' + fname + '</a>';
   });
+  // 6b. Auto-link для computer:///... и file:///... — URI-схемы указывающие на локальный путь.
+  // computer:// — GNOME/Nautilus-схема, macOS её не понимает, но Claude часто её выдаёт.
+  // file:// — стандартная. Обе распаковываем в POSIX-путь и рядом добавляем «открыть в Finder».
+  // safety: путь должен быть под /Users/ или /tmp/, иначе просто как обычный URL.
+  text = text.replace(/(^|[\\s>(])((?:computer|file):\\/\\/\\/[^\\s<>"')]+)/g, (_, prefix, url) => {
+    let decoded = url;
+    try { decoded = decodeURIComponent(url); } catch {}
+    const m = decoded.match(/^(?:computer|file):\\/\\/\\/(.*)$/);
+    const abs = m ? ('/' + m[1]) : null;
+    const isLocal = abs && /^(\\/Users\\/|\\/tmp\\/)/.test(abs);
+    const linkHtml = '<a href="' + url + '" target="_blank" rel="noopener">' + url + '</a>';
+    const copyBtn = '<button class="link-copy" data-copy="' + encodeURIComponent(url) + '">' + linkCopyIcon + '</button>';
+    if (isLocal) {
+      return prefix + linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(abs) + '">' + folderBtnIcon + '</button>';
+    }
+    return prefix + linkHtml + copyBtn;
+  });
   // 7. Restore inline code placeholders. Если содержимое выглядит как путь под $HOME (~/... или /Users/...)
   //    или /tmp/cc-dashboard/... — добавляем рядом кнопку «открыть в Finder».
-  const folderBtnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  //    folderBtnIcon поднят выше — см. перед блоком 6.
   text = text.replace(/\\x00IC(\\d+)\\x00/g, (_, i) => {
     const code = inlineCodes[+i];
     // Путь под $HOME / /tmp — пробелы и юникод разрешены (содержимое уже зажато backtick'ами)
@@ -3113,18 +3140,29 @@ function renderMd(text) {
     return codeHtml;
   });
   // 8. Restore markdown link placeholders. Если URL — локальный путь (~/, /Users/, /tmp/),
-  // рядом с кнопкой копирования добавляем «открыть в Finder» — как для inline-code с путём.
-  // Без этого markdown-ссылка вида [файл.pdf](/Users/.../file.pdf) не имеет open-in-Finder.
+  // либо URI-схема computer:///... / file:///... указывающая на локальный путь —
+  // рядом с кнопкой копирования добавляем «открыть в Finder».
   text = text.replace(/\\x00ML(\\d+)\\x00/g, (_, i) => {
     const ml = mdLinks[+i];
     // ml.url может быть URL-encoded (пробелы = %20). Декодируем для проверки и data-path.
     let decodedUrl = ml.url;
     try { decodedUrl = decodeURIComponent(ml.url); } catch {}
-    const isLocalPath = /^(~\\/|\\/Users\\/|\\/tmp\\/)/.test(decodedUrl);
+    // Определяем local path — либо прямой POSIX, либо распакованный из computer:///file:///
+    // (тип не аннотируем — этот блок внутри клиентского JS, браузер TS-синтаксис не поймёт).
+    let localPath = null;
+    if (/^(~\\/|\\/Users\\/|\\/tmp\\/)/.test(decodedUrl)) {
+      localPath = decodedUrl;
+    } else {
+      const m2 = decodedUrl.match(/^(?:computer|file):\\/\\/\\/(.*)$/);
+      if (m2) {
+        const abs = '/' + m2[1];
+        if (/^(\\/Users\\/|\\/tmp\\/)/.test(abs)) localPath = abs;
+      }
+    }
     const linkHtml = '<a href="' + ml.url + '" target="_blank" rel="noopener">' + ml.label + '</a>';
     const copyBtn = '<button class="link-copy" data-copy="' + encodeURIComponent(ml.url) + '">' + linkCopyIcon + '</button>';
-    if (isLocalPath) {
-      return linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(decodedUrl) + '">' + folderBtnIcon + '</button>';
+    if (localPath) {
+      return linkHtml + copyBtn + '<button class="folder-open-btn" data-path="' + encodeURIComponent(localPath) + '">' + folderBtnIcon + '</button>';
     }
     return linkHtml + copyBtn;
   });
