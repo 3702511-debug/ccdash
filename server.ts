@@ -2099,7 +2099,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v141";
+const CACHE_VERSION = "cc-dashboard-v142";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2501,6 +2501,12 @@ const HTML = `<!doctype html>
   .msg.user .who { color: #58a6ff; }
   .msg.assistant .who { color: #c9d1d9; }
   .msg.tool .who { color: #8b949e; }
+  /* Визуальное выделение user/assistant — чтобы в потоке TOOL-сообщений легко
+     находить свои реплики и ответы Claude. Только цветной кант слева, без фона.
+     Синий для user, зелёный для assistant. Tool остаётся плоским. */
+  .msg.user, .msg.assistant { border-left: 3px solid transparent; padding: 8px 12px; }
+  .msg.user { border-left-color: #58a6ff; }
+  .msg.assistant { border-left-color: #3fb950; }
   .msg .body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
   .msg.tool .body { color: #8b949e; font-size: 12px; }
   .msg.question .who { color: #58a6ff; }
@@ -2734,6 +2740,9 @@ const HTML = `<!doctype html>
   body.theme-light .msg .who { color: #57606a; }
   body.theme-light .msg.user .who { color: #0550ae; }
   body.theme-light .msg.tool .who { color: #424a53; }
+  /* Светлая тема: тот же кант, только оттенки чуть темнее для контраста с белым. */
+  body.theme-light .msg.user { border-left-color: #0969da; }
+  body.theme-light .msg.assistant { border-left-color: #1f883d; }
   body.theme-light .msg .body { color: #1f2328; }
   body.theme-light .msg .body b { color: #0d1117; }
   body.theme-light .msg .body h1, body.theme-light .msg .body h2, body.theme-light .msg .body h3 { color: #0d1117; }
