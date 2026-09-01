@@ -1,4 +1,4 @@
-import { readdir, stat, mkdir, unlink } from "node:fs/promises";
+import { readdir, stat, mkdir, unlink, appendFile } from "node:fs/promises";
 import { existsSync, unlinkSync, statSync, cpSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -10,22 +10,41 @@ const UPLOAD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 await mkdir(UPLOAD_DIR, { recursive: true });
 
 async function cleanupOldUploads(): Promise<void> {
+  // Чистим ТОЛЬКО реально временные файлы:
+  //   voice-*.webm / voice-*.wav — голосовые записи и их конверсии (одноразовые, для whisper)
+  //   whisper-*/ — временные директории whisper (промежуточные txt/wav)
+  // Всё остальное (документы, картинки, .md с ТЗ и т.п. что Claude или юзер положил в /tmp
+  // для последующего открытия из чата через кнопку «в Finder») — НЕ трогаем никогда.
+  // Раньше удаляли ВСЁ старше 24ч → юзер жаловался что файлы из чатов пропадают.
   try {
     const now = Date.now();
     const files = await readdir(UPLOAD_DIR);
     await Promise.all(files.map(async f => {
+      const isTemp = /^voice-[a-f0-9]+\.(webm|wav)$/i.test(f) || /^whisper-[a-f0-9]+$/i.test(f);
+      if (!isTemp) return;
       const p = join(UPLOAD_DIR, f);
       try {
         const s = await stat(p);
-        if (now - s.mtimeMs > UPLOAD_MAX_AGE_MS) await unlink(p);
+        if (now - s.mtimeMs > UPLOAD_MAX_AGE_MS) {
+          if (s.isDirectory()) {
+            // recursive delete для whisper-<tag>/ директорий
+            await Bun.$`rm -rf ${p}`.quiet().nothrow();
+          } else {
+            await unlink(p);
+          }
+        }
       } catch {}
     }));
   } catch {}
 }
 cleanupOldUploads();
 setInterval(cleanupOldUploads, 60 * 60 * 1000);
-const FRESH_MS = 24 * 60 * 60 * 1000;
-const ORPHAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// FRESH_MS: сессии свежее этого показываются в welcome-grid. Раньше было 24 часа,
+// из-за чего сессии которые «пожили» пару дней и упали или были усыплены — исчезали
+// с welcome-grid и уходили в архив («Сессии из Claude.app»). Юзер жаловался «не усыплял,
+// а они пропали». 7 дней покрывает нормальный workflow — сессии не пропадают неделю.
+const FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+const ORPHAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PORT = parseInt(process.env.PORT ?? "8787");
 const SELF_SESSION_ID_ENV = (process.env.CLAUDE_SESSION_ID ?? "").trim();
 
@@ -110,8 +129,19 @@ async function shWithInput(cmd: string, args: string[], input: string): Promise<
 }
 
 async function findClaudePids(): Promise<number[]> {
+  // Исключаем `claude --print` — это subagent'ы Task tool, короткоживущие headless-процессы.
+  // Они пишут jsonl'ы с ai-title в первой записи (фильтруются в isHeadlessOrSidechain),
+  // но как pids сами попадали в pidInfos → stub-cards с бейджем "desktop" и argv0 типа "claude-43".
+  // Sticky-cache держал такие карточки ещё 30 сек после смерти subagent'а. Юзер жаловался что
+  // "две desktop-вкладки появляются во время анализа цен".
   const out = await sh("pgrep", ["-x", "claude"]);
-  return out.split("\n").map(s => parseInt(s.trim())).filter(n => Number.isFinite(n));
+  const pids = out.split("\n").map(s => parseInt(s.trim())).filter(n => Number.isFinite(n));
+  const result: number[] = [];
+  await Promise.all(pids.map(async pid => {
+    const cmd = await sh("ps", ["-o", "command=", "-p", String(pid)]).catch(() => "");
+    if (!/--print\b/.test(cmd)) result.push(pid);
+  }));
+  return result;
 }
 
 async function pidInfo(pid: number): Promise<{ cwd: string | null; tty: string | null; ppidComm: string; resumeSid: string }> {
@@ -161,6 +191,11 @@ async function isHeadlessOrSidechain(jsonlPath: string): Promise<boolean> {
         // её headless (без Terminal-вкладки → нечего показывать). НО snapshot loop отдельно
         // проверит, есть ли для неё живой `claude --resume` процесс — если да, не пропустит.
         if (rec.type === "queue-operation") { res = true; break; }
+        // ai-title — маркер короткоживущих Task-subagent сессий (Claude Code запускает
+        // такую при `Task` tool или auto-summarize). У них нет tty, нет живого resume-pid,
+        // и они не должны заполнять welcome-grid как отдельные карточки — это фоновая
+        // техническая работа parent-чата.
+        if (rec.type === "ai-title") { res = true; break; }
       } catch {}
     }
   } catch {}
@@ -469,6 +504,11 @@ interface PidInfo {
   lastBusyAt?: number;  // для hysteresis: пока < 2с от последнего busy — показываем "думает"
 }
 
+// Расширенное окно поиска jsonl'ов — сессии с customTitle (юзер их /rename'ил через дашборд)
+// должны показываться на welcome-grid независимо от активности. Иначе после 3-дневного простоя
+// компа + 7d FRESH_MS сессии массово выпадают. Фильтр по customTitle делается уже в snapshot
+// (там getTitleCached кэширован). Здесь просто расширяем окно до 60 дней.
+const EXTENDED_FRESH_MS = 60 * 24 * 60 * 60 * 1000;
 async function findAllFreshJsonls(): Promise<{ path: string; mtime: number }[]> {
   let subdirs: string[];
   try { subdirs = await readdir(PROJECTS_DIR); } catch { return []; }
@@ -483,7 +523,7 @@ async function findAllFreshJsonls(): Promise<{ path: string; mtime: number }[]> 
       const p = join(dirPath, f);
       try {
         const s = await stat(p);
-        if (now - s.mtimeMs <= FRESH_MS) out.push({ path: p, mtime: s.mtimeMs });
+        if (now - s.mtimeMs <= EXTENDED_FRESH_MS) out.push({ path: p, mtime: s.mtimeMs });
       } catch {}
     }
   }));
@@ -779,14 +819,27 @@ async function snapshot(): Promise<Session[]> {
     try {
       const fileName = j.path.split("/").pop() ?? "";
       const sessionId = fileName.replace(/\.jsonl$/, "");
-      // Headless: Claude.app или sidechain. Пропускаем ТОЛЬКО если нет живого
-      // `claude --resume` процесса с тем же sessionId — иначе resume через дашборд бы не работал.
-      // Живой Desktop-launched pid (parent=Claude.app, no tty) тоже «спасает» — так
-      // Claude.app-чат становится видим карточкой в основном списке (с бейджем desktop),
-      // и его можно перевести в Terminal через Resume.
+      // Возрастной фильтр: если jsonl старше FRESH_MS (7 дней), показываем только если у сессии
+      // есть customTitle (юзер её /rename'ил через дашборд — считается «своей», должна жить вечно).
+      // Без customTitle старые jsonl уходят в архив «Сессии из Claude.app». Это защищает welcome-grid
+      // от накопления сотен старых Claude.app-сессий и от пропаданий после многодневного простоя мака.
+      if (now - j.mtime > FRESH_MS) {
+        const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId);
+        const hasCustomTitleForOld = !!(await getTitleCached(sessionId, j.path));
+        if (!hasLivePid && !hasCustomTitleForOld) continue;
+      }
+      // Headless: Claude.app или sidechain. Пропускаем если:
+      // 1) нет живого `claude --resume` процесса с тем же sessionId, И
+      // 2) у сессии нет customTitle (не /rename'ена юзером через дашборд).
+      // Живой pid спасает всегда (Claude.app-чат становится картой с бейджем desktop).
+      // Раньше здесь скипались ВСЕ мёртвые headless-сессии → они автоматически уходили
+      // в раздел «Сессии из Claude.app» (drawer). Юзер жаловался: он их не усыплял,
+      // а они «пропадают в закрытые». Теперь /rename-нутые сессии остаются на welcome-grid
+      // как обычные мёртвые (спят) с кнопкой «Разбудить».
       if (await isHeadlessOrSidechain(j.path)) {
         const hasLivePid = pidInfos.some(p => !p.used && p.sessionId === sessionId);
-        if (!hasLivePid) continue;
+        const hasCustomTitle = !!(await getTitleCached(sessionId, j.path));
+        if (!hasLivePid && !hasCustomTitle) continue;
       }
       const st = await readStatus(j.path);
       if (!st) continue;
@@ -806,7 +859,9 @@ async function snapshot(): Promise<Session[]> {
 
       // Filter out orphan jsonls (no live pid bound) older than ORPHAN_MAX_AGE_MS —
       // these are historical session files whose process has already exited.
-      if (!bound && now - j.mtime > ORPHAN_MAX_AGE_MS) continue;
+      // ИСКЛЮЧЕНИЕ: если у sid есть customTitle (юзер /rename'ил через дашборд),
+      // не выбрасываем даже если старая — она «своя», должна оставаться на welcome-grid.
+      if (!bound && now - j.mtime > ORPHAN_MAX_AGE_MS && !customTitle) continue;
 
       const cwd = jsonlCwd ?? bound?.cwd ?? "unknown";
       const tabTitle = bound?.tty ? tabTitles.get(bound.tty) ?? null : null;
@@ -959,15 +1014,64 @@ async function snapshot(): Promise<Session[]> {
   }
 
   // Отфильтровать скрытые пользователем сессии (плюс по пути обновим cwd/title в hiddenSids)
-  if (hiddenSids.size > 0) {
-    for (const s of sessions) {
-      if (hiddenSids.has(s.sessionId)) {
-        hiddenSids.set(s.sessionId, { cwd: s.cwd, title: s.title || undefined });
+  const filtered = hiddenSids.size > 0
+    ? sessions.filter(s => {
+        if (hiddenSids.has(s.sessionId)) {
+          hiddenSids.set(s.sessionId, { cwd: s.cwd, title: s.title || undefined });
+          return false;
+        }
+        return true;
+      })
+    : sessions;
+
+  // Death log — сравниваем текущий snapshot с последним запомненным. Если sid раньше
+  // был жив (pid>0), а сейчас мёртв (pid<0) или пропал — пишем DIED в лог.
+  // Симметрично REVIVED когда мёртвая сессия ожила. Файл: ~/.cc-dashboard/session-deaths.log.
+  // Цель: диагностика самопадений (VPN, 2ATM, ARoma bet упавшие сами). Логика лёгкая —
+  // просто fire-and-forget, не блокирует snapshot.
+  try { logDeathDiff(filtered); } catch {}
+  return filtered;
+}
+
+// Death log — Map sid → {pid, title, cwd} с прошлого snapshot.
+// Обновляется на каждый snapshot(). Если pid перешёл >0 → <0 (или sid пропал) — DIED.
+// Если наоборот (<0 → >0) — REVIVED.
+const lastSnapshotState = new Map<string, { pid: number; title: string | null; cwd: string }>();
+const DEATH_LOG_PATH = join(homedir(), ".cc-dashboard", "session-deaths.log");
+function logDeathDiff(sessions: Session[]) {
+  const currentSids = new Set<string>();
+  const deaths: string[] = [];
+  const revivals: string[] = [];
+  for (const s of sessions) {
+    currentSids.add(s.sessionId);
+    const prev = lastSnapshotState.get(s.sessionId);
+    const nowAlive = s.pid > 0;
+    if (prev) {
+      const prevAlive = prev.pid > 0;
+      if (prevAlive && !nowAlive) {
+        deaths.push(`${new Date().toISOString()} | DIED    | ${s.sessionId.slice(0,8)} | "${s.title ?? '?'}" | cwd=${s.cwd}`);
+      } else if (!prevAlive && nowAlive) {
+        revivals.push(`${new Date().toISOString()} | REVIVED | ${s.sessionId.slice(0,8)} | "${s.title ?? '?'}" | pid=${s.pid}`);
       }
     }
-    return sessions.filter(s => !hiddenSids.has(s.sessionId));
+    lastSnapshotState.set(s.sessionId, { pid: s.pid, title: s.title, cwd: s.cwd });
   }
-  return sessions;
+  // Sessions которые пропали из snapshot вообще (например ушли в hidden) — тоже death,
+  // если раньше были живы.
+  for (const [sid, prev] of lastSnapshotState) {
+    if (!currentSids.has(sid)) {
+      if (prev.pid > 0) {
+        deaths.push(`${new Date().toISOString()} | DIED    | ${sid.slice(0,8)} | "${prev.title ?? '?'}" | cwd=${prev.cwd} (пропала из snapshot — hidden?)`);
+      }
+      lastSnapshotState.delete(sid);
+    }
+  }
+  if (deaths.length === 0 && revivals.length === 0) return;
+  const line = [...deaths, ...revivals].join("\n") + "\n";
+  // Fire-and-forget append. Bun.write перезаписывает, поэтому нужен именно appendFile.
+  appendFile(DEATH_LOG_PATH, line).catch(() => {});
+  // Плюс в stdout — чтобы в out.log сразу было видно смерти рядом с send/restore записями.
+  for (const l of [...deaths, ...revivals]) console.log("[death-log] " + l);
 }
 
 interface QuestionOption { label: string; description?: string; isFreeText?: boolean; tuiNum?: number }
@@ -2099,7 +2203,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v142";
+const CACHE_VERSION = "cc-dashboard-v143";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2391,6 +2495,13 @@ const HTML = `<!doctype html>
   .resume-btn { display: inline-block; margin-top: 6px; background: #1f6feb; border: 0; color: white; padding: 4px 10px; border-radius: 5px; font-size: 11px; cursor: pointer; font-weight: 500; }
   .card { position: relative; }
   .hide-btn { position: absolute; top: 4px; right: 6px; background: transparent; border: 0; color: #8b949e; padding: 0; width: 22px; height: 22px; line-height: 1; cursor: pointer; font-family: 'UnifrakturCook', 'Pirata One', serif; font-weight: 700; font-size: 20px; display: inline-flex; align-items: center; justify-content: center; transition: color 0.15s, transform 0.15s; }
+  /* Sleep-кнопка (полумесяц) — слева от X, в той же стилистике. */
+  .sleep-btn { position: absolute; top: 4px; right: 30px; background: transparent; border: 0; color: #8b949e; padding: 0; width: 22px; height: 22px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: color 0.15s, transform 0.15s; }
+  .sleep-btn svg { width: 14px; height: 14px; display: block; }
+  .sleep-btn:hover { color: #58a6ff; transform: scale(1.15); }
+  .sleep-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  body.theme-light .sleep-btn { color: #57606a; }
+  body.theme-light .sleep-btn:hover { color: #0969da; }
   .main-pin { position: absolute; top: 6px; right: 8px; color: #58a6ff; pointer-events: none; display: inline-flex; }
   .main-pin svg { width: 16px; height: 16px; display: block; }
   .hide-btn:hover { color: #f85149; transform: scale(1.15); }
@@ -3094,7 +3205,10 @@ function renderMd(text) {
   // 4. Extract markdown links [text](url) as placeholders too (so bare-URL pass doesn't double-process them)
   const linkCopyIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
   const mdLinks = [];
-  text = text.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (_, label, url) => {
+  // URL внутри md-link () может содержать пробелы — Claude часто отдаёт локальные пути
+  // с пробелами без URL-encoding. Раньше regex останавливался на первом пробеле, путь
+  // получался обрезанный, backend возвращал 404. Теперь только закрывающая скобка закрывает URL.
+  text = text.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, (_, label, url) => {
     mdLinks.push({ label, url });
     return "\\x00ML" + (mdLinks.length - 1) + "\\x00";
   });
@@ -3213,27 +3327,42 @@ function renderMd(text) {
 function findSession(sid) { return sessionsCache.find(s => s.sessionId === sid); }
 
 function buildCardsHTML(sessions) {
+  // SVG-иконки в стилистике X (feather-style, monochrome, currentColor stroke)
+  const moonSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
   return sessions.map(s => {
     const isDead = s.pid < 0 && !s.sessionId.startsWith('pid-') && !s.isSelf;
-    const badge = isDead ? '<span class="badge">закрыто</span>' : (s.isDesktop ? '<span class="badge">desktop</span>' : '');
+    // Мёртвые сессии — БЕЗ бейджа «спит», кнопка «Разбудить» под карточкой достаточно
+    // говорит о состоянии. Раньше badge добавлял отдельную строку в высоту карточки
+    // (карточка становилась в 2 раза выше в welcome-grid) — визуально громоздко.
+    // Визуально отличаем через CSS opacity на .card.dead ниже.
+    const badge = s.isDesktop && !isDead ? '<span class="badge">desktop</span>' : '';
     const pidLabel = '';
     const head = s.title
       ? \`<div class="title">\${escapeHtml(s.title)}\${s.hasOpenQuestion ? '<span class="q-badge">?</span>' : ''}</div>\${badge ? \`<div class="cwd">\${badge}</div>\` : ''}\`
       : \`<div class="cwd big">\${escapeHtml(s.cwdLabel)}\${s.hasOpenQuestion ? '<span class="q-badge">?</span>' : ''}\${badge}</div>\`;
     const classes = [s.status, s.isSelf ? 'self' : '', panels.has(s.sessionId) ? 'open' : '', isDead ? 'dead' : '', s.hasOpenQuestion ? 'has-question' : ''].filter(Boolean).join(' ');
     const qBadge = s.hasOpenQuestion ? '<span class="q-badge">?</span>' : '';
-    // Resume-кнопка для мёртвых сессий (в т.ч. главной — раньше исключалась, но если main упала после ребута,
-    // юзер должен её тоже поднять). data-title передаёт название чтобы после resume автоматом /rename.
-    const resumeBtn = isDead ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-title="\${escapeHtml(s.title || '')}">▶ Resume</button>\` : '';
+    // Resume-кнопка = «Разбудить» для мёртвых сессий (в т.ч. главной — если main упала после
+    // ребута, юзер должен её тоже поднять). data-title передаёт название чтобы после resume
+    // автоматом /rename. Механически всегда идёт через тот же /api/restore.
+    const resumeBtn = isDead ? \`<button class="resume-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-title="\${escapeHtml(s.title || '')}">Разбудить</button>\` : '';
+    // Sleep-кнопка (полумесяц) — только для активных non-main сессий.
+    // Убивает процесс claude и iTerm-таб, jsonl сохраняется, карточка остаётся с бейджем «спит».
+    const sleepBtn = (!isDead && !s.isMain) ? \`<button class="sleep-btn" data-sid="\${s.sessionId}" title="Усыпить — освободить память, сохранить историю">\${moonSvg}</button>\` : '';
     const hideBtn = s.isMain ? \`<span class="main-pin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><line x1="12" y1="22" x2="12" y2="8"/><path d="M5 12H2a10 10 0 0 0 20 0h-3"/></svg></span>\` : \`<button class="hide-btn" data-sid="\${s.sessionId}" data-cwd="\${escapeHtml(s.cwd)}" data-dead="\${isDead ? '1' : '0'}">X</button>\`;
-    return \`
-      <div class="card \${classes}" data-sid="\${s.sessionId}">
-        \${head}
+    // Для мёртвых сессий не показываем строку статуса «на паузе/idle» + timestamp —
+    // они и так мёртвые, кнопка «Разбудить» это скажет. Убираем лишнюю строку чтобы
+    // карточка в welcome-grid оставалась компактной.
+    const statusRow = isDead ? '' : \`
         <div class="row">
           <span class="status \${s.status}">\${STATUS_LABELS[s.status] ?? s.status}</span>
           <span>\${s.lastActivityRel === '—' ? '' : s.lastActivityRel + ' назад'}\${pidLabel ? ' · ' + pidLabel : ''}</span>
-        </div>
-        \${resumeBtn}\${hideBtn}
+        </div>\`;
+    return \`
+      <div class="card \${classes}" data-sid="\${s.sessionId}">
+        \${head}
+        \${statusRow}
+        \${resumeBtn}\${sleepBtn}\${hideBtn}
       </div>
     \`;
   }).join("");
@@ -3242,8 +3371,8 @@ function buildCardsHTML(sessions) {
 function wireCards(container) {
   for (const el of container.querySelectorAll(".card")) {
     el.addEventListener("click", (e) => {
-      if (e.target.classList.contains("resume-btn")) return;
-      if (e.target.classList.contains("hide-btn")) return;
+      // Игнорировать клики по кнопкам-действиям (Resume/Разбудить, Sleep, Hide, main-pin, вложенные svg).
+      if (e.target.closest(".resume-btn, .hide-btn, .sleep-btn, .main-pin")) return;
       onCardClick(el.dataset.sid);
     });
   }
@@ -3253,11 +3382,34 @@ function wireCards(container) {
       openCloseSessionModal(btn.dataset.sid, btn.dataset.cwd, btn.dataset.dead === "1");
     });
   }
+  for (const btn of container.querySelectorAll(".sleep-btn")) {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      const sid = btn.dataset.sid;
+      try {
+        const res = await fetch("/api/session/" + sid + "/close", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode: "sleep" }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          alert("Не удалось усыпить: " + (data.error || res.status));
+          btn.disabled = false;
+        }
+        // Snapshot через 2 сек подтянет мёртвое состояние — карточка перерисуется с бейджем «спит» и кнопкой «Разбудить».
+      } catch (e2) {
+        alert("Сетевая ошибка: " + e2);
+        btn.disabled = false;
+      }
+    });
+  }
   for (const btn of container.querySelectorAll(".resume-btn")) {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       btn.disabled = true;
-      btn.textContent = "▶ Открываю…";
+      btn.textContent = "Открываю…";
       try {
         const res = await fetch("/api/restore", {
           method: "POST",
@@ -3266,16 +3418,16 @@ function wireCards(container) {
         });
         const data = await res.json();
         if (!res.ok || data.error) {
-          btn.textContent = "▶ Ошибка";
-          alert("Не удалось восстановить: " + (data.error || "?"));
+          btn.textContent = "Ошибка";
+          alert("Не удалось разбудить: " + (data.error || "?"));
         } else {
-          btn.textContent = "✓ Запущено";
+          btn.textContent = "Запущено";
         }
       } catch (e2) {
-        btn.textContent = "▶ Ошибка";
+        btn.textContent = "Ошибка";
         alert("Сетевая ошибка: " + e2);
       } finally {
-        setTimeout(() => { btn.disabled = false; btn.textContent = "▶ Resume"; }, 5000);
+        setTimeout(() => { btn.disabled = false; btn.textContent = "Разбудить"; }, 5000);
       }
     });
   }
@@ -4572,6 +4724,8 @@ function openPanel(sid) {
           folderBtn.innerHTML = '!';
           folderBtn.title = r.error;
           setTimeout(() => { folderBtn.innerHTML = origHTML; folderBtn.title = origTitle; }, 2000);
+          // Явный alert — hover-tooltip не работает на iPhone/PWA, юзер видит "!" и не понимает почему.
+          alert("Не удалось открыть: " + pathToOpen + " — Причина: " + r.error);
         } else {
           folderBtn.classList.add("opened");
           setTimeout(() => folderBtn.classList.remove("opened"), 1300);
@@ -6163,7 +6317,7 @@ Bun.serve({
       if (!allowed) return Response.json({ error: "path outside allowed scope" }, { status: 403 });
       // Если файла нет — AppleScript reveal тихо откроет какую-то ближайшую папку,
       // пользователь не поймёт куда его «привело». Сразу возвращаем 404 с понятной ошибкой.
-      if (!existsSync(p)) return Response.json({ error: "файл удалён (видимо macOS почистила /tmp)" }, { status: 404 });
+      if (!existsSync(p)) return Response.json({ error: p.startsWith("/tmp/") ? "файл удалён из /tmp — Claude сохранил его во временную папку. Попроси Claude пересохранить в постоянное место (~/Documents/)." : "файл не найден" }, { status: 404 });
       const pathEsc = p.replace(/"/g, '\\"');
       // reveal POSIX file работает и для папок (подсвечивает в Finder), и для файлов (показывает в родительской)
       const script = `tell application "Finder"
@@ -6202,8 +6356,13 @@ Bun.serve({
     }
     const closeMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/close$/);
     if (closeMatch && req.method === "POST") {
+      // mode: "hide" (default) — kill + close-tab + hide в drawer «Закрытые сессии»
+      //       "delete" — kill + close-tab + удалить jsonl (безвозвратно)
+      //       "sleep"  — kill + close-tab, jsonl цел, карточка остаётся на welcome-grid
+      //                  (все мёртвые сессии на welcome-grid показываются как «спит»
+      //                   и оживляются одинаковой кнопкой «Разбудить» через /api/restore).
       const body = await req.json().catch(() => ({})) as { mode?: string };
-      const mode = body.mode === "delete" ? "delete" : "hide";
+      const mode = body.mode === "delete" ? "delete" : body.mode === "sleep" ? "sleep" : "hide";
       const sid = closeMatch[1];
       if (sid === mainSessionSid) {
         return Response.json({ error: "Главную сессию дашборда нельзя закрыть" }, { status: 403 });
@@ -6212,6 +6371,11 @@ Bun.serve({
       const pid = meta?.pid;
       const tty = meta?.tty;
       const jsonlPath = meta?.jsonlPath;
+      // Диагностический лог — юзер жаловался что "сессии сами уходят в спячку". Логирование
+      // тут даст ответ: если строка [/close ... mode=sleep] есть в out.log за момент смерти —
+      // это был явный клик юзера. Если нет — процесс упал сам (диагностика через death log).
+      const ua = (req.headers.get("user-agent") || "").slice(0, 80);
+      console.log(`[/close] sid=${sid.slice(0,8)} mode=${mode} pid=${pid ?? "?"} tty=${tty ?? "?"} cwd="${meta?.cwd ?? "?"}" ua="${ua}"`);
       // 1. Сначала убить claude pid — иначе Terminal покажет диалог «закрыть вкладку с запущенным процессом?» и tab останется
       if (pid && pid > 0) {
         try { process.kill(pid, "SIGTERM"); } catch {}
@@ -6267,10 +6431,17 @@ end tell`;
         // старую запись hidden если пользователь удаляет уже скрытую сессию.
         if (jsonlPath) { try { await unlink(jsonlPath); } catch {} }
         hiddenSids.delete(sid);
+        await saveHiddenSids();
+      } else if (mode === "sleep") {
+        // sleep: процесс убит, tab закрыт, jsonl цел, hiddenSids не тронут.
+        // Карточка остаётся в welcome-grid как «мёртвая» → бейдж «спит» + кнопка «Разбудить».
+        // Восстановление через существующий /api/restore (тот же путь что для упавших-самостоятельно).
+        hiddenSids.delete(sid);  // если раньше была в hidden — вернём на welcome-grid
+        await saveHiddenSids();
       } else {
         hiddenSids.set(sid, info);
+        await saveHiddenSids();
       }
-      await saveHiddenSids();
       return Response.json({ ok: true, mode });
     }
     const unhideMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/unhide$/);
@@ -6535,6 +6706,12 @@ return "ok"`;
       const now = Date.now();
       const livePids = await gatherPidInfos();
       const liveSids = new Set(livePids.map(p => p.sessionId).filter(Boolean));
+      // Также исключаем sids которые уже видны в welcome-grid как мёртвые/спящие —
+      // иначе одна и та же сессия дублируется (в welcome-grid как «спит» + в архиве
+      // как Claude.app-сессия). Пример: Travels — процесс мёртв, isHeadlessOrSidechain
+      // = false (нет queue-operation в первых 10 записях), поэтому snapshot показывает
+      // её в welcome-grid. Но qo=16 в файле → пропустил бы в архив без этого фильтра.
+      const snapshotSids = new Set((await snapshot()).map(s => s.sessionId));
       const arch: { sid: string; path: string; mtime: number }[] = [];
       try {
         const dirs = await readdir(PROJECTS_DIR);
@@ -6545,6 +6722,7 @@ return "ok"`;
             if (!f.endsWith(".jsonl")) continue;
             const sid = f.replace(/\.jsonl$/, "");
             if (liveSids.has(sid)) continue;
+            if (snapshotSids.has(sid)) continue;  // уже в welcome-grid — не дублируем в архив
             // Скрытые пользователем sids не показываем ни в основном списке (см. snapshot),
             // ни в архиве — иначе они возвращаются каждый раз, когда Claude.app пере-
             // открывает связанный CLI-инстанс и jsonl становится «свежим» Desktop-стилем.
@@ -6655,8 +6833,17 @@ return "ok"`;
       const title = String(body.title ?? "").trim();
       if (!sid || !cwd) return Response.json({ error: "missing sessionId or cwd" }, { status: 400 });
       if (!/^[0-9a-f-]+$/i.test(sid)) return Response.json({ error: "bad sessionId" }, { status: 400 });
+      // Защита от double-click «Разбудить»: если для этого sid уже есть живой claude-процесс —
+      // не запускаем второй. Без этого два процесса пишут в один jsonl и в дашборде появляются
+      // 2 карточки с одним title (случай Автоматизация 2026-08-22).
+      const livePids = await gatherPidInfos();
+      if (livePids.some(p => p.sessionId === sid || p.resumeSid === sid)) {
+        console.log(`[/restore] REJECT sid=${sid.slice(0,8)} — уже есть живой claude-процесс`);
+        return Response.json({ error: "already-alive", message: "Сессия уже открыта — обнови страницу дашборда." }, { status: 409 });
+      }
       // Защита от инъекции в AppleScript (хотя через argv безопасно, дополнительный фильтр)
       const cleanTitle = title.replace(/[\r\n"]/g, "").slice(0, 80);
+      console.log(`[/restore] sid=${sid.slice(0,8)} cwd="${cwd}"`);
       const r = await restoreSession(sid, cwd, cleanTitle || undefined);
       if (!r.ok) return Response.json({ error: r.error }, { status: 500 });
       return Response.json({ ok: true });
