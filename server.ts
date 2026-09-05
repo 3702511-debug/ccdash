@@ -276,7 +276,29 @@ const MODEL_ALIAS_TO_ID: Record<string, string> = {
   "haiku": "claude-haiku-4-5-20251001",
   "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 };
+// Persistent: переживает рестарт дашборда (иначе после деплоя label врёт — показывает
+// старую модель из jsonl, ведь новых ответов ещё не было). Плюс используется при
+// restore/wake, чтобы поднять сессию с той же моделью (без --model claude берёт дефолт
+// из settings.json и выбор юзера теряется).
+const SESSION_MODELS_FILE = join(homedir(), ".cc-dashboard", "session-models.json");
 const sessionModelOverride = new Map<string, { model: string; at: number }>();
+try {
+  const data = await Bun.file(SESSION_MODELS_FILE).json();
+  if (data && typeof data === "object") {
+    for (const [sid, v] of Object.entries(data as Record<string, any>)) {
+      if (v && typeof v.model === "string") {
+        sessionModelOverride.set(sid, { model: v.model, at: typeof v.at === "number" ? v.at : 0 });
+      }
+    }
+  }
+} catch {}
+async function saveSessionModels() {
+  try {
+    const obj: Record<string, { model: string; at: number }> = {};
+    for (const [k, v] of sessionModelOverride) obj[k] = v;
+    await Bun.write(SESSION_MODELS_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
 
 // === Динамический список моделей ===
 // Источник истины — сам бинарник claude: он валидирует --model, значит знает все
@@ -1016,13 +1038,12 @@ async function snapshot(): Promise<Session[]> {
         isMain: mainSessionSid !== null && sessionId === mainSessionSid,
         hasOpenQuestion: !!st.openQuestionId,
         // Модель: если есть /model-оверрайд И он новее последнего assistant-ответа с моделью —
-        // показываем оверрайд (юзер только что переключил, ответа ещё не было). Иначе — реальная
-        // модель из jsonl. Оверрайд самоустаревает как только claude ответит новой моделью.
+        // показываем оверрайд (юзер переключил, ответа ещё не было). Иначе — реальная модель
+        // из jsonl. Запись оверрайда НЕ удаляем даже когда она «устарела»: это выбор юзера,
+        // он нужен при restore/wake чтобы поднять сессию с нужной моделью (--model).
         model: (() => {
           const ov = sessionModelOverride.get(sessionId);
           if (ov && ov.at > (st.modelAt ?? 0)) return ov.model;
-          // Оверрайд устарел (пришёл свежий ответ) — чистим, чтобы не копился
-          if (ov && st.modelAt && st.modelAt >= ov.at) sessionModelOverride.delete(sessionId);
           return st.model;
         })(),
       });
@@ -1492,7 +1513,10 @@ const RESTORE_SCRIPT_TERMINAL = `on run argv
   set sidArg to item 2 of argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
+  set modelArg to ""
+  if (count of argv) >= 4 then set modelArg to item 4 of argv
   set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg & " --permission-mode auto"
+  if modelArg is not "" then set cmd to cmd & " --model " & modelArg
   tell application "Terminal"
     set newTab to do script cmd
     if titleArg is not "" then
@@ -1518,7 +1542,10 @@ const RESTORE_SCRIPT_ITERM = `on run argv
   set sidArg to item 2 of argv
   set titleArg to ""
   if (count of argv) >= 3 then set titleArg to item 3 of argv
+  set modelArg to ""
+  if (count of argv) >= 4 then set modelArg to item 4 of argv
   set cmd to "cd " & cwdEscaped & " && claude --resume " & sidArg & " --permission-mode auto"
+  if modelArg is not "" then set cmd to cmd & " --model " & modelArg
   tell application "iTerm"
     if (count of windows) = 0 then
       set newWindow to create window with default profile
@@ -1616,7 +1643,13 @@ async function restoreSession(sessionId: string, cwd: string, title?: string): P
   // Экранируем в bash (не через AppleScript `quoted form of` — оно ломается на кириллице).
   const cwdEscaped = shellEscape(slugCwd);
   const args = ["osascript", "-e", restoreScript(), "--", cwdEscaped, sessionId];
-  if (title && title.trim()) args.push(title.trim());
+  // title обязателен как 3-й аргумент, если хотим передать 4-м модель — иначе AppleScript
+  // сдвинет позиции. Пустая строка = «не переименовывать».
+  const savedModel = sessionModelOverride.get(sessionId)?.model ?? "";
+  if ((title && title.trim()) || savedModel) args.push(title?.trim() ?? "");
+  // Поднимаем сессию с той моделью которую юзер выбрал в дашборде — без --model claude
+  // возьмёт дефолт из settings.json и выбор потеряется при каждом wake/restore.
+  if (savedModel && /^claude-[a-z0-9.-]+$/.test(savedModel)) args.push(savedModel);
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
@@ -2336,7 +2369,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v146";
+const CACHE_VERSION = "cc-dashboard-v147";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -7564,6 +7597,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
           ?? (/^claude-[a-z]+-[\d.-]+$/.test(alias) ? alias : undefined);
         if (modelId) {
           sessionModelOverride.set(sid, { model: modelId, at: Date.now() });
+          saveSessionModels();  // fire-and-forget, переживёт рестарт дашборда
           console.log(`[/model override] sid=${sid} → ${modelId}`);
         }
       }
