@@ -472,16 +472,23 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
   // Модель — из последнего assistant-message который РЕАЛЬНО отвечает от Anthropic
   // (message.model). Синтетические сообщения дашборда/claude-code имеют model="<synthetic>".
   // modelAt — timestamp этого record'а, нужен чтобы сравнить со свежестью /model-оверрайда.
+  // ВАЖНО: идём по всем `lines`, а не по `records` — те обрезаны 30 последними записями,
+  // и в активной сессии (поток tool_use/tool_result) последний assistant с model уходит
+  // за это окно → label показывал «модель?».
   let model: string | undefined;
   let modelAt = 0;
-  for (let i = records.length - 1; i >= 0; i--) {
-    const m = records[i]?.message?.model;
-    if (typeof m === "string" && m.startsWith("claude-")) {
-      model = m;
-      const t = records[i]?.timestamp;
-      modelAt = t ? new Date(t).getTime() : 0;
-      break;
-    }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    // Дешёвый префильтр — не парсим JSON у строк где модели заведомо нет
+    if (!lines[i].includes('"model":"claude-')) continue;
+    try {
+      const rec = JSON.parse(lines[i]);
+      const m = rec?.message?.model;
+      if (typeof m === "string" && m.startsWith("claude-")) {
+        model = m;
+        modelAt = rec?.timestamp ? new Date(rec.timestamp).getTime() : 0;
+        break;
+      }
+    } catch {}
   }
 
   // Детект «лимита Anthropic» в последнем assistant-сообщении
@@ -2265,7 +2272,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v144";
+const CACHE_VERSION = "cc-dashboard-v145";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2365,7 +2372,8 @@ const HTML = `<!doctype html>
   .menu-btn { background: #21262d; border: 0; color: #ffffff; border-radius: 50%; padding: 0; cursor: pointer; align-items: center; justify-content: center; width: 40px; height: 40px; min-width: 40px; display: inline-flex; flex-shrink: 0; transition: background 0.15s; }
   .menu-btn:hover { background: #30363d; }
   .menu-btn svg { width: 18px; height: 18px; display: block; }
-  .topbar-spacer { display: block; width: 40px; height: 36px; flex-shrink: 0; }
+  /* .topbar-spacer удалён в v1.0.91 — раньше был заглушкой справа для симметрии с бургером,
+     теперь эту роль выполняет кнопка смены темы (#topbar-theme-btn, тоже 40px). */
   /* Update overlay — полноэкранный фон в цвет темы, минимализм: заголовок + полоса + проценты */
   #upd-overlay { position: fixed; inset: 0; background: #0d1117; z-index: 9999; display: flex; align-items: center; justify-content: center; }
   body.theme-light #upd-overlay { background: #f6f8fa; }
@@ -2894,6 +2902,13 @@ const HTML = `<!doctype html>
     .panel-header button { width: 40px; height: 40px; min-width: 40px; }
     .panel-header button svg { width: 17px; height: 17px; }
     .panel-header .focus-btn { display: none; }  /* Mac-only feature, hide on iPhone */
+    /* Model-btn на мобилке: текстовая кнопка, не круглая. Правило .panel-header button выше
+       ставит фиксированные 40px — перебиваем обратно на auto. Шрифт мельче, паддинг уже,
+       чтобы вместе с Stop и X влезало в узкую шапку. */
+    .panel-header .model-btn { width: auto !important; min-width: auto !important; height: 40px; padding: 0 10px; font-size: 11px; }
+    /* Dropdown прижимаем к правому краю панели и ограничиваем шириной вьюпорта */
+    .panel-header .model-btn .model-menu { top: 46px; right: 0; min-width: 130px; max-width: calc(100vw - 24px); }
+    .panel-header .model-btn .model-menu .model-menu-item { padding: 11px 12px !important; font-size: 14px; }
     .feed { padding: 12px; }
     .msg { margin-bottom: 10px; }
     .msg .body { font-size: 13px; }
@@ -3048,7 +3063,6 @@ const HTML = `<!doctype html>
     <span class="menu-dot" id="menu-dot" style="display:none"></span>
   </button>
   <h1><span id="logo-home" class="logo-text">CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></span></h1>
-  <div class="topbar-spacer"></div>
   <button id="topbar-theme-btn" class="menu-btn" title="Сменить тему" aria-label="Сменить тему">
     <svg id="topbar-theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width:20px; height:20px;"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.5" y1="4.5" x2="6.6" y2="6.6"/><line x1="17.4" y1="17.4" x2="19.5" y2="19.5"/><line x1="4.5" y1="19.5" x2="6.6" y2="17.4"/><line x1="17.4" y1="6.6" x2="19.5" y2="4.5"/></svg>
     <svg id="topbar-theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width:20px; height:20px;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
