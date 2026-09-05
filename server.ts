@@ -278,6 +278,70 @@ const MODEL_ALIAS_TO_ID: Record<string, string> = {
 };
 const sessionModelOverride = new Map<string, { model: string; at: number }>();
 
+// === Динамический список моделей ===
+// Источник истины — сам бинарник claude: он валидирует --model, значит знает все
+// поддерживаемые ID. Достаём через `strings`, фильтруем мусор (снапшот-даты, -v1, -fast,
+// .md-файлы), кэшируем до смены mtime бинарника. Так при обновлении Claude Code новые
+// модели (Fable 5.1, Opus 6…) появляются в dropdown сами, без релиза дашборда.
+const MODEL_FAMILY_ORDER = ["opus", "sonnet", "fable", "haiku"];
+const FALLBACK_MODELS = [
+  "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+  "claude-sonnet-5", "claude-sonnet-4-6",
+  "claude-fable-5",
+  "claude-haiku-4-5",
+];
+let modelsCache: { models: string[]; binMtime: number; at: number } | null = null;
+
+function modelSortKey(id: string): [number, number, number] {
+  const m = id.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/);
+  if (!m) return [99, 0, 0];
+  const famIdx = MODEL_FAMILY_ORDER.indexOf(m[1]);
+  return [famIdx < 0 ? 98 : famIdx, -parseInt(m[2], 10), -(m[3] ? parseInt(m[3], 10) : 0)];
+}
+
+async function discoverModels(): Promise<string[]> {
+  try {
+    // Резолвим symlink ~/.local/bin/claude → versions/<ver>
+    const whichOut = (await sh("which", ["claude"])).trim();
+    if (!whichOut) return FALLBACK_MODELS;
+    let binPath = whichOut;
+    try {
+      const rl = (await sh("readlink", ["-f", whichOut])).trim();
+      if (rl) binPath = rl;
+    } catch {}
+    const st = await stat(binPath).catch(() => null);
+    if (!st) return FALLBACK_MODELS;
+    if (modelsCache && modelsCache.binMtime === st.mtimeMs) return modelsCache.models;
+
+    const proc = Bun.spawn(["strings", binPath], { stdout: "pipe", stderr: "ignore" });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const found = new Set<string>();
+    for (const line of out.split("\n")) {
+      const s = line.trim();
+      // Только «чистые» алиасы: claude-<family>-<N> или claude-<family>-<N>-<M>.
+      // Отсекает снапшоты (claude-opus-4-20250514), -v1, -fast, .md и прочий мусор.
+      if (!/^claude-(opus|sonnet|haiku|fable)-\d+(-\d+)?$/.test(s)) continue;
+      // Снапшот-дата в последней группе (8 цифр) — не алиас
+      if (/-\d{8}$/.test(s)) continue;
+      // claude-opus-4-0 дублирует claude-opus-4 — оставляем только короткую форму
+      if (/-0$/.test(s)) continue;
+      found.add(s);
+    }
+    if (found.size === 0) return FALLBACK_MODELS;
+    const models = [...found].sort((a, b) => {
+      const ka = modelSortKey(a), kb = modelSortKey(b);
+      return ka[0] - kb[0] || ka[1] - kb[1] || ka[2] - kb[2];
+    });
+    modelsCache = { models, binMtime: st.mtimeMs, at: Date.now() };
+    console.log(`[models] обнаружено ${models.length} моделей в ${binPath.split("/").pop()}`);
+    return models;
+  } catch (e) {
+    console.error("[models] discover failed:", e);
+    return FALLBACK_MODELS;
+  }
+}
+
 let tabTitlesCache: { titles: Map<string, string>; at: number } | null = null;
 const TAB_TITLES_TTL_MS = 5_000;
 
@@ -2272,7 +2336,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v145";
+const CACHE_VERSION = "cc-dashboard-v146";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -4142,21 +4206,37 @@ window.fetch = async (...args) => {
 };
 updateWelcome();  // show on initial load
 
-// Известные модели с человекочитаемым именем + slash-alias для /model команды.
-// Порядок = порядок отображения в dropdown. При добавлении новых — правь тут.
-const MODELS = [
-  { id: "claude-opus-5", label: "Opus 5", alias: "opus" },
-  { id: "claude-opus-4-8", label: "Opus 4.8", alias: "claude-opus-4-8" },
-  { id: "claude-opus-4-7", label: "Opus 4.7", alias: "claude-opus-4-7" },
-  { id: "claude-sonnet-5", label: "Sonnet 5", alias: "sonnet" },
-  { id: "claude-sonnet-4-6", label: "Sonnet 4.6", alias: "claude-sonnet-4-6" },
-  { id: "claude-fable-5", label: "Fable 5", alias: "fable" },
-  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", alias: "haiku" },
+// Список моделей грузится с сервера (/api/models — извлекается из бинарника claude,
+// обновляется автоматом при апдейте CLI). До ответа сервера — минимальный fallback.
+let MODELS = [
+  { id: "claude-opus-5", label: "Opus 5", alias: "claude-opus-5" },
+  { id: "claude-fable-5", label: "Fable 5", alias: "claude-fable-5" },
 ];
+// claude-opus-4-8 → "Opus 4.8"; claude-haiku-4-5 → "Haiku 4.5"; claude-fable-5 → "Fable 5"
+function modelIdToLabelRaw(id) {
+  const m = id.match(/^claude-([a-z]+)-(\\d+)(?:-(\\d+))?$/);
+  if (!m) return id.replace(/^claude-/, "");
+  const fam = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+  return fam + " " + m[2] + (m[3] ? "." + m[3] : "");
+}
+async function loadModels() {
+  try {
+    const r = await fetch("/api/models");
+    const d = await r.json();
+    if (Array.isArray(d.models) && d.models.length) {
+      // alias = полный id: он всегда валиден для /model, в отличие от коротких (opus/fable),
+      // которые указывают на «последнюю» модель семейства и могут увести не туда.
+      MODELS = d.models.map(id => ({ id, label: modelIdToLabelRaw(id), alias: id }));
+      // Перерисовать шапки открытых панелей — label мог быть из fallback-списка
+      for (const sid of panels.keys()) updatePanelHeader(sid);
+    }
+  } catch {}
+}
+loadModels();
 function modelIdToLabel(id) {
   if (!id) return "модель?";
   const m = MODELS.find(x => x.id === id);
-  return m ? m.label : id.replace(/^claude-/, "");
+  return m ? m.label : modelIdToLabelRaw(id);
 }
 // Открыть dropdown с моделями. Клик по пункту → шлём /model <alias> в TUI.
 function openModelMenu(sid, panelEl) {
@@ -6470,6 +6550,10 @@ Bun.serve({
       });
     }
 
+    if (url.pathname === "/api/models") {
+      // Список моделей которые понимает установленный claude CLI. Кэш до смены mtime бинарника.
+      return Response.json({ models: await discoverModels() });
+    }
     if (url.pathname === "/api/find-by-name" && req.method === "POST") {
       // Поиск файла по имени. Используется для inline-code-блоков где упомянуто только
       // имя файла без пути. Комбинирует Spotlight (mdfind под $HOME) + прямой поиск в
@@ -7473,7 +7557,11 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const modelMatch = text.trim().match(/^\/model\s+(\S+)/i);
       if (modelMatch) {
         const alias = modelMatch[1].toLowerCase();
-        const modelId = MODEL_ALIAS_TO_ID[alias];
+        // Короткие алиасы (opus/sonnet/fable/haiku) резолвим через таблицу — они указывают
+        // на «последнюю» модель семейства. Полные claude-* id берём как есть, чтобы новые
+        // модели работали без правки таблицы.
+        const modelId = MODEL_ALIAS_TO_ID[alias]
+          ?? (/^claude-[a-z]+-[\d.-]+$/.test(alias) ? alias : undefined);
         if (modelId) {
           sessionModelOverride.set(sid, { model: modelId, at: Date.now() });
           console.log(`[/model override] sid=${sid} → ${modelId}`);
