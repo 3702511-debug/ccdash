@@ -98,6 +98,7 @@ interface Session {
   isMain?: boolean;
   hasOpenQuestion?: boolean;
   openQuestion?: any;  // see OpenQuestion type below — declared later, so use 'any' here to avoid forward-ref
+  model?: string;      // напр. "claude-opus-5" — модель которая обрабатывала последнее сообщение
   // kid-dash интеграция: для сессий kid-dash (cwd содержит ~/.kid-dash/ или ~/Documents/клод/kid-dash/)
   // показываем баннер «ребёнок на уроке» и блокируем композер, пока child_active.
   kidDash?: { isChildChat: boolean; isBlocked: boolean; currentSubject: string | null; expectedEnd: string | null };
@@ -219,7 +220,9 @@ function stripNoise(text: string): string {
   return text
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
     .replace(/<user-prompt-submit-hook>[\s\S]*?<\/user-prompt-submit-hook>/g, "")
+    .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, "")
     .replace(/<command-name>[\s\S]*?<\/command-name>/g, "")
+    .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
     .replace(/<command-args>[\s\S]*?<\/command-args>/g, "")
     .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, "")
     .trim();
@@ -254,6 +257,26 @@ async function getTitle(jsonlPath: string): Promise<string | null> {
 const titleCache = new Map<string, { title: string | null; probedAt: number }>();
 const TITLE_NULL_RECHECK_MS = 10_000;
 const TITLE_VALUE_RECHECK_MS = 60_000;
+
+// Оверрайд модели per-session: когда дашборд сам отправил /model X, мы знаем что юзер выбрал —
+// показываем это сразу, не дожидаясь нового assistant-ответа (в jsonl model виден только на
+// ответах claude, а /model — локальная команда без ответа). Оверрайд действует пока не придёт
+// свежий assistant-record с моделью (at сравнивается с lastActivity сессии).
+// alias-таблица «/model <alias>» → полный modelId (совпадает с MODELS на клиенте).
+const MODEL_ALIAS_TO_ID: Record<string, string> = {
+  "opus": "claude-opus-5",
+  "claude-opus-5": "claude-opus-5",
+  "claude-opus-4-8": "claude-opus-4-8",
+  "claude-opus-4-7": "claude-opus-4-7",
+  "sonnet": "claude-sonnet-5",
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-sonnet-4-6": "claude-sonnet-4-6",
+  "fable": "claude-fable-5",
+  "claude-fable-5": "claude-fable-5",
+  "haiku": "claude-haiku-4-5-20251001",
+  "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+};
+const sessionModelOverride = new Map<string, { model: string; at: number }>();
 
 let tabTitlesCache: { titles: Map<string, string>; at: number } | null = null;
 const TAB_TITLES_TTL_MS = 5_000;
@@ -364,6 +387,9 @@ interface StatusInfo {
   limitResetAt?: string;
   // Открытый AskUserQuestion — модель ждёт ответ-выбор от пользователя; UI показывает кнопки
   openQuestionId?: string;
+  // Модель которой отвечал последний assistant-message (напр. claude-opus-5, claude-fable-5)
+  model?: string;
+  modelAt?: number;  // timestamp записи с моделью (для сравнения со свежестью /model-оверрайда)
 }
 
 async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
@@ -443,6 +469,21 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
     }
   }
 
+  // Модель — из последнего assistant-message который РЕАЛЬНО отвечает от Anthropic
+  // (message.model). Синтетические сообщения дашборда/claude-code имеют model="<synthetic>".
+  // modelAt — timestamp этого record'а, нужен чтобы сравнить со свежестью /model-оверрайда.
+  let model: string | undefined;
+  let modelAt = 0;
+  for (let i = records.length - 1; i >= 0; i--) {
+    const m = records[i]?.message?.model;
+    if (typeof m === "string" && m.startsWith("claude-")) {
+      model = m;
+      const t = records[i]?.timestamp;
+      modelAt = t ? new Date(t).getTime() : 0;
+      break;
+    }
+  }
+
   // Детект «лимита Anthropic» в последнем assistant-сообщении
   let limitHit = false;
   let limitResetAt: string | undefined;
@@ -487,7 +528,7 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
     if (!answeredIds.has(id)) openQuestionId = id;  // last unanswered wins
   }
 
-  return { status, lastActivity: ts, sessionId, recordCwd, busySince, inputTokens, limitHit, limitResetAt, openQuestionId };
+  return { status, lastActivity: ts, sessionId, recordCwd, busySince, inputTokens, limitHit, limitResetAt, openQuestionId, model, modelAt };
 }
 
 interface PidInfo {
@@ -903,6 +944,16 @@ async function snapshot(): Promise<Session[]> {
         limitResetAt: st.limitResetAt,
         isMain: mainSessionSid !== null && sessionId === mainSessionSid,
         hasOpenQuestion: !!st.openQuestionId,
+        // Модель: если есть /model-оверрайд И он новее последнего assistant-ответа с моделью —
+        // показываем оверрайд (юзер только что переключил, ответа ещё не было). Иначе — реальная
+        // модель из jsonl. Оверрайд самоустаревает как только claude ответит новой моделью.
+        model: (() => {
+          const ov = sessionModelOverride.get(sessionId);
+          if (ov && ov.at > (st.modelAt ?? 0)) return ov.model;
+          // Оверрайд устарел (пришёл свежий ответ) — чистим, чтобы не копился
+          if (ov && st.modelAt && st.modelAt >= ov.at) sessionModelOverride.delete(sessionId);
+          return st.model;
+        })(),
       });
 
       sessionMeta.set(sessionId, {
@@ -1159,14 +1210,25 @@ async function readMessages(jsonlPath: string, limitBytes = 256 * 1024): Promise
       if (rec.type === "user") {
         const content = rec.message?.content;
         if (typeof content === "string") {
-          messages.push({ role: "user", text: content, ts });
+          // Служебные slash-команды и local-command обёртки не показываем в ленте — это не разговор,
+          // а управление (смена модели через кнопку/TUI, переименование). stripNoise убирает
+          // <local-command-*>, <command-*> обёртки; если после стрипа пусто ИЛИ остался голый
+          // /model|/rename — пропускаем запись целиком. Юзер видит результат (label / title), не команду.
+          const cleaned = stripNoise(content);
+          if (!cleaned || /^\s*\/(model|rename)\b/i.test(cleaned)) continue;
+          messages.push({ role: "user", text: cleaned, ts });
         } else if (Array.isArray(content)) {
           const texts: string[] = [];
           for (const item of content) {
             if (item?.type === "text" && typeof item.text === "string") texts.push(item.text);
             else if (item?.type === "tool_result") messages.push({ role: "tool", text: compactToolResult(item), ts });
           }
-          if (texts.length) messages.push({ role: "user", text: texts.join("\n"), ts });
+          if (texts.length) {
+            const joined = stripNoise(texts.join("\n"));
+            if (joined && !/^\s*\/(model|rename)\b/i.test(joined)) {
+              messages.push({ role: "user", text: joined, ts });
+            }
+          }
         }
       } else if (rec.type === "assistant") {
         const content = rec.message?.content;
@@ -2203,7 +2265,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v143";
+const CACHE_VERSION = "cc-dashboard-v144";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -2597,6 +2659,40 @@ const HTML = `<!doctype html>
   .panel-header button svg { width: 16px; height: 16px; display: block; }
   .panel-header .interrupt-btn { width: auto; min-width: auto; padding: 0 14px; font-size: 13px; font-weight: 500; color: white; background: #d73a49; border-radius: 18px; height: 36px; letter-spacing: 0.02em; }
   .panel-header .interrupt-btn:hover { background: #cb2431; }
+  /* Model-btn — как остальные round buttons (36×36 → auto с pill радиусом), с текстом типа "Opus 5" */
+  .panel-header .model-btn { width: auto; min-width: auto; padding: 0 12px; font-size: 12px; font-weight: 500; border-radius: 18px; height: 36px; white-space: nowrap; letter-spacing: 0.02em; position: relative; }
+  .panel-header .model-btn:hover { background: #30363d; }
+  .panel-header .model-btn.disabled { opacity: 0.5; cursor: default; }
+  .panel-header .model-btn.disabled:hover { background: #21262d; }
+  body.theme-light .panel-header .model-btn { background: #eaeef2; color: #24292f; }
+  body.theme-light .panel-header .model-btn:hover { background: #d0d7de; }
+  /* Dropdown с моделями — маленький popup под кнопкой.
+     ВАЖНО: перебиваем родительский panel-header button (width:36px, border-radius:50%)
+     через специфичные селекторы плюс !important — иначе кнопки-пункты станут круглыми
+     36x36 и наложатся друг на друга. */
+  .panel-header .model-btn .model-menu { position: absolute; top: 42px; right: 0; background: #21262d; border: 1px solid #30363d; border-radius: 8px; padding: 4px; min-width: 150px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.4); display: block; }
+  body.theme-light .panel-header .model-btn .model-menu { background: #ffffff; border-color: #d0d7de; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+  .panel-header .model-btn .model-menu .model-menu-item {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    height: auto !important;
+    padding: 8px 12px !important;
+    background: transparent !important;
+    border: 0 !important;
+    color: #c9d1d9;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 4px !important;
+    font-size: 13px;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  body.theme-light .panel-header .model-btn .model-menu .model-menu-item { color: #24292f; }
+  .panel-header .model-btn .model-menu .model-menu-item:hover { background: #30363d !important; color: white; }
+  body.theme-light .panel-header .model-btn .model-menu .model-menu-item:hover { background: #f6f8fa !important; color: #24292f; }
+  .panel-header .model-btn .model-menu .model-menu-item.current { color: #58a6ff; font-weight: 500; }
+  body.theme-light .panel-header .model-btn .model-menu .model-menu-item.current { color: #0969da; }
   .panel-header .close-btn:hover { background: #d73a49; color: white; }
   .warn { background: #321c1c; color: #f0c674; padding: 8px 14px; font-size: 12px; border-bottom: 1px solid #30363d; }
   .warn.self { background: #1f1633; color: #a371f7; }
@@ -2953,6 +3049,10 @@ const HTML = `<!doctype html>
   </button>
   <h1><span id="logo-home" class="logo-text">CC Dashboard<span class="blood" aria-hidden="true">CC Dashboard</span></span></h1>
   <div class="topbar-spacer"></div>
+  <button id="topbar-theme-btn" class="menu-btn" title="Сменить тему" aria-label="Сменить тему">
+    <svg id="topbar-theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width:20px; height:20px;"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.5" y1="4.5" x2="6.6" y2="6.6"/><line x1="17.4" y1="17.4" x2="19.5" y2="19.5"/><line x1="4.5" y1="19.5" x2="6.6" y2="17.4"/><line x1="17.4" y1="6.6" x2="19.5" y2="4.5"/></svg>
+    <svg id="topbar-theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width:20px; height:20px;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  </button>
   <button id="push-btn" style="display:none"></button>
   <button id="update-btn" style="display:none"></button>
 </div>
@@ -3048,15 +3148,6 @@ const HTML = `<!doctype html>
       <div class="drawer-item" id="settings-notifications">
         <span>Уведомления</span>
         <span class="toggle" id="notif-toggle"><span class="toggle-thumb"></span></span>
-      </div>
-      <div class="drawer-item" id="settings-theme">
-        <span>Тема</span>
-        <span class="toggle theme-toggle" id="theme-toggle">
-          <span class="toggle-thumb">
-            <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.5" y1="4.5" x2="6.6" y2="6.6"/><line x1="17.4" y1="17.4" x2="19.5" y2="19.5"/><line x1="4.5" y1="19.5" x2="6.6" y2="17.4"/><line x1="17.4" y1="6.6" x2="19.5" y2="4.5"/></svg>
-            <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
-          </span>
-        </span>
       </div>
       <div class="drawer-item" id="settings-updates">
         <span>Обновления<span class="drawer-dot" id="updates-dot" style="display:none"></span></span>
@@ -3640,19 +3731,26 @@ refreshHiddenList();
 
 // Тема: тумблер с иконкой солнца (слева, светлая) / луны (справа, тёмная).
 // localStorage("theme") = "light" | "dark" (по умолчанию dark).
+// Дополнительно: кнопка-переключатель в topbar справа. Иконка показывает то на что
+// переключит клик (сейчас светлая → луна = переключить на тёмную; тёмная → солнце).
 function applyTheme(theme) {
   document.body.classList.toggle("theme-light", theme === "light");
-  const tg = document.getElementById("theme-toggle");
-  if (tg) tg.classList.toggle("on", theme === "dark");
+  const sun = document.getElementById("topbar-theme-sun");
+  const moon = document.getElementById("topbar-theme-moon");
+  if (sun && moon) {
+    sun.style.display = theme === "dark" ? "block" : "none";
+    moon.style.display = theme === "light" ? "block" : "none";
+  }
 }
 const savedTheme = localStorage.getItem("theme") || "dark";
 applyTheme(savedTheme);
-document.getElementById("settings-theme").addEventListener("click", () => {
+function toggleTheme() {
   const cur = localStorage.getItem("theme") || "dark";
   const next = cur === "dark" ? "light" : "dark";
   localStorage.setItem("theme", next);
   applyTheme(next);
-});
+}
+document.getElementById("topbar-theme-btn").addEventListener("click", toggleTheme);
 // === Rename session modal (клик по названию чата) ===
 const rnModal = document.getElementById("rename-modal");
 const rnName = document.getElementById("rn-name");
@@ -4030,6 +4128,62 @@ window.fetch = async (...args) => {
 };
 updateWelcome();  // show on initial load
 
+// Известные модели с человекочитаемым именем + slash-alias для /model команды.
+// Порядок = порядок отображения в dropdown. При добавлении новых — правь тут.
+const MODELS = [
+  { id: "claude-opus-5", label: "Opus 5", alias: "opus" },
+  { id: "claude-opus-4-8", label: "Opus 4.8", alias: "claude-opus-4-8" },
+  { id: "claude-opus-4-7", label: "Opus 4.7", alias: "claude-opus-4-7" },
+  { id: "claude-sonnet-5", label: "Sonnet 5", alias: "sonnet" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6", alias: "claude-sonnet-4-6" },
+  { id: "claude-fable-5", label: "Fable 5", alias: "fable" },
+  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", alias: "haiku" },
+];
+function modelIdToLabel(id) {
+  if (!id) return "модель?";
+  const m = MODELS.find(x => x.id === id);
+  return m ? m.label : id.replace(/^claude-/, "");
+}
+// Открыть dropdown с моделями. Клик по пункту → шлём /model <alias> в TUI.
+function openModelMenu(sid, panelEl) {
+  const s = findSession(sid);
+  if (!s || !s.tty) return;  // мёртвая сессия — некуда слать
+  const btn = panelEl.querySelector(".model-btn");
+  const existing = panelEl.querySelector(".model-menu");
+  if (existing) { existing.remove(); return; }  // toggle
+  const menu = document.createElement("div");
+  menu.className = "model-menu";
+  menu.innerHTML = MODELS.map(m => {
+    const cur = m.id === s.model ? "current" : "";
+    return \`<button class="model-menu-item \${cur}" data-alias="\${m.alias}">\${m.label}</button>\`;
+  }).join("");
+  btn.appendChild(menu);
+  menu.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const item = e.target.closest(".model-menu-item");
+    if (!item) return;
+    const alias = item.dataset.alias;
+    menu.remove();
+    // Шлём /model <alias> в TUI через существующий send endpoint
+    try {
+      const res = await fetch("/api/session/" + sid + "/send", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "/model " + alias }),
+      });
+      const data = await res.json();
+      if (data.error) alert("Не удалось переключить модель: " + data.error);
+    } catch (err) { alert("Сеть: " + err.message); }
+  });
+  // Клик вне меню закрывает его
+  const onOutside = (e) => {
+    if (!menu.contains(e.target) && e.target !== btn) {
+      menu.remove();
+      document.removeEventListener("click", onOutside);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", onOutside), 0);
+}
 function updatePanelHeader(sid) {
   const p = panels.get(sid);
   if (!p) return;
@@ -4038,6 +4192,14 @@ function updatePanelHeader(sid) {
   const titleEl = p.el.querySelector(".title-main");
   const cwdEl = p.el.querySelector(".cwd-line");
   const meta = s.pid > 0 ? "  ·  pid " + s.pid : "";
+  // Обновляем label модели. Если сессия мёртвая — disabled (нет TUI куда слать /model).
+  const modelBtn = p.el.querySelector(".model-btn");
+  const modelLabel = p.el.querySelector(".model-label");
+  if (modelBtn && modelLabel) {
+    modelLabel.textContent = modelIdToLabel(s.model);
+    modelBtn.classList.toggle("disabled", !s.tty);
+    modelBtn.title = s.model || "Модель ещё не известна";
+  }
   if (s.title) {
     titleEl.textContent = s.title;
     titleEl.style.display = "";
@@ -4302,6 +4464,9 @@ function openPanel(sid) {
         <div class="title-main"></div>
         <div class="cwd-line"></div>
       </div>
+      <button class="model-btn" title="Модель">
+        <span class="model-label">…</span>
+      </button>
       <button class="focus-btn" title="Поднять окно терминала">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
       </button>
@@ -4759,6 +4924,10 @@ function openPanel(sid) {
 
   el.querySelector(".close-btn").addEventListener("click", () => closePanel(sid));
   el.querySelector(".focus-btn").addEventListener("click", () => focusWindow(sid));
+  el.querySelector(".model-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openModelMenu(sid, el);
+  });
   el.querySelector(".title-block").addEventListener("click", () => {
     openRenameModal(sid);
   });
@@ -6288,21 +6457,42 @@ Bun.serve({
     }
 
     if (url.pathname === "/api/find-by-name" && req.method === "POST") {
-      // Поиск файла по имени через Spotlight (mdfind). Используется для inline-code-блоков
-      // где упомянуто только имя файла без пути. Возвращает первое совпадение под $HOME.
+      // Поиск файла по имени. Используется для inline-code-блоков где упомянуто только
+      // имя файла без пути. Комбинирует Spotlight (mdfind под $HOME) + прямой поиск в
+      // /tmp/cc-dashboard/ и /private/tmp/claude-501/*/scratchpad/ (Spotlight их не индексирует,
+      // но Claude Code складывает туда файлы через Write tool). Возвращает первое совпадение.
       const body = await req.json().catch(() => ({})) as { name?: string };
       const rawName = String(body.name ?? "").trim();
-      // Безопасность: только разрешённые символы в имени (без пробелов, кавычек, спец-чаров); юникод-буквы разрешены
       const name = rawName.replace(/[^\p{L}\p{N}_.\-]/gu, "").slice(0, 100);
       if (!name || name.length < 3) return Response.json({ error: "bad name" }, { status: 400 });
-      const proc = Bun.spawn(["mdfind", "-name", name, "-onlyin", homedir()], { stdout: "pipe", stderr: "pipe" });
-      const out = await new Response(proc.stdout).text();
-      await proc.exited;
-      const paths = out.trim().split("\n").filter(p => p && p.startsWith("/"));
-      // Фильтр: точное совпадение имени файла (mdfind может вернуть substring match'и)
-      const exactMatches = paths.filter(p => p.split("/").pop() === name);
-      const matches = exactMatches.length > 0 ? exactMatches : paths;
-      return Response.json({ matches: matches.slice(0, 5) });
+      const matches: string[] = [];
+      // 1. Spotlight под $HOME
+      try {
+        const proc = Bun.spawn(["mdfind", "-name", name, "-onlyin", homedir()], { stdout: "pipe", stderr: "pipe" });
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        const paths = out.trim().split("\n").filter(p => p && p.startsWith("/"));
+        const exactMatches = paths.filter(p => p.split("/").pop() === name);
+        matches.push(...(exactMatches.length > 0 ? exactMatches : paths));
+      } catch {}
+      // 2. Fallback: /tmp/cc-dashboard/ (dashboard uploads) — plain filesystem check
+      const tmpDashPath = join(UPLOAD_DIR, name);
+      if (existsSync(tmpDashPath)) matches.push(tmpDashPath);
+      // 3. Fallback: /private/tmp/claude-501/*/scratchpad/ (Claude Code Write outputs)
+      // Spotlight не индексирует /tmp; используем find для сканирования scratchpad-директорий.
+      try {
+        const scratchRoot = "/private/tmp/claude-501";
+        if (existsSync(scratchRoot)) {
+          const findProc = Bun.spawn(["find", scratchRoot, "-name", name, "-type", "f"], { stdout: "pipe", stderr: "ignore" });
+          const findOut = await new Response(findProc.stdout).text();
+          await findProc.exited;
+          const scratchPaths = findOut.trim().split("\n").filter(p => p && p.startsWith("/"));
+          matches.push(...scratchPaths);
+        }
+      } catch {}
+      // dedup
+      const uniq = Array.from(new Set(matches));
+      return Response.json({ matches: uniq.slice(0, 5) });
     }
     if (url.pathname === "/api/open-path" && req.method === "POST") {
       const body = await req.json().catch(() => ({})) as { path?: string };
@@ -6312,8 +6502,9 @@ Bun.serve({
       p = p.replace(/:\d+(:\d+)?$/, "");
       // Tilde-expand
       if (p.startsWith("~")) p = p.replace(/^~/, homedir());
-      // Безопасность: разрешаем только пути под $HOME или /tmp/ (system temp — пользователь его и так писал)
-      const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/");
+      // Безопасность: разрешаем пути под $HOME, /tmp/ (system temp), и /private/tmp/claude-501/*/scratchpad/
+      // (там Claude Code кладёт файлы через Write tool — Spotlight их не индексирует, но открыть можно).
+      const allowed = p.startsWith(homedir() + "/") || p === homedir() || p.startsWith("/tmp/") || p.startsWith("/private/tmp/claude-501/");
       if (!allowed) return Response.json({ error: "path outside allowed scope" }, { status: 403 });
       // Если файла нет — AppleScript reveal тихо откроет какую-то ближайшую папку,
       // пользователь не поймёт куда его «привело». Сразу возвращаем 404 с понятной ошибкой.
@@ -7261,6 +7452,18 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       // Если шлём /rename — сбрасываем кэш заголовка чтобы новое имя подхватилось быстро
       if (text.trim().toLowerCase().startsWith("/rename ")) {
         titleCache.delete(sid);
+      }
+      // Если шлём /model <alias> — запоминаем оверрайд, чтобы label модели в дашборде
+      // обновился сразу (не дожидаясь нового ответа claude). Оверрайд уступит реальному
+      // message.model когда придёт следующий assistant-ответ.
+      const modelMatch = text.trim().match(/^\/model\s+(\S+)/i);
+      if (modelMatch) {
+        const alias = modelMatch[1].toLowerCase();
+        const modelId = MODEL_ALIAS_TO_ID[alias];
+        if (modelId) {
+          sessionModelOverride.set(sid, { model: modelId, at: Date.now() });
+          console.log(`[/model override] sid=${sid} → ${modelId}`);
+        }
       }
       // Если text начинается с `!` — это shell-bang Claude Code (выполнить как bash).
       // Claude Code включает bash-mode только при ЖИВОМ keypress `!`, не при AppleScript paste.
