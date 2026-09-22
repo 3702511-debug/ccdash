@@ -228,16 +228,37 @@ if (!haveBrew) {
 // показывает «Do you want to proceed?» — для пользователя дашборда это сильно мешает.
 // Создаём ТОЛЬКО если settings.json ещё нет (не трогаем существующие настройки).
 const claudeSettingsPath = join(HOME, ".claude", "settings.json");
+// cleanupPeriodDays: Claude Code по умолчанию удаляет jsonl сессий, к которым не
+// обращались 30 дней. Для дашборда это катастрофа — сессия просто исчезает с карточкой
+// и всей перепиской. Инцидент 22.09.2026: так пропало 6 сессий у владельца.
+// Ставим 3650 (≈10 лет) — фактически отключаем автоудаление.
+const RETENTION_DAYS = 3650;
 if (!existsSync(claudeSettingsPath)) {
   log("Создаю ~/.claude/settings.json в auto-permission mode (без вопросов на каждую команду)…");
   mkdirSync(join(HOME, ".claude"), { recursive: true });
   await Bun.write(claudeSettingsPath, JSON.stringify({
     permissions: { defaultMode: "auto" },
     skipAutoPermissionPrompt: true,
+    cleanupPeriodDays: RETENTION_DAYS,
   }, null, 2));
-  ok("~/.claude/settings.json создан (auto mode)");
+  ok("~/.claude/settings.json создан (auto mode, автоудаление сессий отключено)");
 } else {
-  log("(~/.claude/settings.json уже есть — не трогаю)");
+  // Файл уже есть — правим ТОЛЬКО cleanupPeriodDays, остальное не трогаем.
+  try {
+    const cfg = await Bun.file(claudeSettingsPath).json();
+    const cur = cfg.cleanupPeriodDays;
+    if (typeof cur !== "number" || cur < RETENTION_DAYS) {
+      const backup = `${claudeSettingsPath}.bak-${new Date().toISOString().slice(0, 10)}`;
+      if (!existsSync(backup)) await Bun.write(backup, JSON.stringify(cfg, null, 2));
+      cfg.cleanupPeriodDays = RETENTION_DAYS;
+      await Bun.write(claudeSettingsPath, JSON.stringify(cfg, null, 2));
+      ok(`cleanupPeriodDays: ${cur ?? "не задан (дефолт 30 дней)"} → ${RETENTION_DAYS} — сессии больше не удаляются автоматически`);
+    } else {
+      log("(~/.claude/settings.json уже есть, автоудаление сессий уже отключено)");
+    }
+  } catch {
+    log("(~/.claude/settings.json уже есть — не трогаю)");
+  }
 }
 
 // 5. LaunchAgent

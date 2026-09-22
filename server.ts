@@ -2369,7 +2369,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v147";
+const CACHE_VERSION = "cc-dashboard-v148";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6934,6 +6934,62 @@ end tell`;
         if (livePids.some(p => p.sessionId === resumeSid)) {
           return Response.json({ error: "Эта сессия уже открыта в терминале — нельзя дублировать. Открой её карточку в дашборде." }, { status: 409 });
         }
+      }
+      // Каждая сессия живёт в своей папке со своим CLAUDE.md — иначе рабочие файлы
+      // расползаются по диску, а при удалении jsonl (Claude Code чистит их по
+      // cleanupPeriodDays) от сессии не остаётся вообще ничего. CLAUDE.md автозагружается
+      // при каждом старте и служит постоянной базой знаний, переживающей потерю переписки.
+      try {
+        if (!existsSync(cwd)) {
+          await mkdir(cwd, { recursive: true });
+          console.log(`[new-session] создана папка ${cwd}`);
+        }
+        const mdPath = join(cwd, "CLAUDE.md");
+        if (!existsSync(mdPath)) {
+          const today = new Date().toLocaleDateString("ru-RU");
+          await Bun.write(mdPath, [
+            `# CLAUDE.md — ${name}`,
+            ``,
+            `Автозагружается при старте сессии в этом cwd. Глобальные правила — \`~/.claude/CLAUDE.md\`.`,
+            ``,
+            `**Создана:** ${today}`,
+            ``,
+            `## Что это за сессия`,
+            ``,
+            `_TODO: одной строкой — чем занимаемся._`,
+            ``,
+            `## ⚠️ Правило хранения файлов`,
+            ``,
+            `**Все файлы этой сессии лежат только в этой папке.**`,
+            ``,
+            `- Новая тема → новая подпапка здесь, не где-то ещё на диске.`,
+            `- **Не сохранять рабочие файлы в \`/tmp/\`** — оттуда они пропадают.`,
+            `  \`/tmp/cc-dashboard/\` — только для скриншотов и разовых вложений.`,
+            `- Файлы от пользователя класть сюда, а не в Downloads.`,
+            ``,
+            `## Ключевые факты`,
+            ``,
+            `_TODO: IP, порты, пути, версии, найденные настройки — всё, что понадобится после /compact._`,
+            ``,
+            `## Что уже решено`,
+            ``,
+            `_TODO: после каждого нетривиального дебага — 2-3 строки: что было, как починили._`,
+            ``,
+            `## Открытые вопросы`,
+            ``,
+            `_TODO: незакрытые задачи. Закрытые — удалять._`,
+            ``,
+            `---`,
+            ``,
+            `**Правило ведения:** обновлять этот файл по ходу работы, не откладывая.`,
+            `Переписка сессии может быть удалена автоматической чисткой Claude Code —`,
+            `этот файл останется.`,
+            ``,
+          ].join("\n"));
+          console.log(`[new-session] создан CLAUDE.md в ${cwd}`);
+        }
+      } catch (e) {
+        console.error(`[new-session] не удалось подготовить папку ${cwd}:`, e);
       }
       console.log(`[new-session] cwd=${cwd} resume=${resumeSid || "(new)"} rc=${rc}`);
       // AppleScript: открыть preferred-терминал, запустить claude (или claude --resume), /rename, /remote-control, скрыть.
