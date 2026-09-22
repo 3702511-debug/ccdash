@@ -15,7 +15,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, cpSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, chmodSync } from "node:fs";
 
 const SRC = import.meta.dir;
 const HOME = homedir();
@@ -258,6 +258,50 @@ if (!existsSync(claudeSettingsPath)) {
     }
   } catch {
     log("(~/.claude/settings.json уже есть — не трогаю)");
+  }
+}
+
+// 4.6. Hooks: гарантируем CLAUDE.md в папке каждой сессии и напоминаем обновить его
+// перед сжатием контекста. CLAUDE.md автозагружается при старте и переживает и compact,
+// и удаление jsonl — после инцидента 22.09.2026 уцелело ровно то, что лежало в папках.
+const hooksDir = join(HOME, ".claude", "hooks");
+const HOOK_FILES = ["ensure-claude-md.sh", "precompact-claude-md.sh"];
+const hooksSrcDir = join(SRC, "hooks");
+if (existsSync(hooksSrcDir)) {
+  log("Устанавливаю hooks (CLAUDE.md-страховка)…");
+  mkdirSync(hooksDir, { recursive: true });
+  for (const f of HOOK_FILES) {
+    const src = join(hooksSrcDir, f);
+    if (!existsSync(src)) continue;
+    const dst = join(hooksDir, f);
+    cpSync(src, dst);
+    try { chmodSync(dst, 0o755); } catch {}
+  }
+  // Прописываем в settings.json, аккуратно мержа с существующими hooks
+  try {
+    const cfg = existsSync(claudeSettingsPath) ? await Bun.file(claudeSettingsPath).json() : {};
+    cfg.hooks ??= {};
+    let changed = false;
+    const WANT: Array<[string, string]> = [
+      ["SessionStart", "$HOME/.claude/hooks/ensure-claude-md.sh"],
+      ["PreCompact", "$HOME/.claude/hooks/precompact-claude-md.sh"],
+    ];
+    for (const [event, cmd] of WANT) {
+      cfg.hooks[event] ??= [];
+      const already = JSON.stringify(cfg.hooks[event]).includes(cmd.split("/").pop()!);
+      if (already) continue;
+      cfg.hooks[event].push({ hooks: [{ type: "command", command: cmd, timeout: 10 }] });
+      changed = true;
+    }
+    if (changed) {
+      await Bun.write(claudeSettingsPath, JSON.stringify(cfg, null, 2));
+      ok("hooks прописаны в ~/.claude/settings.json (SessionStart + PreCompact)");
+      log("  → чтобы применились в уже открытых сессиях, откройте /hooks один раз");
+    } else {
+      log("(hooks уже прописаны — не трогаю)");
+    }
+  } catch (e) {
+    log(`(не удалось прописать hooks: ${e})`);
   }
 }
 
