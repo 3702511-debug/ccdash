@@ -113,6 +113,44 @@ interface SessionMeta {
 
 const sessionMeta = new Map<string, SessionMeta>();
 
+// Последняя модель, реально виденная в jsonl каждой сессии. Нужен, потому что окно
+// чтения readStatus фиксированное — ответ с полем model может выпасть за его край,
+// и без кэша label в UI мерцал между реальной моделью и /model-оверрайдом.
+const lastKnownModel = new Map<string, { model: string; at: number }>();
+
+// Проверяет, что tty из sessionMeta всё ещё принадлежит процессу ИМЕННО этой сессии.
+//
+// Зачем: sessionMeta живёт в памяти и не чистится. Сессия могла переехать на другой tty
+// (усыпили-разбудили, перенесли вкладку между окнами iTerm, процесс упал и поднялся),
+// а в meta остался старый. Тогда /send печатает текст в ЧУЖУЮ вкладку — сообщение уходит
+// не в тот чат. Реальный случай 25.09.2026: «/model claude-opus-5» для кассы парковки
+// (ttys004) улетел на ttys002, где сессия была неделю назад.
+//
+// Возвращает актуальный tty (обновив meta) или null, если живого процесса нет.
+async function verifiedTty(sid: string): Promise<string | null> {
+  const meta = sessionMeta.get(sid);
+  if (!meta) return null;
+  // Быстрый путь: pid из meta жив и сидит на том же tty — meta актуальна.
+  if (meta.pid > 0 && meta.tty) {
+    try {
+      const cur = (await sh("ps", ["-o", "tty=", "-p", String(meta.pid)])).trim();
+      if (cur && cur !== "??" && cur === meta.tty) return meta.tty;
+    } catch {}
+  }
+  // Медленный путь: ищем живой claude-процесс этой сессии заново.
+  const pids = await gatherPidInfos();
+  const hit = pids.find(p => p.sessionId === sid || p.resumeSid === sid);
+  if (hit?.tty) {
+    if (hit.tty !== meta.tty) {
+      console.log(`[tty-refresh] sid=${sid.slice(0, 8)} ${meta.tty ?? "(нет)"} → ${hit.tty} (meta устарела)`);
+    }
+    sessionMeta.set(sid, { ...meta, tty: hit.tty, pid: hit.pid });
+    return hit.tty;
+  }
+  console.log(`[tty-refresh] sid=${sid.slice(0, 8)} живого процесса нет — отправка отменена`);
+  return null;
+}
+
 async function sh(cmd: string, args: string[]): Promise<string> {
   const proc = Bun.spawn([cmd, ...args], { stdout: "pipe", stderr: "ignore" });
   const out = await new Response(proc.stdout).text();
@@ -575,6 +613,16 @@ async function readStatus(jsonlPath: string): Promise<StatusInfo | null> {
         break;
       }
     } catch {}
+  }
+  // Окно чтения фиксированное (64 КБ), поэтому в активной сессии последний assistant
+  // с полем model то попадает в него, то вылетает за край при большом tool-выхлопе.
+  // Без кэша это давало мерцание label'а в UI: то реальная модель, то /model-оверрайд
+  // (он выигрывает, когда modelAt=0). Помним последнее найденное значение по sid.
+  if (model) {
+    lastKnownModel.set(sessionId, { model, at: modelAt });
+  } else {
+    const cached = lastKnownModel.get(sessionId);
+    if (cached) { model = cached.model; modelAt = cached.at; }
   }
 
   // Детект «лимита Anthropic» в последнем assistant-сообщении
@@ -2369,7 +2417,7 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <text x="256" y="256" font-family="UC" font-weight="700" font-size="340" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CC</text>
 </svg>`;
 
-const CACHE_VERSION = "cc-dashboard-v148";
+const CACHE_VERSION = "cc-dashboard-v149";
 const SERVICE_WORKER_JS = `
 const CACHE = "${CACHE_VERSION}";
 self.addEventListener('install', e => {
@@ -6664,8 +6712,10 @@ Bun.serve({
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
       // Используем sendRawKey('escape') — он шлёт Esc через CGEventPostToPid без system-wide activate.
       // Раньше тут был AppleScript с `activate`, который выкидывал Terminal в фронт.
-      const { ok, error } = await sendRawKey(meta.tty, "escape");
-      console.log(`[interrupt ${meta.tty}] sendRawKey escape: ok=${ok} err=${error ?? ""}`);
+      const itTty = await verifiedTty(sid);
+      if (!itTty) return Response.json({ error: "no tty" }, { status: 400 });
+      const { ok, error } = await sendRawKey(itTty, "escape");
+      console.log(`[interrupt ${itTty}] sendRawKey escape: ok=${ok} err=${error ?? ""}`);
       if (!ok) return Response.json({ error: error ?? "send failed" }, { status: 500 });
       return Response.json({ ok: true });
     }
@@ -7579,7 +7629,9 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
       const body = await req.json().catch(() => ({})) as { text?: string };
       if (typeof body.text !== "string" || !body.text) return Response.json({ error: "text required" }, { status: 400 });
-      const res = await sendTextToTui(meta.tty, body.text);
+      const ttTty = await verifiedTty(sid);
+      if (!ttTty) return Response.json({ error: "no tty" }, { status: 400 });
+      const res = await sendTextToTui(ttTty, body.text);
       if (res.ok) return Response.json({ ok: true });
       return Response.json({ error: res.error }, { status: 500 });
     }
@@ -7603,7 +7655,9 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
       const body = await req.json().catch(() => ({})) as { key?: string };
       if (!body.key || typeof body.key !== "string") return Response.json({ error: "key required" }, { status: 400 });
-      const res = await sendRawKey(meta.tty, body.key as any);
+      const rkTty = await verifiedTty(sid);
+      if (!rkTty) return Response.json({ error: "no tty" }, { status: 400 });
+      const res = await sendRawKey(rkTty, body.key as any);
       if (res.ok) return Response.json({ ok: true });
       return Response.json({ error: res.error }, { status: 500 });
     }
@@ -7617,7 +7671,9 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const idx = Number(body.optionIndex);
       if (!Number.isInteger(idx) || idx < 1 || idx > 20) return Response.json({ error: "invalid optionIndex" }, { status: 400 });
       const freeText = typeof body.freeText === "string" ? body.freeText : undefined;
-      const res = await answerTuiQuestion(meta.tty, idx, freeText);
+      const aqTty = await verifiedTty(sid);
+      if (!aqTty) return Response.json({ error: "no tty" }, { status: 400 });
+      const res = await answerTuiQuestion(aqTty, idx, freeText);
       if (res.ok) return Response.json({ ok: true });
       return Response.json({ error: res.error }, { status: 500 });
     }
@@ -7631,11 +7687,14 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       }
       const meta = sessionMeta.get(sid);
       if (!meta) return Response.json({ error: "session not found" }, { status: 404 });
-      if (!meta.tty) return Response.json({ terminal: "none", error: "no tty — отправка возможна только для терминальных сессий" }, { status: 400 });
+      // tty из meta может устареть (сессию усыпили/разбудили, вкладку перенесли) — тогда
+      // текст уйдёт в ЧУЖУЮ вкладку. Сверяем с живым процессом перед каждой отправкой.
+      const liveTty = await verifiedTty(sid);
+      if (!liveTty) return Response.json({ terminal: "none", error: "no tty — отправка возможна только для терминальных сессий" }, { status: 400 });
       const body = await req.json().catch(() => ({})) as { text?: string };
       const text = (body.text ?? "").toString();
       if (!text.trim()) return Response.json({ error: "empty text" }, { status: 400 });
-      console.log(`[/send sid=${sid} tty=${meta.tty}] text="${text.slice(0, 80)}"`);
+      console.log(`[/send sid=${sid} tty=${liveTty}] text="${text.slice(0, 80)}"`);
       // Если шлём /rename — сбрасываем кэш заголовка чтобы новое имя подхватилось быстро
       if (text.trim().toLowerCase().startsWith("/rename ")) {
         titleCache.delete(sid);
@@ -7661,10 +7720,10 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       // Claude Code включает bash-mode только при ЖИВОМ keypress `!`, не при AppleScript paste.
       // Поэтому печатаем через CGEventKeyboardSetUnicodeString (живой набор), потом Enter отдельно.
       if (text.trimStart().startsWith("!")) {
-        const typed = await sendTextToTui(meta.tty, text);
+        const typed = await sendTextToTui(liveTty, text);
         if (!typed.ok) return Response.json({ terminal: preferredTerm(), error: typed.error ?? "type-text failed" }, { status: 500 });
         await new Promise(r => setTimeout(r, 120));
-        const enter = await sendRawKey(meta.tty, "enter");
+        const enter = await sendRawKey(liveTty, "enter");
         if (!enter.ok) return Response.json({ terminal: preferredTerm(), error: enter.error ?? "enter failed" }, { status: 500 });
         return Response.json({ terminal: preferredTerm(), pasteHint: true });
       }
@@ -7674,16 +7733,16 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       //  - "race" — параллельный /send удерживает активность tab'а, ждём чтобы отпустил
       //  - "none" — AppleScript при 30+ окнах иногда не успевает добежать до нужного tty
       //    и возвращает 'none' хотя tab физически жив. Повтор через 300мс обычно проходит.
-      let { result, stderr } = await controlTerminal(meta.tty, "send", text);
+      let { result, stderr } = await controlTerminal(liveTty, "send", text);
       if (result === "race" || result === "none") {
         await new Promise(r => setTimeout(r, 300));
-        ({ result, stderr } = await controlTerminal(meta.tty, "send", text));
+        ({ result, stderr } = await controlTerminal(liveTty, "send", text));
       }
       if (result === "race") {
-        return Response.json({ terminal: "race", error: `Не удалось удержать активность вкладки ttyS${meta.tty.replace(/^.*ttys/, "")} — два сообщения в разные чаты одновременно. Повтори отправку через секунду.` }, { status: 500 });
+        return Response.json({ terminal: "race", error: `Не удалось удержать активность вкладки ttyS${liveTty.replace(/^.*ttys/, "")} — два сообщения в разные чаты одновременно. Повтори отправку через секунду.` }, { status: 500 });
       }
       if (result === "none") {
-        return Response.json({ terminal: "none", error: `tty ${meta.tty} не найден ни в Terminal, ни в iTerm2 — окно закрыто? Или у тебя >30 окон терминала, закрой лишние.` }, { status: 500 });
+        return Response.json({ terminal: "none", error: `tty ${liveTty} не найден ни в Terminal, ни в iTerm2 — окно закрыто? Или у тебя >30 окон терминала, закрой лишние.` }, { status: 500 });
       }
       if (stderr) {
         return Response.json({ terminal: result, error: stderr }, { status: 500 });
