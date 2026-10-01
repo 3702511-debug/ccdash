@@ -1469,13 +1469,18 @@ const APPLESCRIPT_BODY = `on run argv
                     tell w to select
                     activate
                   else if actionArg is "send" then
-                    -- write text шлёт текст+newline в stdin. Claude Code TUI 2.x
-                    -- после multi-line paste остаётся в edit-mode — второй пустой
-                    -- write text даёт финальный Enter для submit (как do script "" in t
-                    -- в Terminal-блоке ниже).
-                    tell s to write text msgArg
-                    delay 0.15
-                    tell s to write text ""
+                    -- Критично: write text по умолчанию дописывает LF (0x0A), а TUI
+                    -- Claude Code в raw-режиме принимает за Enter только CR (0x0D).
+                    -- LF попадает в буфер ввода как перенос строки: текст виден
+                    -- в промпте, но не отправляется. Поэтому текст шлём с newline no,
+                    -- а submit делаем явным CR. Второй CR с паузой — страховка на
+                    -- длинной вставке, когда TUI ещё не успел дочитать буфер;
+                    -- на пустой строке лишний CR TUI игнорирует.
+                    tell s to write text msgArg newline no
+                    delay 0.25
+                    tell s to write text (ASCII character 13) newline no
+                    delay 0.35
+                    tell s to write text (ASCII character 13) newline no
                   end if
                   return "iTerm"
                 end if
@@ -2340,6 +2345,74 @@ async function sendRawKey(tty: string, key: "left" | "right" | "up" | "down" | "
   return { ok: true };
 }
 
+// Содержимое строки ввода TUI (после маркера ❯), или null если строки ввода на
+// экране нет — так бывает, пока Claude отвечает, и это нормальный признак того,
+// что отправка прошла.
+// Нужно потому, что Claude Code периодически показывает поверх промпта оверлеи
+// (например опрос «How is Claude doing this session?»), которые забирают Enter
+// себе: текст вставился, а submit не произошёл — ровно симптом «из дашборда
+// отправил, в iTerm попало, но висит».
+// Читаем напрямую через osascript, без кэша readAllTerminalContents — после
+// отправки нужно свежее состояние, а не то, что было до неё.
+async function promptLine(tty: string): Promise<string | null> {
+  const script = `tell application "iTerm"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if (tty of s) is "${tty}" then return contents of s
+        end try
+      end repeat
+    end repeat
+  end repeat
+end tell
+return ""`;
+  try {
+    const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const lines = out.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const idx = lines[i].indexOf("\u276f");
+      if (idx < 0) continue;
+      // \u00a0 (nbsp) TUI ставит сразу после маркера — нормализуем, иначе текст
+      // «пустого» промпта выглядит непустым.
+      return lines[i].slice(idx + 1).replace(/\u00a0/g, " ").trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Убеждаемся, что отправленный текст действительно ушёл, а не висит в строке ввода.
+// Дожимаем Enter только если в промпте висит ИМЕННО наш текст: в строке ввода может
+// лежать черновик пользователя или вставка из другого источника, и отправлять чужое
+// за него нельзя. До attempts попыток, с записью в out.log — чтобы факт дожима был
+// виден, а не выводился из симптомов.
+async function ensureSubmitted(tty: string, sent: string, attempts = 2): Promise<"sent" | "stuck" | "foreign" | "unknown"> {
+  const norm = (v: string) => v.replace(/\s+/g, " ").trim();
+  const probe = norm(sent).slice(0, 30);
+  if (!probe) return "unknown";
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(r => setTimeout(r, 700));
+    const line = await promptLine(tty);
+    if (line === null) return "sent";       // строки ввода нет — Claude уже работает
+    const cur = norm(line);
+    if (cur.length === 0) return "sent";    // промпт пуст — текст ушёл
+    if (!cur.startsWith(probe.slice(0, Math.min(probe.length, cur.length)))) {
+      console.log(`[ensure-submit ${tty}] в строке ввода чужой текст — не дожимаю: "${cur.slice(0, 60)}"`);
+      return "foreign";
+    }
+    console.log(`[ensure-submit ${tty}] наш текст висит в строке ввода — дожимаю Enter (попытка ${i + 1})`);
+    await sendRawKey(tty, "enter");
+  }
+  const line = await promptLine(tty);
+  const stuck = line !== null && norm(line).length > 0;
+  if (stuck) console.log(`[ensure-submit ${tty}] текст всё ещё висит после ${attempts} попыток`);
+  return stuck ? "stuck" : "sent";
+}
+
 async function answerTuiQuestion(tty: string, optionIndex: number, freeText?: string): Promise<{ ok: boolean; error?: string }> {
   if (optionIndex < 1 || optionIndex > 9) return { ok: false, error: "optionIndex out of range 1-9" };
   const downs = optionIndex - 1;
@@ -2388,7 +2461,8 @@ async function controlTerminal(tty: string, action: "focus" | "send", msg = ""):
   await proc.exited;
   const result = out.trim();
   const stderr = err.trim();
-  console.log(`[osascript ${action} ${tty}] result="${result}" stderr="${stderr}"`);
+  const ts = new Date().toLocaleTimeString("ru-RU");
+  console.log(`[${ts}] [osascript ${action} ${tty}] result="${result}" stderr="${stderr}"`);
   return { result, stderr };
 }
 
@@ -5508,6 +5582,12 @@ async function sendInPanel(sid) {
     const data = await res.json();
     if (!res.ok || data.terminal === "none") {
       errEl.textContent = data.error || "Не удалось отправить";
+    } else if (data.submit === "stuck") {
+      // Текст вставился во вкладку, но Enter не сработал даже после дожима.
+      // Раньше это выглядело как молча проглоченное сообщение: в дашборде оно
+      // уходило из поля, а в iTerm висело в строке ввода. Теперь говорим прямо.
+      errEl.textContent = "Текст вставлен в терминал, но не отправился — дожми Enter в iTerm";
+      hintEl.style.display = "none";
     } else {
       // Без всплывающей подсказки об отправке — статус виден через индикатор в шапке.
       hintEl.style.display = "none";
@@ -7571,8 +7651,9 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const sid = focusMatch[1];
       const meta = sessionMeta.get(sid);
       if (!meta) return Response.json({ error: "session not found" }, { status: 404 });
-      if (!meta.tty) return Response.json({ terminal: "none", error: "no tty (desktop session?)" });
-      const { result, stderr } = await controlTerminal(meta.tty, "focus");
+      const focusTty = await verifiedTty(sid);
+      if (!focusTty) return Response.json({ terminal: "none", error: "no tty (desktop session?)" });
+      const { result, stderr } = await controlTerminal(focusTty, "focus");
       return Response.json({ terminal: result, stderr });
     }
 
@@ -7582,6 +7663,10 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const meta = sessionMeta.get(sid);
       if (!meta?.tty) return Response.json({ error: "no tty" }, { status: 400 });
       if (!meta.jsonlPath) return Response.json({ error: "no jsonl" }, { status: 400 });
+      // Сверяем tty с живым процессом: meta могла устареть после усыпления/переноса вкладки,
+      // иначе Esc и пересылка текста уйдут в чужую вкладку.
+      const wakeTty = await verifiedTty(sid);
+      if (!wakeTty) return Response.json({ error: "no tty" }, { status: 400 });
       // Найти последнее user-сообщение в jsonl и переслать его — это retry, который реально дёрнет API.
       let lastUserText = "";
       try {
@@ -7601,12 +7686,12 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       // сначала шлём Esc чтобы Claude вернулся в нормальный input — иначе наш
       // текст застрянет в этом модале.
       try {
-        const tuiContents = await readAllTerminalContents(new Set([meta.tty]));
-        const text = tuiContents.get(meta.tty) ?? "";
+        const tuiContents = await readAllTerminalContents(new Set([wakeTty]));
+        const text = tuiContents.get(wakeTty) ?? "";
         const isStuckScreen = /Press Enter to retry|Esc to cancel|OAuth error|Login|Use [/]login/i.test(text);
         if (isStuckScreen) {
           console.log(`[/wake sid=${sid}] detected stuck screen, sending Esc first`);
-          await sendRawKey(meta.tty, "escape");
+          await sendRawKey(wakeTty, "escape");
           await new Promise(r => setTimeout(r, 300));
         }
       } catch (e) {
@@ -7614,11 +7699,11 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       }
       if (!lastUserText) {
         // Fallback: пустой Enter
-        const { result } = await controlTerminal(meta.tty, "send", "");
+        const { result } = await controlTerminal(wakeTty, "send", "");
         return Response.json({ ok: true, terminal: result, fallback: "empty-enter" });
       }
       console.log(`[/wake sid=${sid}] resend last user text="${lastUserText.slice(0, 80)}"`);
-      const { result } = await controlTerminal(meta.tty, "send", lastUserText);
+      const { result } = await controlTerminal(wakeTty, "send", lastUserText);
       return Response.json({ ok: true, terminal: result, resent: lastUserText.slice(0, 120) });
     }
     // Multi-tab: отправить произвольный текст в указанный tty (для Type something / Свой вариант)
@@ -7694,7 +7779,7 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       const body = await req.json().catch(() => ({})) as { text?: string };
       const text = (body.text ?? "").toString();
       if (!text.trim()) return Response.json({ error: "empty text" }, { status: 400 });
-      console.log(`[/send sid=${sid} tty=${liveTty}] text="${text.slice(0, 80)}"`);
+      console.log(`[${new Date().toLocaleTimeString("ru-RU")}] [/send sid=${sid.slice(0, 8)} tty=${liveTty} len=${text.length}] text="${text.slice(0, 80)}"`);
       // Если шлём /rename — сбрасываем кэш заголовка чтобы новое имя подхватилось быстро
       if (text.trim().toLowerCase().startsWith("/rename ")) {
         titleCache.delete(sid);
@@ -7750,11 +7835,12 @@ return acc & "|||DEBUG|||winCount=" & winCount & " errs=" & errLog`;
       // Длинное/multi-line сообщение: Claude TUI 2.x после paste остаётся в edit-mode,
       // trailing newline от `do script` идёт как ещё одна пустая строка, а не submit.
       // Гарантируем submit физическим Enter через CGEvent.
-      if (text.includes("\n") || text.length > 200) {
-        await new Promise(r => setTimeout(r, 250));
-        await sendRawKey(meta.tty, "enter");
-      }
-      return Response.json({ terminal: result, pasteHint: true });
+      // Раньше дожим Enter делался по эвристике «длинное или multi-line», причём в
+      // устаревший meta.tty. Эвристика мимо: отправка срывалась и на коротких, когда
+      // поверх промпта висел оверлей TUI. Теперь вместо угадывания проверяем факт —
+      // опустела ли строка ввода, и дожимаем, пока не опустеет.
+      const submitState = await ensureSubmitted(liveTty, text);
+      return Response.json({ terminal: result, pasteHint: true, submit: submitState });
     }
 
     return new Response("Not found", { status: 404 });
