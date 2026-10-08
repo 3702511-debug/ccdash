@@ -362,7 +362,21 @@ function modelSortKey(id: string): [number, number, number] {
 async function discoverModels(): Promise<string[]> {
   try {
     // Резолвим symlink ~/.local/bin/claude → versions/<ver>
-    const whichOut = (await sh("which", ["claude"])).trim();
+    // which зависит от PATH, а у LaunchAgent он урезан: ~/.local/bin в него не входит,
+    // claude не находился, и список молча падал в FALLBACK_MODELS — новые модели
+    // в переключателе не появлялись никогда. Поэтому при пустом which проверяем
+    // известные места установки напрямую.
+    let whichOut = "";
+    try { whichOut = (await sh("which", ["claude"])).trim(); } catch {}
+    if (!whichOut) {
+      for (const cand of [
+        join(homedir(), ".local", "bin", "claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+      ]) {
+        if (await stat(cand).then(() => true).catch(() => false)) { whichOut = cand; break; }
+      }
+    }
     if (!whichOut) return FALLBACK_MODELS;
     let binPath = whichOut;
     try {
@@ -2220,13 +2234,32 @@ const UNIFIED_SELECT_TAB_SCRIPT = `on run argv
   return "tty not found"
 end run`;
 
+// Асинхронный запуск osascript с жёстким таймаутом.
+// Было Bun.spawnSync: пока AppleScript ждёт ответа от iTerm (а при занятом или
+// подвисшем терминале это до 60 секунд таймаута AppleEvent), синхронный вызов
+// держит event loop Bun — и дашборд целиком перестаёт отвечать, хотя процесс жив.
+// Симптом: нажал «Разбудить» — весь дашборд лёг. Теперь ожидание не блокирует
+// остальные запросы, а зависший osascript убивается по таймауту.
+async function osaRun(args: string[], timeoutMs = 15000): Promise<string> {
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+  try {
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    return out.trim();
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Кэш pid по имени приложения (для CGEventPostToPid после успешного select).
 const termPidByApp = new Map<TerminalApp, { pid: number; at: number }>();
 async function getPidForApp(app: TerminalApp): Promise<number | null> {
   const cached = termPidByApp.get(app);
   if (cached && Date.now() - cached.at < 60000) return cached.pid;
-  const proc = Bun.spawnSync(["pgrep", "-x", app]);
-  const pid = parseInt(proc.stdout.toString().trim().split("\n")[0], 10);
+  const pid = parseInt((await osaRun(["pgrep", "-x", app], 5000)).split("\n")[0], 10);
   if (Number.isInteger(pid) && pid > 0) {
     termPidByApp.set(app, { pid, at: Date.now() });
     return pid;
@@ -2238,12 +2271,10 @@ async function getPidForApp(app: TerminalApp): Promise<number | null> {
 // pid нужен вызывающему коду чтобы отправить CGEvent именно в этот процесс.
 async function selectTabForCGEvent(tty: string): Promise<{ ok: boolean; app?: TerminalApp; pid?: number; error?: string; race?: boolean }> {
   const first = preferredTerm();
-  let sel = Bun.spawnSync(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
-  let out = sel.stdout.toString().trim();
+  let out = await osaRun(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
   if (out.startsWith("race:")) {
     await new Promise(r => setTimeout(r, 300));
-    sel = Bun.spawnSync(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
-    out = sel.stdout.toString().trim();
+    out = await osaRun(["osascript", "-e", UNIFIED_SELECT_TAB_SCRIPT, "--", tty, first]);
   }
   if (out.startsWith("race:")) return { ok: false, race: true, error: "race: параллельная отправка в другую вкладку" };
   if (out === "tty not found") return { ok: false, error: "tab not found" };
@@ -2306,8 +2337,7 @@ async function sendKeysToItermByTty(tty: string, sequence: string): Promise<bool
   end try
   return "not-found"
 end run`;
-  const proc = Bun.spawnSync(["osascript", "-e", script, "--", tty, sequence]);
-  return proc.stdout.toString().trim() === "ok";
+  return (await osaRun(["osascript", "-e", script, "--", tty, sequence])) === "ok";
 }
 
 // Escape-последовательности для клавиш при отправке через write text
@@ -6873,7 +6903,9 @@ end tell` : `tell application "Terminal"
     end try
   end repeat
 end tell`;
-        Bun.spawnSync(["osascript", "-e", script]);
+        // Не spawnSync: внутри do script + delay + close, и при занятой вкладке
+        // это вешало весь дашборд до таймаута AppleEvent.
+        await osaRun(["osascript", "-e", script]);
       }
       const info = { cwd: meta?.cwd, title: meta?.title };
       if (mode === "delete") {
