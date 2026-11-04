@@ -2284,6 +2284,123 @@ async function osaRun(args: string[], timeoutMs = 15000): Promise<string> {
   }
 }
 
+// Уборка мёртвых вкладок Claude в iTerm. «Разбудить» всегда открывает новую вкладку,
+// а старая (claude завершился или вкладку восстановил iTerm после перезагрузки) так и
+// висит с пустой оболочкой — у клиентов их копились десятки. Вкладка закрывается, только если:
+//   1) на её tty нет процессов, кроме login и самой оболочки (проверка по ps, не по экрану);
+//   2) на экране есть след Claude (команда claude --resume, «Resume this session with»
+//      или футер его интерфейса), а после следа — только приглашение оболочки и служебные
+//      строки (Last login, Restored session…). Набирал что-то после Claude — не трогаем;
+//   3) так выглядит на двух проверках подряд (5–10 мин) — чтобы не закрыть вкладку, на
+//      которой человек только что вышел из Claude и ещё читает экран.
+// Ручные вкладки без следа Claude не трогаются никогда. Переписка к этому моменту уже
+// выгружена в _история_сессии/, так что со скроллбеком ничего не теряется.
+// Выключить: ~/.cc-dashboard/no-tab-reaper.flag
+const TAB_REAPER_OFF_FLAG = join(homedir(), ".cc-dashboard", "no-tab-reaper.flag");
+const CLAUDE_TRACE = /claude --resume [0-9a-f-]{8,}|Resume this session with|⏵⏵|\? for shortcuts|Claude Code v\d|bypass permissions on|accept edits on/;
+const SHELL_TAIL_OK = /^(Last login|Restored session|Saving session|\.\.\.|\[Process completed\]|Session Contents Restored)|[$%#>❯]\s*$|^➜/;
+const SHELLS = new Set(["login", "bash", "-bash", "zsh", "-zsh", "sh", "-sh", "fish", "-fish"]);
+const LIST_ITERM_TABS = `set RS to ASCII character 30
+set US to ASCII character 31
+set out to ""
+tell application "iTerm"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          set c to contents of s
+          set lns to paragraphs of c
+          set tailTxt to ""
+          set k to 0
+          repeat with i from (count of lns) to 1 by -1
+            set tailTxt to (item i of lns) & US & tailTxt
+            set k to k + 1
+            if k ≥ 80 then exit repeat
+          end repeat
+          set out to out & (unique id of s) & US & (tty of s) & US & tailTxt & RS
+        end try
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out`;
+// exit в оболочку + close одной сессии iTerm. Сессия ищется дважды: после exit iTerm
+// сам закрывает вкладку, и ссылка из repeat («сессия 1 вкладки N») начинает указывать на
+// соседнюю вкладку — close по ней закрывал чужую. Второй поиск — по unique id.
+function itermExitAndCloseScript(match: string): string {
+  return `tell application "iTerm"
+  set target to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if ${match} then
+            set target to unique id of s
+            tell s to write text "exit"
+            exit repeat
+          end if
+        end try
+      end repeat
+      if target is not "" then exit repeat
+    end repeat
+    if target is not "" then exit repeat
+  end repeat
+  if target is "" then return "not-found"
+  delay 0.4
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (unique id of s) is target then
+          tell s to close
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "ok"
+end tell`;
+}
+const deadTabSeen = new Set<string>();
+let tabReaperRunning = false;
+async function reapDeadClaudeTabs() {
+  if (tabReaperRunning || preferredTerm() !== "iTerm2" || existsSync(TAB_REAPER_OFF_FLAG)) return;
+  tabReaperRunning = true;
+  try {
+    const busy = new Set<string>();
+    for (const line of (await osaRun(["ps", "-A", "-o", "tty=,comm="], 5000)).split("\n")) {
+      const m = line.trim().match(/^(\S+)\s+(.+)$/);
+      if (!m || m[1] === "??") continue;
+      const comm = m[2].trim().split("/").pop()!;
+      if (!SHELLS.has(comm)) busy.add(m[1]);
+    }
+    const dead = new Map<string, string>();
+    for (const rec of (await osaRun(["osascript", "-e", LIST_ITERM_TABS], 20000)).split("\x1e")) {
+      const [uid, ttyPath, ...lines] = rec.split("\x1f").map(s => s.trim());
+      if (!uid || !ttyPath) continue;
+      const tty = ttyPath.replace("/dev/", "");
+      if (busy.has(tty)) continue;
+      const nonEmpty = lines.map(l => l.trim()).filter(Boolean);
+      let last = -1;
+      nonEmpty.forEach((l, i) => { if (CLAUDE_TRACE.test(l)) last = i; });
+      if (last < 0) continue;
+      if (!nonEmpty.slice(last + 1).every(l => SHELL_TAIL_OK.test(l))) continue;
+      dead.set(uid, tty);
+    }
+    for (const uid of [...deadTabSeen]) if (!dead.has(uid)) deadTabSeen.delete(uid);
+    for (const [uid, tty] of dead) {
+      if (!deadTabSeen.has(uid)) { deadTabSeen.add(uid); continue; }
+      const res = await osaRun(["osascript", "-e", itermExitAndCloseScript(`(unique id of s) is "${uid.replace(/[^A-Za-z0-9-]/g, "")}"`)]);
+      deadTabSeen.delete(uid);
+      console.log(`[tab-reaper] закрыта мёртвая вкладка Claude ${tty} (${res || "уже закрылась"})`);
+    }
+  } catch (e) {
+    console.error("[tab-reaper]", e);
+  } finally { tabReaperRunning = false; }
+}
+// Первая проверка через 3 мин после старта, дальше строго раз в 5 мин от неё —
+// иначе вторая проверка «двух подряд» приходит через 2 мин, а не через 5.
+setTimeout(() => { reapDeadClaudeTabs(); setInterval(reapDeadClaudeTabs, 5 * 60 * 1000); }, 3 * 60 * 1000);
+
 // Кэш pid по имени приложения (для CGEventPostToPid после успешного select).
 const termPidByApp = new Map<TerminalApp, { pid: number; at: number }>();
 async function getPidForApp(app: TerminalApp): Promise<number | null> {
@@ -6898,40 +7015,37 @@ Bun.serve({
       // 2. Закрыть вкладку preferred-терминала: exit для shell, потом close (без диалога «процесс запущен»)
       if (tty) {
         const term = preferredTerm();
-        const script = term === "iTerm2" ? `tell application "iTerm"
+        // ВАЖНО: s и t в repeat — ссылки по номеру («сессия 1 вкладки 8»), а не по самой
+        // вкладке. После exit терминал сам закрывает вкладку, номер 8 переходит к соседней,
+        // и следующий close закрывал ЕЁ (поймано 04.11.2026 на тестовых вкладках). Поэтому
+        // после exit вкладка ищется заново: в iTerm по unique id, в Terminal — по tty.
+        const script = term === "iTerm2" ? itermExitAndCloseScript(`(tty of s) is "/dev/${tty}"`) : `tell application "Terminal"
+  set found to false
   repeat with w in windows
-    try
-      repeat with t in tabs of w
-        try
-          repeat with s in sessions of t
-            try
-              if (tty of s) is "/dev/${tty}" then
-                tell s to write text "exit"
-                delay 0.4
-                tell s to close
-                return "ok"
-              end if
-            end try
-          end repeat
-        end try
-      end repeat
-    end try
+    repeat with t in tabs of w
+      try
+        if (tty of t) is "/dev/${tty}" then
+          do script "exit" in t
+          set found to true
+          exit repeat
+        end if
+      end try
+    end repeat
+    if found then exit repeat
   end repeat
-end tell` : `tell application "Terminal"
+  if not found then return "not-found"
+  delay 0.4
   repeat with w in windows
-    try
-      repeat with t in tabs of w
-        try
-          if (tty of t) is "/dev/${tty}" then
-            do script "exit" in t
-            delay 0.4
-            close t saving no
-            return "ok"
-          end if
-        end try
-      end repeat
-    end try
+    repeat with t in tabs of w
+      try
+        if (tty of t) is "/dev/${tty}" then
+          close t saving no
+          return "ok"
+        end if
+      end try
+    end repeat
   end repeat
+  return "ok"
 end tell`;
         // Не spawnSync: внутри do script + delay + close, и при занятой вкладке
         // это вешало весь дашборд до таймаута AppleEvent.
