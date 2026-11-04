@@ -1302,6 +1302,7 @@ function logDeathDiff(sessions: Session[]) {
     }
   }
   if (deaths.length === 0 && revivals.length === 0) return;
+  if (deaths.length) requestTabReap(30 * 1000);  // во вкладке умершей сессии осталась пустая оболочка
   const line = [...deaths, ...revivals].join("\n") + "\n";
   // Fire-and-forget append. Bun.write перезаписывает, поэтому нужен именно appendFile.
   appendFile(DEATH_LOG_PATH, line).catch(() => {});
@@ -1759,6 +1760,7 @@ async function restoreSession(sessionId: string, cwd: string, title?: string): P
   const stderr = err.trim();
   console.log(`[restore sid=${sessionId.slice(0, 8)} slug-cwd=${slugCwd}] out="${out.trim()}" stderr="${stderr}"`);
   if (stderr) return { ok: false, error: stderr };
+  requestTabReap(30 * 1000);  // старая вкладка разбуженной сессии осталась висеть
   return { ok: true };
 }
 
@@ -2291,8 +2293,12 @@ async function osaRun(args: string[], timeoutMs = 15000): Promise<string> {
 //   2) на экране есть след Claude (команда claude --resume, «Resume this session with»
 //      или футер его интерфейса), а после следа — только приглашение оболочки и служебные
 //      строки (Last login, Restored session…). Набирал что-то после Claude — не трогаем;
-//   3) так выглядит на двух проверках подряд (5–10 мин) — чтобы не закрыть вкладку, на
-//      которой человек только что вышел из Claude и ещё читает экран.
+//   3) так выглядит на двух проверках подряд с разницей 5 мин — чтобы не закрыть вкладку,
+//      на которой человек только что вышел из Claude и ещё читает экран.
+// Не опрос: проверка запускается по событиям, после которых и появляются мёртвые вкладки, —
+// старт дашборда (после ребута iTerm восстанавливает вкладки), «Разбудить», смерть сессии
+// (DIED в death log). Плюс страховка раз в час (например, человек сам набрал /exit).
+// Если проверка нашла кандидатов, она сама назначает повторную через 5 мин.
 // Ручные вкладки без следа Claude не трогаются никогда. Переписка к этому моменту уже
 // выгружена в _история_сессии/, так что со скроллбеком ничего не теряется.
 // Выключить: ~/.cc-dashboard/no-tab-reaper.flag
@@ -2387,19 +2393,26 @@ async function reapDeadClaudeTabs() {
       dead.set(uid, tty);
     }
     for (const uid of [...deadTabSeen]) if (!dead.has(uid)) deadTabSeen.delete(uid);
+    let marked = 0;
     for (const [uid, tty] of dead) {
-      if (!deadTabSeen.has(uid)) { deadTabSeen.add(uid); continue; }
+      if (!deadTabSeen.has(uid)) { deadTabSeen.add(uid); marked++; continue; }
       const res = await osaRun(["osascript", "-e", itermExitAndCloseScript(`(unique id of s) is "${uid.replace(/[^A-Za-z0-9-]/g, "")}"`)]);
       deadTabSeen.delete(uid);
       console.log(`[tab-reaper] закрыта мёртвая вкладка Claude ${tty} (${res || "уже закрылась"})`);
     }
+    if (marked) requestTabReap(5 * 60 * 1000);
   } catch (e) {
     console.error("[tab-reaper]", e);
   } finally { tabReaperRunning = false; }
 }
-// Первая проверка через 3 мин после старта, дальше строго раз в 5 мин от неё —
-// иначе вторая проверка «двух подряд» приходит через 2 мин, а не через 5.
-setTimeout(() => { reapDeadClaudeTabs(); setInterval(reapDeadClaudeTabs, 5 * 60 * 1000); }, 3 * 60 * 1000);
+// Одна отложенная проверка за раз: повторный запрос, пока есть ожидающая, ничего не делает.
+let tabReapTimer: ReturnType<typeof setTimeout> | null = null;
+function requestTabReap(delayMs: number) {
+  if (tabReapTimer) return;
+  tabReapTimer = setTimeout(() => { tabReapTimer = null; reapDeadClaudeTabs(); }, delayMs);
+}
+requestTabReap(3 * 60 * 1000);
+setInterval(() => requestTabReap(0), 60 * 60 * 1000);
 
 // Кэш pid по имени приложения (для CGEventPostToPid после успешного select).
 const termPidByApp = new Map<TerminalApp, { pid: number; at: number }>();
