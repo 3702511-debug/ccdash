@@ -39,6 +39,36 @@ async function cleanupOldUploads(): Promise<void> {
 }
 cleanupOldUploads();
 setInterval(cleanupOldUploads, 60 * 60 * 1000);
+
+// Раз в час переписка каждой именованной сессии выгружается в md рядом с её CLAUDE.md
+// (<папка>/_история_сессии/<название>.md) + симлинк AGENTS.md для Codex — чтобы чат можно
+// было перенести в другой агент и чтобы переписка пережила чистку jsonl.
+// Отдельным процессом: парсинг сотен мегабайт jsonl не должен держать event loop.
+let transcriptsRunning = false;
+async function exportTranscripts() {
+  if (transcriptsRunning) return;
+  let script = join(import.meta.dir, "tools", "export-transcripts.ts");
+  try {
+    const repo = (await Bun.file(join(homedir(), ".cc-dashboard", "repo-path.txt")).text()).trim();
+    if (repo && existsSync(join(repo, "tools", "export-transcripts.ts"))) script = join(repo, "tools", "export-transcripts.ts");
+  } catch {}
+  if (!existsSync(script)) return;
+  transcriptsRunning = true;
+  try {
+    const proc = Bun.spawn([process.execPath, "run", script], { stdout: "pipe", stderr: "pipe" });
+    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, 5 * 60 * 1000);
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    await proc.exited;
+    clearTimeout(timer);
+    const n = out.split("\n").filter(l => l.startsWith("ok ")).length;
+    console.log(`[transcripts] выгружено ${n} сессий${proc.exitCode ? `, код ${proc.exitCode}` : ""}`);
+    if (err.trim()) console.error(`[transcripts] ${err.trim().slice(0, 500)}`);
+  } catch (e) {
+    console.error("[transcripts]", e);
+  } finally { transcriptsRunning = false; }
+}
+setTimeout(exportTranscripts, 2 * 60 * 1000);
+setInterval(exportTranscripts, 60 * 60 * 1000);
 // FRESH_MS: сессии свежее этого показываются в welcome-grid. Раньше было 24 часа,
 // из-за чего сессии которые «пожили» пару дней и упали или были усыплены — исчезали
 // с welcome-grid и уходили в архив («Сессии из Claude.app»). Юзер жаловался «не усыплял,
@@ -7129,23 +7159,35 @@ end tell`;
             `  \`/tmp/cc-dashboard/\` — только для скриншотов и разовых вложений.`,
             `- Файлы от пользователя класть сюда, а не в Downloads.`,
             ``,
+            `## Текущее состояние`,
+            ``,
+            `_TODO: что работает, что сломано, что в процессе — с датой._`,
+            ``,
             `## Ключевые факты`,
             ``,
-            `_TODO: IP, порты, пути, версии, найденные настройки — всё, что понадобится после /compact._`,
+            `_TODO: IP, порты, пути, версии, найденные настройки; где лежат файлы и скрипты, как их запустить и проверить._`,
+            ``,
+            `## Решения пользователя`,
+            ``,
+            `_TODO: что решили и почему; особенно «не делать X» и «отсечено, не предлагать снова»._`,
             ``,
             `## Что уже решено`,
             ``,
-            `_TODO: после каждого нетривиального дебага — 2-3 строки: что было, как починили._`,
+            `_TODO: после каждого нетривиального дебага — 2-3 строки: что было, что пробовали и не сработало, как починили._`,
             ``,
             `## Открытые вопросы`,
             ``,
-            `_TODO: незакрытые задачи. Закрытые — удалять._`,
+            `_TODO: незакрытые задачи и что ждёт пользователя. Закрытые — удалять._`,
             ``,
             `---`,
             ``,
             `**Правило ведения:** обновлять этот файл по ходу работы, не откладывая.`,
-            `Переписка сессии может быть удалена автоматической чисткой Claude Code —`,
-            `этот файл останется.`,
+            `Пиши его как передачу дел: чат могут перенести в Codex или в новую сессию,`,
+            `и новый агент увидит только файлы — прочитав этот, он должен продолжить без вопросов.`,
+            ``,
+            `Полная переписка раз в час выгружается в \`_история_сессии/\` (делает дашборд) —`,
+            `это архив для поиска подробностей, а не замена этому файлу. \`AGENTS.md\` рядом —`,
+            `симлинк на этот файл для Codex, его не трогать.`,
             ``,
           ].join("\n"));
           console.log(`[new-session] создан CLAUDE.md в ${cwd}`);
