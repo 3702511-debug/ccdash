@@ -73,7 +73,7 @@ setInterval(exportTranscripts, 60 * 60 * 1000);
 // «Живые» сессии — их переписка обновляется через минуту после изменения, а не раз в час:
 // для них держим запасного агента (DeepSeek Harness, Codex), который должен в любой момент
 // подхватить работу, если Claude недоступен. Список названий — ~/.cc-dashboard/live-export.json,
-// например ["Финансы и планы"]. jsonl сессии берутся из индекса, который пишет полный прогон.
+// например ["Финансы и планы"] или ["*"] — все сессии (проверка — stat нескольких файлов, дёшево). jsonl сессии берутся из индекса, который пишет полный прогон.
 const LIVE_EXPORT_FILE = join(homedir(), ".cc-dashboard", "live-export.json");
 const TRANSCRIPTS_INDEX = join(homedir(), ".cc-dashboard", "transcripts-index.json");
 const liveExportedAt = new Map<string, number>();
@@ -82,7 +82,9 @@ setInterval(async () => {
     if (!existsSync(LIVE_EXPORT_FILE) || !existsSync(TRANSCRIPTS_INDEX)) return;
     const titles = JSON.parse(readFileSync(LIVE_EXPORT_FILE, "utf8")) as string[];
     const index = JSON.parse(readFileSync(TRANSCRIPTS_INDEX, "utf8")) as Record<string, string[]>;
-    for (const title of Array.isArray(titles) ? titles : []) {
+    // "*" — все сессии из индекса
+    const list = Array.isArray(titles) ? (titles.includes("*") ? Object.keys(index) : titles) : [];
+    for (const title of list) {
       let mtime = 0;
       for (const p of index[title] || []) { try { mtime = Math.max(mtime, statSync(p).mtimeMs); } catch {} }
       if (!mtime || mtime <= (liveExportedAt.get(title) ?? 0)) continue;
