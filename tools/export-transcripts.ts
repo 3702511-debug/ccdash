@@ -209,6 +209,7 @@ if (!ONLY && !DRY) {
   for (const [t, s] of all) idx[t] = s.files;
   try { writeFileSync(INDEX, JSON.stringify(idx, null, 1)); } catch (e) { console.error(`!! индекс: ${e}`); }
 }
+const registry: string[] = [];
 for (const [title, s] of [...all].sort((a, b) => a[0].localeCompare(b[0]))) {
   if (ONLY && title !== ONLY) continue;
   const r = render(title, s);
@@ -217,6 +218,8 @@ for (const [title, s] of [...all].sort((a, b) => a[0].localeCompare(b[0]))) {
   const safe = title.replace(/[/\\:*?"<>|]/g, "_");
   const dst = own ? join(dir, OUT_DIR, safe + ".md") : join(dir, safe + ".md");
   console.log(`ok ${title}: ${r.n} реплик, ${Math.round(r.md.length / 1024)} КБ → ${dst}`);
+  const lastTs = [...s.recs.values()].reduce((m, x) => (x.ts > m ? x.ts : m), "").slice(0, 10);
+  registry.push(`| ${title} | \`${own ? dir : dst}\` | ${lastTs} |`);
   if (DRY) continue;
   try {
     if (own) { gitExclude(dir); agentsLink(dir); }
@@ -224,4 +227,16 @@ for (const [title, s] of [...all].sort((a, b) => a[0].localeCompare(b[0]))) {
     writeFileSync(dst + ".tmp", r.md);
     renameSync(dst + ".tmp", dst);
   } catch (e) { console.error(`!! ${title}: ${e}`); }
+}
+
+// Реестр проектов: по нему любой агент (Claude, Harness, Codex) находит папку проекта по названию.
+if (!ONLY && !DRY && registry.length) {
+  const reg = [
+    "# Реестр проектов", "",
+    "Автоматически, при каждом полном прогоне выгрузки переписок (`cc-dashboard/tools/export-transcripts.ts`).",
+    "Папка — та, где лежат `CLAUDE.md` / `AGENTS.md` проекта и `_история_сессии/`. Не редактировать.", "",
+    "| Проект (сессия Claude) | Папка | Последняя активность |", "|---|---|---|",
+    ...registry.sort((a, b) => b.split("|")[3].localeCompare(a.split("|")[3])), "",
+  ].join("\n");
+  try { mkdirSync(FALLBACK_DIR, { recursive: true }); writeFileSync(join(FALLBACK_DIR, "Реестр проектов.md"), reg); } catch (e) { console.error(`!! реестр: ${e}`); }
 }
