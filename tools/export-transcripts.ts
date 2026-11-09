@@ -8,7 +8,7 @@
 //   - папка = ближайшая вверх от cwd запуска, где есть CLAUDE.md;
 //   - cwd = домашняя папка → по таблице в ~/CLAUDE.md, иначе ~/Documents/Claude — история сессий/.
 // Что попадает: реплики пользователя, ответы Claude, сводки после compact, одной строкой —
-// какие инструменты вызывались. Выводы инструментов и thinking — нет.
+// какие инструменты вызывались. Выводы инструментов и thinking — нет. Секреты маскируются (redact).
 // Сессии без /rename (служебные запуски claude -p) пропускаются.
 //
 // Запускается сервером дашборда раз в час отдельным процессом. Вручную:
@@ -30,6 +30,31 @@ const ONLY = process.argv.includes("--only") ? process.argv[process.argv.indexOf
 const INDEX = join(HOME, ".cc-dashboard", "transcripts-index.json");
 const NOISE = /<(system-reminder|local-command-stdout|local-command-caveat|command-message|command-args)>[\s\S]*?<\/\1>/g;
 
+// Маскировка секретов: выгрузку читают другие агенты (Harness, Codex), и всё прочитанное уходит
+// на сервер их модели. Значение заменяется на [скрыто], название ключа остаётся — агенту видно,
+// о чём речь, а сам секрет он берёт из файла по пути. Ловит не всё: свободный текст вроде
+// «пароль от админки qwerty» без «:»/«=» пройдёт — секреты в чат лучше не писать.
+const HIDDEN = "[скрыто]";
+const SECRET_PATTERNS: [RegExp, string][] = [
+  [/\b\d{8,10}:AA[A-Za-z0-9_-]{30,40}\b/g, HIDDEN],                                  // токен Telegram-бота
+  [/\bya29\.[A-Za-z0-9_\-.]{20,}/g, HIDDEN],                                          // Google access token
+  [/\b1\/\/0[A-Za-z0-9_\-]{30,}/g, HIDDEN],                                           // Google refresh token
+  [/\b(?:gh[pousr]_|glpat-|sk-ant-|sk-)[A-Za-z0-9_\-]{20,}/g, HIDDEN],                 // GitHub, GitLab, OpenAI/Anthropic
+  [/\bAKIA[0-9A-Z]{16}\b/g, HIDDEN],                                                   // AWS
+  [/\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{24,}\b/gi, HIDDEN],                    // голые hex-ключи (API без подписи; заодно полные sha)
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, HIDDEN],        // JWT
+  [/\b(vless|vmess|trojan|hysteria2|hy2|ss):\/\/[^\s`'")<>]+/g, "$1://" + HIDDEN],  // ссылки подключения VPN
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[приватный ключ скрыт]"],
+  // "access_token": "…", password: …, API_KEY=…, KEY1=…, пароль — …
+  [/("?(?:access_token|refresh_token|client_secret|password|passwd|secret|token|api_?key|apikey)"?\s*[:=]\s*)("[^"]{6,}"|'[^']{6,}'|`[^`]{6,}`|[^\s`'",;]{6,})/gi, "$1" + HIDDEN],
+  [/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASS)[A-Z0-9_]*\s*[:=]\s*)([^\s`'",;]{6,})/g, "$1" + HIDDEN],
+  [/((?:пароль|токен|ключ)(?:\s+[а-яё]+){0,3}\s*[:—–-]\s*[`'"]?)([^\s`'",;]{6,})/gi, "$1" + HIDDEN],
+];
+function redact(t: string): string {
+  for (const [re, rep] of SECRET_PATTERNS) t = t.replace(re, rep);
+  return t;
+}
+
 // Сразу при чтении от записи остаётся только то, что пойдёт в md (выводы инструментов
 // весят сотни мегабайт — их не держим).
 type Rec = { ts: string; kind: "user" | "summary" | "text" | "tool"; text: string };
@@ -40,12 +65,12 @@ function slim(j: any): Rec[] {
   if (j.type === "user") {
     if (j.isMeta) return [];
     const t = userText(msg.content);
-    return t ? [{ ts, kind: j.isCompactSummary ? "summary" : "user", text: t }] : [];
+    return t ? [{ ts, kind: j.isCompactSummary ? "summary" : "user", text: redact(t) }] : [];
   }
   const out: Rec[] = [];
   for (const b of msg.content || []) {
-    if (b.type === "text" && b.text?.trim()) out.push({ ts, kind: "text", text: b.text.trim() });
-    else if (b.type === "tool_use") out.push({ ts, kind: "tool", text: toolLine(b) });
+    if (b.type === "text" && b.text?.trim()) out.push({ ts, kind: "text", text: redact(b.text.trim()) });
+    else if (b.type === "tool_use") out.push({ ts, kind: "tool", text: redact(toolLine(b)) });
   }
   return out;
 }
