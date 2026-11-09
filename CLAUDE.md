@@ -176,3 +176,15 @@ close` закрывал **соседнюю** вкладку. Видно было
 и ручная ttys008. Теперь `itermExitAndCloseScript()` после exit ищет сессию заново по
 `unique id`; в Terminal.app — заново по tty. Не исправлено: разовая миграция Terminal→iTerm
 (`autoMigrateToIterm2`) — у клиентов уже отработала.
+
+## «Живые» сессии для запасного агента (09.11.2026)
+
+Пилот: DeepSeek Harness (`/Applications/DeepSeek Harness.app`, данные `~/.dsh/`) как запасной
+агент на случай, если Claude недоступен (VPN). Harness сам грузит `AGENTS.md`/`CLAUDE.md`
+рабочей папки и глобальный `~/.dsh/AGENTS.md` (там правила запасного агента: откуда брать
+контекст, без «да» не пушить и не трогать серверы, вести `_история_сессии/Harness — журнал.md`).
+Сессии из `~/.cc-dashboard/live-export.json` (сейчас `["Финансы и планы"]`) сервер выгружает
+через ≤1 мин после изменения jsonl (`export-transcripts.ts --only`, ~40 мс; список jsonl —
+из `~/.cc-dashboard/transcripts-index.json`, его пишет часовой полный прогон). Новый jsonl
+после resume попадёт в индекс только с ближайшим полным прогоном.
+Codex от падения VPN не спасает — OpenAI блокирует РФ так же, как Anthropic.

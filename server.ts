@@ -45,7 +45,7 @@ setInterval(cleanupOldUploads, 60 * 60 * 1000);
 // было перенести в другой агент и чтобы переписка пережила чистку jsonl.
 // Отдельным процессом: парсинг сотен мегабайт jsonl не должен держать event loop.
 let transcriptsRunning = false;
-async function exportTranscripts() {
+async function exportTranscripts(only?: string) {
   if (transcriptsRunning) return;
   let script = join(import.meta.dir, "tools", "export-transcripts.ts");
   try {
@@ -55,13 +55,13 @@ async function exportTranscripts() {
   if (!existsSync(script)) return;
   transcriptsRunning = true;
   try {
-    const proc = Bun.spawn([process.execPath, "run", script], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([process.execPath, "run", script, ...(only ? ["--only", only] : [])], { stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => { try { proc.kill(); } catch {} }, 5 * 60 * 1000);
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     await proc.exited;
     clearTimeout(timer);
     const n = out.split("\n").filter(l => l.startsWith("ok ")).length;
-    console.log(`[transcripts] выгружено ${n} сессий${proc.exitCode ? `, код ${proc.exitCode}` : ""}`);
+    if (!only) console.log(`[transcripts] выгружено ${n} сессий${proc.exitCode ? `, код ${proc.exitCode}` : ""}`);
     if (err.trim()) console.error(`[transcripts] ${err.trim().slice(0, 500)}`);
   } catch (e) {
     console.error("[transcripts]", e);
@@ -69,6 +69,28 @@ async function exportTranscripts() {
 }
 setTimeout(exportTranscripts, 2 * 60 * 1000);
 setInterval(exportTranscripts, 60 * 60 * 1000);
+
+// «Живые» сессии — их переписка обновляется через минуту после изменения, а не раз в час:
+// для них держим запасного агента (DeepSeek Harness, Codex), который должен в любой момент
+// подхватить работу, если Claude недоступен. Список названий — ~/.cc-dashboard/live-export.json,
+// например ["Финансы и планы"]. jsonl сессии берутся из индекса, который пишет полный прогон.
+const LIVE_EXPORT_FILE = join(homedir(), ".cc-dashboard", "live-export.json");
+const TRANSCRIPTS_INDEX = join(homedir(), ".cc-dashboard", "transcripts-index.json");
+const liveExportedAt = new Map<string, number>();
+setInterval(async () => {
+  try {
+    if (!existsSync(LIVE_EXPORT_FILE) || !existsSync(TRANSCRIPTS_INDEX)) return;
+    const titles = JSON.parse(readFileSync(LIVE_EXPORT_FILE, "utf8")) as string[];
+    const index = JSON.parse(readFileSync(TRANSCRIPTS_INDEX, "utf8")) as Record<string, string[]>;
+    for (const title of Array.isArray(titles) ? titles : []) {
+      let mtime = 0;
+      for (const p of index[title] || []) { try { mtime = Math.max(mtime, statSync(p).mtimeMs); } catch {} }
+      if (!mtime || mtime <= (liveExportedAt.get(title) ?? 0)) continue;
+      await exportTranscripts(title);
+      liveExportedAt.set(title, mtime);
+    }
+  } catch (e) { console.error("[transcripts-live]", e); }
+}, 60 * 1000);
 // FRESH_MS: сессии свежее этого показываются в welcome-grid. Раньше было 24 часа,
 // из-за чего сессии которые «пожили» пару дней и упали или были усыплены — исчезали
 // с welcome-grid и уходили в архив («Сессии из Claude.app»). Юзер жаловался «не усыплял,

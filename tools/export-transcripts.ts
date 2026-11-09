@@ -12,7 +12,10 @@
 // Сессии без /rename (служебные запуски claude -p) пропускаются.
 //
 // Запускается сервером дашборда раз в час отдельным процессом. Вручную:
-//   bun run tools/export-transcripts.ts [--dry-run]
+//   bun run tools/export-transcripts.ts [--dry-run] [--only "<название>"]
+// --only — одна сессия, по списку её jsonl из индекса прошлого полного прогона
+// (~/.cc-dashboard/transcripts-index.json): так сервер раз в минуту дёшево обновляет
+// сессии из «живого» списка, не перечитывая все jsonl.
 import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync, existsSync, lstatSync, mkdirSync, writeFileSync, renameSync, symlinkSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -23,12 +26,14 @@ const OUT_DIR = "_история_сессии";
 const FALLBACK_DIR = join(HOME, "Documents", "Claude — история сессий");
 const MIN_USER_MSGS = 3;
 const DRY = process.argv.includes("--dry-run");
+const ONLY = process.argv.includes("--only") ? process.argv[process.argv.indexOf("--only") + 1] : null;
+const INDEX = join(HOME, ".cc-dashboard", "transcripts-index.json");
 const NOISE = /<(system-reminder|local-command-stdout|local-command-caveat|command-message|command-args)>[\s\S]*?<\/\1>/g;
 
 // Сразу при чтении от записи остаётся только то, что пойдёт в md (выводы инструментов
 // весят сотни мегабайт — их не держим).
 type Rec = { ts: string; kind: "user" | "summary" | "text" | "tool"; text: string };
-type Sess = { recs: Map<string, Rec>; sids: Set<string>; cwd: string };
+type Sess = { recs: Map<string, Rec>; sids: Set<string>; files: string[]; cwd: string };
 
 function slim(j: any): Rec[] {
   const ts = j.timestamp || "", msg = j.message || {};
@@ -100,9 +105,10 @@ function toolLine(b: any): string {
   return `- 🔧 \`${b.name}\` ${String(what).replace(/\n/g, " ").slice(0, 160)}`.trimEnd();
 }
 
-function collect(): Map<string, Sess> {
+function collect(only: string[] | null): Map<string, Sess> {
   const files: { path: string; mtime: number }[] = [];
-  for (const proj of readdirSync(PROJECTS)) {
+  if (only) for (const p of only) { try { files.push({ path: p, mtime: statSync(p).mtimeMs }); } catch {} }
+  else for (const proj of readdirSync(PROJECTS)) {
     let names: string[] = [];
     try { names = readdirSync(join(PROJECTS, proj)); } catch { continue; }
     for (const n of names) if (n.endsWith(".jsonl")) {
@@ -127,8 +133,9 @@ function collect(): Map<string, Sess> {
       }
     });
     if (!title || !cwd) continue;
-    const s = sessions.get(title) || { recs: new Map(), sids: new Set(), cwd };
+    const s = sessions.get(title) || { recs: new Map(), sids: new Set(), files: [], cwd };
     s.sids.add(basename(path, ".jsonl"));
+    s.files.push(path);
     s.cwd = cwd;
     for (const [k, r] of recs) if (!s.recs.has(k)) s.recs.set(k, r);
     sessions.set(title, s);
@@ -191,7 +198,19 @@ function agentsLink(d: string) {
 }
 
 const table = homeTable();
-for (const [title, s] of [...collect()].sort((a, b) => a[0].localeCompare(b[0]))) {
+let onlyFiles: string[] | null = null;
+if (ONLY) {
+  try { onlyFiles = JSON.parse(readFileSync(INDEX, "utf8"))[ONLY] || null; } catch {}
+  if (!onlyFiles) console.error(`!! ${ONLY}: нет в индексе — полный прогон`);
+}
+const all = collect(onlyFiles);
+if (!ONLY && !DRY) {
+  const idx: Record<string, string[]> = {};
+  for (const [t, s] of all) idx[t] = s.files;
+  try { writeFileSync(INDEX, JSON.stringify(idx, null, 1)); } catch (e) { console.error(`!! индекс: ${e}`); }
+}
+for (const [title, s] of [...all].sort((a, b) => a[0].localeCompare(b[0]))) {
+  if (ONLY && title !== ONLY) continue;
   const r = render(title, s);
   if (!r) continue;
   const { dir, own } = targetDir(title, s.cwd, table);
